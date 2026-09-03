@@ -4392,9 +4392,47 @@ t_rpcd_list_paths() {
 	GB_TEST_SYSUPGRADE_L="$work/rpcd-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
 	out=$(rpcd_call list_paths)
 	assert_json 'list_paths is valid JSON' "$out"
-	contains 'list_paths includes /etc/config/network' '/etc/config/network' "$out"
-	contains 'list_paths includes /etc/config/dhcp' '/etc/config/dhcp' "$out"
+	contains 'list_paths "effective" includes /etc/config/network' '/etc/config/network' "$out"
+	contains 'list_paths "effective" includes /etc/config/dhcp' '/etc/config/dhcp' "$out"
 	unset GB_TEST_SYSUPGRADE_L
+}
+
+# t_rpcd_list_paths_raw_vs_effective -- the defect this hand-off closes:
+# gbrpc_list_paths used to print ONLY sysupgrade -l's own fully-expanded
+# effective set, so a directory line a human added to sysupgrade.conf came
+# back already flattened into individual files, and the LuCI view's first
+# save (gbrpc_set_paths writes back exactly what it is given) baked that
+# flattening into the file permanently -- silently narrowing what a real
+# future sysupgrade would protect. list_paths must now carry both: "paths"
+# is the raw, unexpanded content of GB_SYSUPGRADE_CONF (what a human wrote,
+# the only thing set_paths may ever write back), "effective" is sysupgrade
+# -l's own wider union (read-only, sizing/audit only). A directory line
+# must appear in "paths" verbatim and must NOT appear, expanded into its
+# individual files, there -- only in "effective".
+t_rpcd_list_paths_raw_vs_effective() {
+	GB_TEST_SYSUPGRADE_CONF="$work/rpcd-raweff-sysupgrade.conf"
+	printf '/root/scripts/\n/etc/config/network\n' >"$GB_TEST_SYSUPGRADE_CONF"
+	GB_TEST_SYSUPGRADE_L="$work/rpcd-raweff-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+	printf '/root/scripts/a.sh\n/root/scripts/b.sh\n/etc/config/network\n/etc/config/dhcp\n' >"$GB_TEST_SYSUPGRADE_L"
+
+	out=$(rpcd_call list_paths)
+	assert_json 'list_paths (raw+effective) is valid JSON' "$out"
+
+	_gb_t_paths_part="${out%%\"effective\"*}"
+	_gb_t_eff_part="${out#*\"effective\"}"
+
+	contains 'raw "paths" keeps the directory line, unexpanded' '/root/scripts/' "$_gb_t_paths_part"
+	contains 'raw "paths" also has the plain file line' '/etc/config/network' "$_gb_t_paths_part"
+	case "$_gb_t_paths_part" in
+		*'/root/scripts/a.sh'*)
+			no 'raw "paths" is never expanded into the directory'\''s individual files' "found /root/scripts/a.sh in [$_gb_t_paths_part]" ;;
+		*) ok 'raw "paths" is never expanded into the directory'\''s individual files' ;;
+	esac
+
+	contains '"effective" carries sysupgrade -l'\''s own expansion of the directory' '/root/scripts/a.sh' "$_gb_t_eff_part"
+	contains '"effective" also carries a keep.d/conffiles-only entry' '/etc/config/dhcp' "$_gb_t_eff_part"
+
+	unset GB_TEST_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
 }
 
 t_rpcd_validate_cron() {
@@ -4461,18 +4499,40 @@ t_rpcd_set_secret_perms_and_no_log() {
 	unset GB_ETC_DIR GB_TEST_LOG
 }
 
+# t_rpcd_set_paths_validates_serverside -- gbrpc_set_paths used to
+# duplicate only two of gb_paths_validate's checks inline (absolute,
+# blacklist), leaving a space and a nonexistent path to the LuCI view's own
+# JS -- but set_paths writes straight to flash and the view is not its
+# only caller (the CLI's `paths add` already goes through
+# gb_paths_validate directly). This now routes every entry through
+# paths.sh's own gb_paths_validate, the exact function the CLI already
+# uses, so the two can never validate differently -- and a directory that
+# passes must land in sysupgrade.conf as one line, not expanded.
 t_rpcd_set_paths_validates_serverside() {
+	GB_ROOT="$work/rpcd-paths-root"; export GB_ROOT
+	rm -rf "$GB_ROOT"
+	mkdir -p "$GB_ROOT/etc/config" "$GB_ROOT/root/scripts"
+	: >"$GB_ROOT/etc/config/network"
+
 	GB_TEST_SYSUPGRADE_CONF="$work/rpcd-sysupgrade.conf"
-	out=$(rpcd_call set_paths '{"paths":["/etc/config/network","/proc/cpuinfo","relative","/etc/gitbackup/token","/tmp/x"]}')
+	out=$(rpcd_call set_paths '{"paths":["/etc/config/network","/root/scripts","/proc/cpuinfo","relative","/etc/gitbackup/token","/tmp/x","/etc/config/has space","/etc/config/does-not-exist"]}')
 	assert_json 'set_paths is valid JSON' "$out"
-	contains 'the one valid path is reported written' '"/etc/config/network"' "$out"
+	contains 'the existing file is reported written' '"/etc/config/network"' "$out"
+	contains 'the existing directory is reported written' '"/root/scripts"' "$out"
 	contains '/proc/* is rejected with a reason, not silently' '"/proc/cpuinfo"' "$out"
 	contains 'a relative path is rejected' '"relative"' "$out"
 	contains '/etc/gitbackup/** is rejected as reserved' '"/etc/gitbackup/token"' "$out"
 	contains '/tmp/* is rejected as non-persistent' '"/tmp/x"' "$out"
-	eq 'only the valid path actually lands in sysupgrade.conf' '/etc/config/network' \
+	contains 'a space in the path is now rejected server-side (gb_paths_validate), not only by the JS view' \
+		'contains a space' "$out"
+	contains 'a nonexistent path is now rejected server-side (gb_paths_validate), not only by the JS view' \
+		'no such file or directory' "$out"
+
+	eq 'only the valid entries land in sysupgrade.conf, and the directory is kept as one line, not expanded' \
+		"$(printf '/etc/config/network\n/root/scripts')" \
 		"$(cat "$GB_TEST_SYSUPGRADE_CONF" 2>/dev/null)"
-	unset GB_TEST_SYSUPGRADE_CONF
+
+	unset GB_TEST_SYSUPGRADE_CONF GB_ROOT
 }
 
 # t_rpcd_long_methods_return_immediately -- ticket 10 acceptance criterion:
@@ -4842,6 +4902,7 @@ run_test 'rpcd: status never leaks the secret, only token_set' t_rpcd_status_hid
 run_test 'rpcd: log wraps the CLI'\''s own text' t_rpcd_log_wraps_cli_text
 run_test 'rpcd: pubkey before and after keygen' t_rpcd_pubkey_before_and_after_keygen
 run_test 'rpcd: list_paths' t_rpcd_list_paths
+run_test 'rpcd: list_paths keeps raw sysupgrade.conf separate from the expanded effective set' t_rpcd_list_paths_raw_vs_effective
 run_test 'rpcd: validate_cron -- valid and invalid' t_rpcd_validate_cron
 run_test 'rpcd: call params survive a stdin with no trailing newline (real rpcd shape)' t_rpcd_call_params_survive_no_trailing_newline
 run_test 'rpcd: set_secret writes 0600 and never logs the value' t_rpcd_set_secret_perms_and_no_log

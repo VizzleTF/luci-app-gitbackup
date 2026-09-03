@@ -48,6 +48,8 @@ GB_ROOT="${GB_ROOT:-}"
 . "$GB_SHARE/auth.sh"
 # shellcheck disable=SC1091
 . "$GB_SHARE/schedule.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/paths.sh"
 # card.sh (ticket 09) may not exist on a system built before it landed --
 # same "command -v gb_card" tolerance usr/sbin/gitbackup's own cmd_run
 # already uses, not a new convention invented here.
@@ -201,11 +203,37 @@ gbrpc_pubkey() {
 	fi
 }
 
+# gbrpc_list_paths -- two distinct sets, on purpose (the read/write
+# asymmetry this ticket exists to close): "paths" is the RAW, unexpanded
+# content of GB_SYSUPGRADE_CONF (paths.sh's own gb_paths_list) -- exactly
+# what a human wrote, a directory line included verbatim -- and the only
+# thing gbrpc_set_paths below may ever write back. "effective" is plain
+# `sysupgrade -l`, the full union spec §sysupgrade names
+# (GB_SYSUPGRADE_CONF ∪ /lib/upgrade/keep.d/* ∪ changed conffiles) already
+# recursively expanded to individual files/symlinks. Read-only: it exists
+# for sizing (gb_paths_size_kb's own walk) and so a caller can show what is
+# already covered without the operator having added it. Collapsing the two
+# into one field (the previous shape of this method) is exactly what let a
+# directory a human added survive only until the next `set_paths` call,
+# which would write the already-expanded file list straight back to disk
+# and permanently lose the "anything added to this directory later is
+# covered too" property a real sysupgrade gives a directory line.
 gbrpc_list_paths() {
-	_gb_rpc_paths=$(sysupgrade -l 2>/dev/null)
+	_gb_rpc_raw=$(gb_paths_list)
+	_gb_rpc_eff=$(sysupgrade -l 2>/dev/null)
+
 	printf '{ "paths": ['
 	_gb_rpc_first=1
-	printf '%s\n' "$_gb_rpc_paths" | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
+	printf '%s\n' "$_gb_rpc_raw" | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
+		[ -n "$_gb_rpc_p" ] || continue
+		[ "$_gb_rpc_first" -eq 1 ] || printf ','
+		printf '%s' "$(gb_json_str "$_gb_rpc_p")"
+		_gb_rpc_first=0
+	done
+
+	printf '], "effective": ['
+	_gb_rpc_first=1
+	printf '%s\n' "$_gb_rpc_eff" | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
 		[ -n "$_gb_rpc_p" ] || continue
 		[ "$_gb_rpc_first" -eq 1 ] || printf ','
 		printf '%s' "$(gb_json_str "$_gb_rpc_p")"
@@ -489,15 +517,28 @@ gbrpc_set_secret() {
 	printf '{ "ok": true, "token_set": %s }\n' "$_gb_rpc_token_set"
 }
 
-# gbrpc_set_paths -- writes /etc/sysupgrade.conf, one path per line. Same
-# blacklist the Paths view itself validates against (spec "Paths": "путь не
-# из чёрного списка /etc/gitbackup/**, /proc, /sys, /tmp") is re-checked
-# here, server-side, as a backstop -- the LuCI view (ticket 13) is not this
-# file's only caller, and a write straight to flash is not something to
-# trust a client's own JS validation for. Rejected entries are reported,
-# not silently dropped (spec: "отклоняются с объяснением, а не молча"),
-# but do not abort the whole write -- the remaining, valid paths are still
-# saved.
+# gbrpc_set_paths -- writes /etc/sysupgrade.conf, one RAW path per line,
+# exactly as given (a directory line included, never expanded -- that
+# expansion is sysupgrade's own job at upgrade time, not this method's).
+#
+# Every entry is validated through paths.sh's own gb_paths_validate --
+# the same function the CLI's `gitbackup paths add` already calls -- not a
+# second, hand-rolled copy of its rules. Previously only two of its four
+# checks (absolute, the fixed blacklist) were duplicated here, leaving a
+# space in the path and a nonexistent path to the LuCI view's own JS to
+# catch; that was never a safe backstop, because a write straight to flash
+# is not something to trust a client's own validation for, and this
+# method is not the LuCI view's exclusive caller. Routing through the one
+# shared validator also fixes the JS view's own long-flagged gap: it could
+# never reliably tell a dangling symlink (a legitimate entry, e.g.
+# /etc/resolv.conf) from a genuinely missing path, because no rpcd ACL
+# anywhere grants `fs.lstat`. This function runs ON the router, so `-e ||
+# -L` (gb_paths_validate's own check) sees the real filesystem and gets it
+# right without needing that ACL grant at all.
+#
+# Rejected entries are reported, not silently dropped (spec: "отклоняются
+# с объяснением, а не молча"), but do not abort the whole write -- the
+# remaining, valid paths are still saved.
 gbrpc_set_paths() {
 	_gb_rpc_dir=$(dirname "$GB_SYSUPGRADE_CONF")
 	mkdir -p "$_gb_rpc_dir" 2>/dev/null
@@ -517,19 +558,7 @@ gbrpc_set_paths() {
 	# files, never to a variable this function reads back afterward.
 	_gb_rpc_param_list "$1" '@.paths[*]' | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
 		[ -n "$_gb_rpc_p" ] || continue
-		_gb_rpc_reason=''
-		case "$_gb_rpc_p" in
-			/*) ;;
-			*) _gb_rpc_reason='not an absolute path' ;;
-		esac
-		if [ -z "$_gb_rpc_reason" ]; then
-			case "$_gb_rpc_p" in
-				/etc/gitbackup | /etc/gitbackup/*) _gb_rpc_reason='reserved for gitbackup itself' ;;
-				/proc | /proc/*) _gb_rpc_reason='not a real filesystem path' ;;
-				/sys | /sys/*) _gb_rpc_reason='not a real filesystem path' ;;
-				/tmp | /tmp/*) _gb_rpc_reason='cleared on every reboot' ;;
-			esac
-		fi
+		_gb_rpc_reason=$(gb_paths_validate "$_gb_rpc_p" 2>&1 >/dev/null)
 		if [ -n "$_gb_rpc_reason" ]; then
 			printf '{ "path": %s, "reason": %s }\n' \
 				"$(gb_json_str "$_gb_rpc_p")" "$(gb_json_str "$_gb_rpc_reason")" >>"$_gb_rpc_rej_f"
