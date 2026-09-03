@@ -19,6 +19,12 @@ GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
 . "$GB_SHARE/lib.sh"
 # shellcheck disable=SC1091
 . "$GB_SHARE/device.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/remoteurl.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/visibility.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/auth.sh"
 
 usage() {
 	cat <<'EOF'
@@ -158,6 +164,106 @@ cmd_status() {
 	printf '}\n'
 }
 
+# cmd_test -- `gitbackup test` (ticket 04, spec "Аутентификация" +
+# "Гейт видимости"). Reaches the remote end to end and tells the operator
+# exactly which of the three ways that can fail actually happened, rather
+# than one generic error:
+#
+#   exit 3  network unreachable, or the remote rejected the credentials
+#   exit 4  the repository is publicly visible -- push refused outright
+#
+# Both network-unreachable and auth-rejected land on exit 3: the shared
+# exit-code contract (interfaces.md, "Коды выхода") has exactly one slot for
+# "network or auth", by design -- what tells the two apart for the operator
+# is the message this prints and logs, not the exit code.
+#
+# Deliberately does NOT call lib.sh's gb_have_net as a pre-check (an earlier
+# version of this function did): measured live on the owlab 25.12.4 stand,
+# this image's busybox nc applet does not implement `-w` at all --
+# `nc -w 5 host port` prints nc's usage banner and exits 1 for every host,
+# reachable or not, which made gb_have_net report every remote as
+# unreachable including a real, working connection to github.com. git's own
+# error text already distinguishes "could not connect" from "connected but
+# rejected" without needing a second, less reliable tool to ask first (see
+# _gb_test_classify below) -- confirmed against real output from this same
+# stand for both the https and ssh transports.
+cmd_test() {
+	_gb_parsed=$(gb_parse_url "$GB_URL") ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+	# shellcheck disable=SC2086  # word-splitting is the point: five fields from one line
+	set -- $_gb_parsed
+	_gb_scheme="$1"
+	_gb_host="$2"
+	_gb_port="$3"
+
+	# The visibility gate first: a repository confirmed public is refused
+	# before this ever dials the remote for real, and "could not tell" (exit
+	# 3, spec "Гейт видимости": "3 означает проверить не удалось, а не
+	# можно") is branched on separately from "confirmed not public" (0) --
+	# never folded into "proceed".
+	gb_visibility_ok "$GB_URL"
+	case $? in
+		4) gb_die 4 "$GB_URL is publicly visible to an anonymous request; push refused" ;;
+		3) gb_die 3 "could not verify whether $GB_URL is public (network or provider API unreachable); try again once connectivity is confirmed" ;;
+	esac
+
+	# Host key acceptance only happens here, never in `run` (spec:
+	# "Host key принимается только внутри gitbackup test"). Safe to call on
+	# every `test` run: gb_accept_hostkey itself is a no-op (return 0) once
+	# the key is already trusted. Its own ssh call is what actually dials
+	# the network for an ssh:// remote -- a host that cannot be reached at
+	# all is caught right here (rc 2) rather than falling through to
+	# git ls-remote below.
+	if [ "$_gb_scheme" = ssh ]; then
+		_gb_hk_port="$_gb_port"
+		[ "$_gb_hk_port" != 0 ] || _gb_hk_port=22
+		gb_accept_hostkey "$_gb_host" "$_gb_hk_port"
+		case $? in
+			0) ;;
+			1) gb_die 3 "$_gb_host:$_gb_hk_port host key was not accepted" ;;
+			*) gb_die 3 "$_gb_host:$_gb_hk_port host key could not be obtained -- is the network reachable?" ;;
+		esac
+	fi
+
+	# eval, not process substitution (a bashism this CLI cannot use,
+	# interfaces.md: POSIX sh for busybox ash) -- gb_git_env's own quoting
+	# is what makes this eval safe.
+	eval "$(gb_git_env)"
+	if _gb_err=$(git ls-remote "$GB_URL" 2>&1 >/dev/null); then
+		gb_log notice "gitbackup test: $GB_URL is reachable and authenticated"
+		printf 'ok: %s is reachable and authenticated\n' "$GB_URL"
+		return 0
+	fi
+
+	_gb_test_classify "$_gb_host" "$_gb_err"
+}
+
+# _gb_test_classify <host> <git-stderr> -- the message-only half of the
+# network/auth split: both exit 3 (see cmd_test's own header comment), but
+# the operator still needs to know which one happened. Matched against
+# git's own wording for a connection that never got made at all --
+# confirmed live on the owlab stand: `git ls-remote https://127.0.0.1:1/...`
+# gives "Failed to connect to 127.0.0.1 port 1 ...: Error", and
+# `git ls-remote ssh://git@127.0.0.1:2/...` gives
+# "ssh: connect to host 127.0.0.1 port 2: Connection refused" -- both
+# wrapped in git's own "fatal: unable to access"/"Could not read from
+# remote repository". Anything else (measured: "Permission denied
+# (publickey)" for a real host with the wrong key) is authentication, not
+# network.
+_gb_test_classify() {
+	_gb_h="$1"
+	_gb_e="$2"
+	case "$_gb_e" in
+		*'Could not resolve host'*|*'Failed to connect'*|*'Connection timed out'*| \
+		*'Connection refused'*|*'Network is unreachable'*|*'ssh: connect to host'*|*'No route to host'*)
+			gb_die 3 "cannot reach $_gb_h: $_gb_e"
+			;;
+		*)
+			gb_die 3 "authentication to $GB_URL failed: $_gb_e"
+			;;
+	esac
+}
+
 [ "$#" -ge 1 ] || { usage; exit 0; }
 
 cmd="$1"
@@ -170,7 +276,29 @@ case "$cmd" in
 		gb_status_config
 		cmd_status
 		;;
-	run|collect|diff|keygen|pubkey|test|paths|restore|card|log)
+	keygen)
+		# No gb_validate_config: generating a deploy key depends only on
+		# gitbackup.origin.key_file (which always has a default), never on
+		# GB_URL or the device name -- in the real bootstrap order the key
+		# is generated and its public half handed to the provider BEFORE a
+		# remote url even exists to validate.
+		_gb_force=''
+		for _gb_a in "$@"; do
+			[ "$_gb_a" = '--force' ] && _gb_force=1
+		done
+		gb_keygen "$_gb_force" || exit 1
+		printf 'generated %s\n' "$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)"
+		;;
+	pubkey)
+		# Same reasoning as keygen: reading back a key that may already
+		# exist needs no remote configuration at all.
+		gb_pubkey || exit 1
+		;;
+	test)
+		gb_validate_config
+		cmd_test
+		;;
+	run|collect|diff|paths|restore|card|log)
 		gb_validate_config
 		# Honest placeholders: exit 1 and say so, rather than a stub that
 		# pretends to have run. Each lands in its own ticket.

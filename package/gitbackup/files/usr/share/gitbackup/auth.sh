@@ -1,0 +1,241 @@
+# shellcheck shell=sh
+#
+# gitbackup -- access to the remote (spec "Аутентификация").
+#
+# Exposes gb_git_env, gb_keygen, gb_pubkey and gb_accept_hostkey; every
+# _gb_auth_-prefixed helper below is private and namespaced by module, same
+# convention collect.sh uses (multiple *.sh here end up sourced into the
+# same process by usr/sbin/gitbackup, so a bare _gb_ helper name could
+# collide with a sibling module's). Sourced, never executed: nothing here
+# runs at load time -- GB_ETC_DIR below is a variable assignment from an
+# environment default, not a filesystem access.
+#
+# Depends on lib.sh (gb_log, gb_uci_get) already being sourced by the
+# caller, same convention every other module here uses.
+#
+# GB_ETC_DIR overrides gitbackup's own secrets directory (default
+# /etc/gitbackup). It is deliberately NOT a UCI option: gitbackup.origin.
+# key_file and .token_file already give the operator a path for those two,
+# but known_hosts has no such option in the shipped schema (spec:
+# "known_hosts лежит в /etc/gitbackup/", a fixed location, not configurable)
+# -- this exists only so tests/run.sh can point it at a tmp directory
+# instead of the real /etc/gitbackup, the same seam GB_ROOT/GB_STATE_DIR/
+# GB_SYSFS_NET give the other modules.
+GB_ETC_DIR="${GB_ETC_DIR:-/etc/gitbackup}"
+
+# gb_git_env
+#
+# Prints "export KEY='VALUE'" lines, one per line, quoted so a caller can
+# safely `eval "$(gb_git_env)"` even though GIT_SSH_COMMAND's value itself
+# contains spaces -- and so the assignments are exported into the calling
+# shell's environment, where the `git` child process this whole thing
+# exists for can actually see them.
+#
+# GIT_SSH_COMMAND and GIT_ASKPASS are both always printed, regardless of
+# gitbackup.origin.auth: it is the git remote URL's own scheme (ssh:// vs
+# https://), not this option, that decides which one a given `git`
+# invocation actually uses -- ssh transport never calls GIT_ASKPASS for
+# anything, and GIT_SSH_COMMAND is simply inert for an https transport. Not
+# branching on .auth here means there is exactly one thing to keep in sync
+# with the remote URL parser (remoteurl.sh) instead of two.
+#
+# GIT_SSH_COMMAND carries the four options the spec names by name: -i (the
+# deploy key), UserKnownHostsFile (this package's own known_hosts, never
+# the invoking user's ~/.ssh/known_hosts -- a stale entry there must not be
+# able to either accept or block this package's own host-key decision),
+# StrictHostKeyChecking=yes (an unknown or changed host key is refused,
+# full stop -- gitbackup test is the only place that ever adds one) and
+# BatchMode=yes (never fall back to an interactive passphrase/password
+# prompt that would hang a cron job forever) -- plus ConnectTimeout=15, not
+# named in the spec but added after a live failure on the owlab stand: a
+# host that never answers at all (as opposed to actively refusing the
+# connection) leaves `ssh` hanging with neither of those two safeguards to
+# stop it, well past two minutes with no output. BatchMode only rules out
+# an interactive *prompt*; it does nothing about the TCP handshake itself
+# never completing, which is exactly what a firewalled or simply
+# nonexistent host looks like.
+#
+# GIT_SSL_CAINFO is printed only when gitbackup.origin.ca_file is set, and
+# is the only sanctioned way to talk to a self-signed/private-CA remote:
+# GIT_SSL_NO_VERIFY and http.sslVerify=false are refused even as an option
+# by this package, spec "Аутентификация" and "Границы и швы" -- there is no
+# code path anywhere in this package that can turn certificate verification
+# off, only one that can hand it an extra trusted certificate.
+#
+# Never prints the token itself: GIT_ASKPASS names askpass.sh's path, and
+# the token is read off disk by askpass.sh's own process, later, only once
+# git has actually decided it needs credentials.
+gb_git_env() {
+	_gb_key=$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)
+	_gb_known="$GB_ETC_DIR/known_hosts"
+	_gb_ssh_cmd="ssh -i $(_gb_auth_shquote "$_gb_key") -o UserKnownHostsFile=$(_gb_auth_shquote "$_gb_known") -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15"
+
+	printf 'export GIT_SSH_COMMAND=%s\n' "$(_gb_auth_shquote "$_gb_ssh_cmd")"
+	printf 'export GIT_ASKPASS=%s\n' "$(_gb_auth_shquote "${GB_SHARE:-/usr/share/gitbackup}/askpass.sh")"
+	# Never let git fall back to its own interactive prompt on a real tty --
+	# askpass.sh is the only credential source this package allows.
+	printf 'export GIT_TERMINAL_PROMPT=%s\n' "$(_gb_auth_shquote 0)"
+
+	_gb_ca=$(gb_uci_get gitbackup.origin.ca_file)
+	[ -n "$_gb_ca" ] && printf 'export GIT_SSL_CAINFO=%s\n' "$(_gb_auth_shquote "$_gb_ca")"
+	return 0
+}
+
+# _gb_auth_shquote <string> -- <string> wrapped in single quotes, with any
+# single quote inside it escaped, so the result can be eval'd back to the
+# original value regardless of what it contains (a path with a space is the
+# realistic case here, not an adversarial one, but the quoting is correct
+# either way).
+_gb_auth_shquote() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# gb_keygen [force]
+#
+# Generates the deploy key at gitbackup.origin.key_file (default
+# /etc/gitbackup/id_ed25519): ed25519, no passphrase. No passphrase is
+# deliberate, not an oversight -- GIT_SSH_COMMAND always carries
+# BatchMode=yes (gb_git_env), which refuses to prompt for one, so an
+# encrypted key would simply make every push hang forever instead of
+# failing loudly.
+#
+# Refuses to overwrite a key that already exists unless <force> is a
+# non-empty argument: losing the only copy of a deploy key locks every
+# remote it was already added to until the operator notices and re-adds
+# the new public half everywhere (ticket 04 acceptance criterion).
+#
+# Creates the key's directory at 0700 if it does not exist yet (uci-
+# defaults/99-gitbackup already does this for the default /etc/gitbackup,
+# but gitbackup.origin.key_file can point anywhere), and leaves the
+# private key at 0600 -- ssh-keygen's own default, asserted here rather
+# than trusted, since a future ssh-keygen with a different umask-derived
+# default would otherwise change this package's security posture with no
+# code change on this side to catch it.
+gb_keygen() {
+	_gb_force="${1:-}"
+	_gb_key=$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)
+	if [ -z "$_gb_key" ]; then
+		gb_log err 'gb_keygen: gitbackup.origin.key_file is empty'
+		return 1
+	fi
+
+	if [ -e "$_gb_key" ] && [ -z "$_gb_force" ]; then
+		gb_log err "gb_keygen: $_gb_key already exists; pass a non-empty force argument to replace it"
+		return 1
+	fi
+
+	_gb_dir=$(dirname "$_gb_key")
+	mkdir -p "$_gb_dir" || { gb_log err "gb_keygen: cannot create $_gb_dir"; return 1; }
+	chmod 0700 "$_gb_dir" || return 1
+
+	rm -f "$_gb_key" "$_gb_key.pub"
+	if ! ssh-keygen -t ed25519 -N '' -C gitbackup -f "$_gb_key" >/dev/null; then
+		gb_log err "gb_keygen: ssh-keygen failed for $_gb_key"
+		return 1
+	fi
+	chmod 0600 "$_gb_key" || return 1
+	[ -e "$_gb_key.pub" ] && chmod 0644 "$_gb_key.pub"
+	gb_log notice "gb_keygen: generated $_gb_key"
+	return 0
+}
+
+# gb_pubkey
+#
+# Prints the deploy key's public half. Reads the already-generated .pub
+# file when it is there (the common case, ssh-keygen always writes one),
+# and falls back to deriving it from the private key with `ssh-keygen -y`
+# only if that file is missing -- an operator could plausibly delete just
+# the .pub half by hand and expect this to still work.
+gb_pubkey() {
+	_gb_key=$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)
+	if [ -r "$_gb_key.pub" ]; then
+		cat "$_gb_key.pub"
+		return 0
+	fi
+	if [ -r "$_gb_key" ]; then
+		ssh-keygen -y -f "$_gb_key"
+		return $?
+	fi
+	gb_log err "gb_pubkey: no key at $_gb_key; run 'gitbackup keygen' first"
+	return 1
+}
+
+# gb_accept_hostkey <host> [port]
+#
+# Interactive, and only ever meant to be called from `gitbackup test`
+# (spec: "Host key принимается только внутри gitbackup test"). Fetches the
+# host's SSH key, shows its fingerprint on stderr, asks for a yes/no on
+# stdin, and only on "yes" appends it to this package's own known_hosts
+# (GB_ETC_DIR/known_hosts) -- never the invoking user's ~/.ssh/known_hosts.
+#
+# There is no ssh-keyscan on this image without pulling in the separate
+# openssh-client-utils package (measured on the 25.12.4 stand: `apk info -L
+# openssh-client openssh-keygen` together provide neither ssh-keyscan nor
+# any equivalent) -- rather than growing DEPENDS for one command, this
+# reuses the `ssh` binary DEPENDS already carries. The SSH protocol
+# completes its host-key exchange before user authentication even starts,
+# so `ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes` against a
+# scratch, empty known_hosts file writes the host's key into it regardless
+# of whether the authentication that follows succeeds -- verified live on
+# the owlab stand: `ssh -o UserKnownHostsFile=<scratch> -o
+# StrictHostKeyChecking=accept-new -o BatchMode=yes git@github.com exit`
+# still populates <scratch> with github.com's key even though the command
+# itself exits 255 on "Permission denied (publickey)" right after, because
+# no key for github.com had actually been added yet.
+#
+# Returns 0 once the key is confirmed and recorded (or was already known --
+# see the ssh-keygen -F check below, which makes this safe to call
+# unconditionally from `gitbackup test` every time), 1 when the operator
+# declines, 2 when no host key could be obtained at all (host unreachable,
+# connection refused, DNS failure).
+gb_accept_hostkey() {
+	_gb_host="$1"
+	_gb_port="${2:-22}"
+	case "$_gb_port" in
+		''|0) _gb_port=22 ;;
+	esac
+
+	mkdir -p "$GB_ETC_DIR" 2>/dev/null
+	_gb_known="$GB_ETC_DIR/known_hosts"
+
+	# Already trusted: nothing to accept. Asked of ssh-keygen itself, not a
+	# raw grep, so a known_hosts entry hashed with -H (never written by this
+	# package, but nothing stops an operator from hand-editing the file) is
+	# still recognized correctly.
+	if [ -r "$_gb_known" ] && ssh-keygen -F "$_gb_host" -f "$_gb_known" >/dev/null 2>&1; then
+		return 0
+	fi
+
+	_gb_scratch=$(mktemp "${TMPDIR:-/tmp}/gitbackup-hostkey.XXXXXX") || return 2
+	rm -f "$_gb_scratch"
+
+	# ConnectTimeout=15: same reasoning as gb_git_env's own copy of it -- a
+	# host that never answers at all, rather than actively refusing,
+	# otherwise leaves this hanging well past two minutes (measured live).
+	ssh -o UserKnownHostsFile="$_gb_scratch" -o StrictHostKeyChecking=accept-new \
+		-o BatchMode=yes -o ConnectTimeout=15 -p "$_gb_port" "git@$_gb_host" exit >/dev/null 2>&1
+
+	if [ ! -s "$_gb_scratch" ]; then
+		rm -f "$_gb_scratch"
+		gb_log err "gb_accept_hostkey: could not reach $_gb_host:$_gb_port to obtain its host key"
+		return 2
+	fi
+
+	_gb_fp=$(ssh-keygen -lf "$_gb_scratch" 2>/dev/null)
+	printf 'Host key for %s:%s --\n  %s\nAccept and remember it? [y/N] ' "$_gb_host" "$_gb_port" "$_gb_fp" >&2
+	IFS= read -r _gb_ans
+	case "$_gb_ans" in
+		y|Y|yes|YES) ;;
+		*)
+			rm -f "$_gb_scratch"
+			gb_log notice "gb_accept_hostkey: $_gb_host:$_gb_port declined by the operator"
+			return 1
+			;;
+	esac
+
+	cat "$_gb_scratch" >>"$_gb_known"
+	chmod 0600 "$_gb_known"
+	rm -f "$_gb_scratch"
+	gb_log notice "gb_accept_hostkey: $_gb_host:$_gb_port accepted and recorded in $_gb_known"
+	return 0
+}
