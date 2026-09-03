@@ -1,0 +1,79 @@
+# Shared cron-expression fixtures for gitbackup's schedule validator.
+#
+# Run by both implementations: package/gitbackup/files/usr/share/gitbackup/schedule.sh's
+# gb_cron_valid (tests/run.sh, "schedule.sh: gb_cron_valid fixtures") and the
+# JS validator that ships in htdocs/.../view/gitbackup (ticket 12) -- a
+# disagreement between the two on any row here is a red CI, not a note for
+# later (spec, "Schedule" section: the two validators share this file and a
+# mismatch between them must fail CI).
+#
+# Format: tab-separated, two columns, one case per line.
+#   <expr>	<valid|invalid>
+# Blank lines and lines starting with "#" are ignored. <expr> itself never
+# contains a literal tab or a leading/trailing space, so a plain split on
+# the first tab is enough -- no quoting rules to agree on between sh and JS.
+#
+# Field bounds enforced (measured on the OpenWrt 25.12.4 stand by running
+# busybox crond against fixture crontabs and reading its own parse
+# errors/debug dump): minute 0-59, hour 0-23, day-of-month 1-31, month 1-12,
+# day-of-week 0-6 (NOT 0-7 -- busybox has no Sunday-as-7 alias).
+
+# -- baseline valid forms --
+0 3 * * *	valid
+* * * * *	valid
+59 23 31 12 6	valid
+0 0 1 1 0	valid
+00 03 * * *	valid
+
+# -- @-macros: busybox 25.12 has no CONFIG_FEATURE_CROND_SPECIAL_TIMES table --
+@daily	invalid
+@hourly	invalid
+@reboot	invalid
+@weekly	invalid
+
+# -- field count --
+# (a genuinely empty <expr> is not a case here -- it is indistinguishable
+# from a blank separator line in this format; "* * * *" already exercises
+# the wrong-field-count path a reader would otherwise reach for.)
+* * * *	invalid
+* * * * * *	invalid
+
+# -- out-of-range single values (busybox itself gives "parse error" on each) --
+60 * * * *	invalid
+* 24 * * *	invalid
+* * 32 * *	invalid
+* * 0 * *	invalid
+* * * 13 *	invalid
+* * * 0 *	invalid
+* * * * 7	invalid
+
+# -- ranges --
+0 0-5 * * *	valid
+1-59 * * * *	valid
+0 3 * * 1-5	valid
+5-2 * * * *	invalid
+5- * * * *	invalid
+-5 * * * *	invalid
+1-60 * * * *	invalid
+
+# -- steps --
+*/5 * * * *	valid
+*/59 * * * *	valid
+*/60 * * * *	invalid
+*/0 * * * *	invalid
+10-20/2 * * * *	valid
+10-20/0 * * * *	invalid
+10-20/100 * * * *	invalid
+5/2 * * * *	valid
+
+# -- lists --
+1,15,30 * * * *	valid
+1-5,10-20/2 * * * *	valid
+5,,6 * * * *	invalid
+,5 * * * *	invalid
+5, * * * *	invalid
+
+# -- garbage --
+- * * * *	invalid
+abc * * * *	invalid
+0 3 * * mon	invalid
