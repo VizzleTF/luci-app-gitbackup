@@ -208,20 +208,268 @@ t_bootstrap_dry_run_untouched() {
 }
 
 # --------------------------------------------------------------------------
-# --list's --token has no way into uclient-fetch except a literal argv word
-# (confirmed against uclient's own upstream source -- see the VERIFY comment
-# above gb_bs_list in bootstrap.sh itself). Not fixable without a new
-# dependency this script is not allowed to add, so the acceptance bar here
-# is that the limitation is actually told to whoever passes --token, not
-# silently accepted -- this guards the --help text that says so.
+# --list -- rewritten (ticket 09 follow-up) from an anonymous/token-in-argv
+# REST call to `git ls-remote` over the SAME git+askpass transport the rest
+# of this product uses (bootstrap.sh's own header comment above gb_bs_list).
+# That means --list now needs the package installed (auth.sh/askpass.sh
+# sourced/exec'd for real, not stubbed) to prove anything meaningful, so
+# these tests run the REAL module files from package/gitbackup/files --
+# same boundary this suite's own header already draws for gitio.sh/
+# restore.sh-style integration coverage, just for auth.sh/askpass.sh
+# instead. `git` and `uci` are still stubs (a real router's git/uci, not a
+# dev host's), but ones that round-trip values and replay git's own
+# askpass dance faithfully enough to prove the credential actually flows
+# through GIT_ASKPASS and never through argv.
 # --------------------------------------------------------------------------
 
-t_bootstrap_help_warns_list_token_in_ps() {
+# _bs_stub_list_path -- PATH for the --list tests below. Separate from
+# _bs_stub_path (which only needs to prove "nothing was called" for the
+# --dry-run test above): `git` here fakes the exact askpass exchange real
+# git performs for an authenticated `ls-remote --heads` while logging its
+# own full argv, and `uci` actually stores what it is `set`, unlike
+# _bs_stub_path's log-only version -- auth.sh's gb_git_env and askpass.sh
+# are sourced/exec'd UNMODIFIED here and read gitbackup.origin.* back
+# through real `uci -q get` calls; a stub that always answers empty would
+# make every one of them fall back to a hardcoded default and never prove
+# the credential this test wrote is what actually gets read back.
+_bs_stub_list_path() {
+	_bsl_bin="$work/bin-list"
+	rm -rf "$_bsl_bin"
+	mkdir -p "$_bsl_bin"
+
+	cat >"$_bsl_bin/uclient-fetch" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+	cat >"$_bsl_bin/uci" <<'EOF'
+#!/bin/sh
+db="${GB_TEST_UCIDB:?uci stub: GB_TEST_UCIDB is not set}"
+[ "$1" = -q ] && shift
+case "$1" in
+	get)
+		val=$(grep "^$2=" "$db" 2>/dev/null | tail -n 1)
+		[ -n "$val" ] || exit 1
+		printf '%s\n' "${val#*=}"
+		;;
+	set)
+		key="${2%%=*}"
+		val="${2#*=}"
+		grep -v "^$key=" "$db" >"$db.tmp" 2>/dev/null
+		printf '%s=%s\n' "$key" "$val" >>"$db.tmp"
+		mv "$db.tmp" "$db"
+		;;
+	commit) : ;;
+	*) echo "uci stub: unsupported '$*'" >&2; exit 64 ;;
+esac
+EOF
+
+	cat >"$_bsl_bin/git" <<EOF
+#!/bin/sh
+printf 'git %s\n' "\$*" >>"$work/calls.log"
+if [ "\$1 \$2" = 'ls-remote --heads' ]; then
+	# Replay git's own real askpass dance (auth.sh's gb_git_env sets
+	# GIT_ASKPASS to the real askpass.sh): username prompt first
+	# (discarded, same as real git), then the password prompt -- the
+	# canned branch list below is only printed when the password
+	# askpass.sh actually returned matches what this test configured,
+	# proving the token really did flow through GIT_ASKPASS.
+	if [ -n "\${GIT_ASKPASS:-}" ]; then
+		"\$GIT_ASKPASS" "Username for 'https://example.com': " >/dev/null
+		pass=\$("\$GIT_ASKPASS" "Password for 'https://gitbackup@example.com': ")
+	else
+		pass="\${GB_TEST_EXPECTED_TOKEN:-}"
+	fi
+	if [ "\$pass" != "\${GB_TEST_EXPECTED_TOKEN:-}" ]; then
+		echo 'fatal: Authentication failed' >&2
+		exit 128
+	fi
+	printf 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111\trefs/heads/device/r1\n'
+	printf 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222\trefs/heads/main\n'
+	exit 0
+fi
+exit 0
+EOF
+	chmod +x "$_bsl_bin"/*
+	printf '%s' "$_bsl_bin"
+}
+
+# t_bootstrap_list_never_puts_token_in_argv -- the mutation-sensitive check
+# the ticket asks for: every external command --list can invoke logs its
+# full argv, and the token must never appear in that log. Verified by
+# actually flipping this red once by hand while writing it (reintroducing
+# a `--header=...$token...` argv word into gb_bs_list made this fail; the
+# checked-in version does not).
+t_bootstrap_list_never_puts_token_in_argv() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		GB_BOOTSTRAP_SECRET_DIR="$work/etc-list-argv"
+		export GB_BOOTSTRAP_SECRET_DIR
+		. "$bootstrap"
+
+		GB_SHARE="$root/package/gitbackup/files/usr/share/gitbackup"
+		export GB_SHARE
+
+		stubdir=$(_bs_stub_list_path)
+		rm -f "$work/calls.log"
+		: >"$work/ucidb"
+		GB_TEST_UCIDB="$work/ucidb"
+		export GB_TEST_UCIDB
+		PATH="$stubdir:$PATH"
+
+		token='SECRET_TOKEN_never_in_argv_98765'
+		GB_TEST_EXPECTED_TOKEN="$token"
+		export GB_TEST_EXPECTED_TOKEN
+		GB_BS_REPO='https://example.com/acme/routers'
+		GB_BS_TOKEN="$token"
+		GB_BS_SSHKEY=''
+		GB_BS_FORCE=0
+
+		out=$(gb_bs_list 2>&1)
+		eq 'gb_bs_list against an already-installed package exits 0' '0' "$?"
+		contains 'and lists the device branch it found' 'r1' "$out"
+		case "$out" in
+			*main*) no 'and does not list the non-device/* branch' "$out" ;;
+			*) ok 'and does not list the non-device/* branch' ;;
+		esac
+
+		if grep -q "$token" "$work/calls.log"; then
+			no 'the token never appears in any external command'\''s argv' "$(cat "$work/calls.log")"
+		else
+			ok 'the token never appears in any external command'\''s argv'
+		fi
+		contains 'git is invoked with ls-remote, never a REST call' 'ls-remote' "$(cat "$work/calls.log")"
+	)
+}
+
+# t_bootstrap_list_installs_package_if_missing -- requirement 2's first
+# question: --list installs the package itself when it is not there yet,
+# rather than refusing. gb_bs_install_pkg is redefined here rather than
+# exercised for real: it needs a real OpenWrt image (apk, DISTRIB_RELEASE,
+# /etc/apk/arch) this suite's own header already excludes for the same
+# reason as the main flow's own gb_bs_install_pkg (never called by any
+# existing test either) -- what this test actually proves is that
+# gb_bs_list CALLS it when auth.sh/lib.sh are missing, by having the fake
+# installer materialize the real module files a real apk install would
+# have placed there.
+t_bootstrap_list_installs_package_if_missing() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		GB_BOOTSTRAP_SECRET_DIR="$work/etc-list-install"
+		export GB_BOOTSTRAP_SECRET_DIR
+		. "$bootstrap"
+
+		missing_share="$work/pkg-not-installed-yet"
+		rm -rf "$missing_share"
+		GB_SHARE="$missing_share"
+		export GB_SHARE
+
+		# shellcheck disable=SC2329  # shadows bootstrap.sh's own definition; invoked indirectly via gb_bs_list -> gb_bs_ensure_pkg
+		gb_bs_install_pkg() {
+			printf 'install_pkg called\n' >>"$work/calls.log"
+			mkdir -p "$missing_share"
+			cp "$root/package/gitbackup/files/usr/share/gitbackup/lib.sh" "$missing_share/"
+			cp "$root/package/gitbackup/files/usr/share/gitbackup/auth.sh" "$missing_share/"
+			cp "$root/package/gitbackup/files/usr/share/gitbackup/askpass.sh" "$missing_share/"
+		}
+
+		stubdir=$(_bs_stub_list_path)
+		rm -f "$work/calls.log"
+		: >"$work/ucidb"
+		GB_TEST_UCIDB="$work/ucidb"
+		export GB_TEST_UCIDB
+		PATH="$stubdir:$PATH"
+
+		token='tok-for-install-test'
+		GB_TEST_EXPECTED_TOKEN="$token"
+		export GB_TEST_EXPECTED_TOKEN
+		GB_BS_REPO='https://example.com/acme/routers'
+		GB_BS_TOKEN="$token"
+		GB_BS_SSHKEY=''
+		GB_BS_FORCE=0
+
+		out=$(gb_bs_list 2>&1)
+		eq 'gb_bs_list installs the missing package first, then still succeeds' '0' "$?"
+		contains 'install_pkg was actually called' 'install_pkg called' "$(cat "$work/calls.log")"
+		contains 'and the listing itself still worked afterwards' 'r1' "$out"
+	)
+}
+
+# t_bootstrap_list_skips_install_when_already_installed -- the flip side:
+# an already-installed package (auth.sh/lib.sh present) must not trigger a
+# second, pointless apk run. gb_bs_install_pkg is redefined to a trap that
+# fails the test if it is ever called at all.
+t_bootstrap_list_skips_install_when_already_installed() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		GB_BOOTSTRAP_SECRET_DIR="$work/etc-list-noinstall"
+		export GB_BOOTSTRAP_SECRET_DIR
+		. "$bootstrap"
+
+		GB_SHARE="$root/package/gitbackup/files/usr/share/gitbackup"
+		export GB_SHARE
+
+		# shellcheck disable=SC2329  # shadows bootstrap.sh's own definition; invoked indirectly, if at all, by gb_bs_list -> gb_bs_ensure_pkg
+		gb_bs_install_pkg() { printf 'install_pkg called\n' >>"$work/calls.log"; }
+
+		stubdir=$(_bs_stub_list_path)
+		rm -f "$work/calls.log"
+		: >"$work/ucidb"
+		GB_TEST_UCIDB="$work/ucidb"
+		export GB_TEST_UCIDB
+		PATH="$stubdir:$PATH"
+
+		token='tok-for-noinstall-test'
+		GB_TEST_EXPECTED_TOKEN="$token"
+		export GB_TEST_EXPECTED_TOKEN
+		GB_BS_REPO='https://example.com/acme/routers'
+		GB_BS_TOKEN="$token"
+		GB_BS_SSHKEY=''
+		GB_BS_FORCE=0
+
+		out=$(gb_bs_list 2>&1)
+		eq 'gb_bs_list on an already-installed package exits 0' '0' "$?"
+		if grep -q 'install_pkg called' "$work/calls.log" 2>/dev/null; then
+			no 'an already-installed package is never reinstalled' "$(cat "$work/calls.log")"
+		else
+			ok 'an already-installed package is never reinstalled'
+		fi
+	)
+}
+
+# t_bootstrap_list_dry_run_installs_nothing -- requirement 2's third
+# question: --list --dry-run must not become a surprise install. Every
+# state-changing command is stubbed to log itself (the same _bs_stub_path
+# the plain --dry-run test above uses), and the log must stay empty.
+t_bootstrap_list_dry_run_installs_nothing() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		. "$bootstrap"
+		stubdir=$(_bs_stub_path)
+		rm -f "$work/calls.log"
+		PATH="$stubdir:$PATH"
+		out=$(gb_bs_main --repo https://h/o/r --list --dry-run 2>&1)
+		eq '--list --dry-run exits 0' '0' "$?"
+		contains 'and says nothing was changed' 'nothing was changed' "$out"
+		contains 'and the plan mentions installing the package' 'install' "$out"
+		if [ -r "$work/calls.log" ]; then
+			no '--list --dry-run calls no external command at all' "$(cat "$work/calls.log")"
+		else
+			ok '--list --dry-run calls no external command at all'
+		fi
+	)
+}
+
+# t_bootstrap_help_documents_list_needs_package -- --help must actually
+# say --list now requires/installs the package, replacing the removed
+# warning about token-in-ps for the old REST implementation.
+t_bootstrap_help_documents_list_needs_package() {
 	out=$(sh "$bootstrap" --help 2>&1)
 	eq 'bootstrap.sh --help exits 0' '0' "$?"
-	# shellcheck disable=SC2016  # backtick is prose (a literal command name), not substitution
-	contains '--help documents that --list --token is visible in ps' \
-		'visible in `ps`' "$out"
+	contains '--help documents that --list needs the package installed' \
+		'needs the package installed' "$out"
+	contains 'and that --list --dry-run installs nothing' \
+		'installs nothing' "$out"
 }
 
 # --------------------------------------------------------------------------
@@ -231,7 +479,11 @@ run_test 'bootstrap: gb_bs_host_of covers all four remote URL forms' t_bootstrap
 run_test 'bootstrap: --repo and --device are both required' t_bootstrap_requires_repo_and_device
 run_test 'bootstrap: exactly one of --token/--ssh-key is required' t_bootstrap_requires_exactly_one_credential
 run_test 'bootstrap: --dry-run touches nothing at all' t_bootstrap_dry_run_untouched
-run_test 'bootstrap: --help warns --list --token is visible in ps' t_bootstrap_help_warns_list_token_in_ps
+run_test 'bootstrap: --list never puts the token in any command'\''s argv' t_bootstrap_list_never_puts_token_in_argv
+run_test 'bootstrap: --list installs the package if it is missing' t_bootstrap_list_installs_package_if_missing
+run_test 'bootstrap: --list skips install when the package is already there' t_bootstrap_list_skips_install_when_already_installed
+run_test 'bootstrap: --list --dry-run installs nothing' t_bootstrap_list_dry_run_installs_nothing
+run_test 'bootstrap: --help documents --list needs the package' t_bootstrap_help_documents_list_needs_package
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")

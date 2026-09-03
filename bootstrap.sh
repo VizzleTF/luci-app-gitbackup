@@ -92,6 +92,16 @@ GB_APK_FEED_BASE="${GB_BOOTSTRAP_FEED_BASE:-https://github.com/VizzleTF/luci-app
 
 GB_PKG_NAME='gitbackup'
 
+# GB_BS_SECRET_DIR -- where step 3 writes the credential and where the
+# temporary UCI config below points gitbackup.origin.token_file/.key_file
+# at, so the installed package's own auth.sh/askpass.sh (ticket 04) find
+# exactly what this script just wrote. Same convention as GB_APK_FEED_BASE
+# above: overridable through an environment variable a real invocation
+# never sets, here so tests/bootstrap/run.sh can point it at a scratch
+# directory instead of the real /etc/gitbackup a developer's own host
+# neither owns as root nor wants touched by a unit test.
+GB_BS_SECRET_DIR="${GB_BOOTSTRAP_SECRET_DIR:-/etc/gitbackup}"
+
 # ---------------------------------------------------------------------------
 # small helpers -- no dependency on the not-yet-installed package
 # ---------------------------------------------------------------------------
@@ -115,19 +125,19 @@ Usage: bootstrap.sh --repo URL --device NAME [options]
   --device NAME       the device id to restore (required, unless --list)
   --commit SHA        restore this commit instead of the branch tip (default HEAD)
   --token PAT         personal access token for an https:// --repo
-                      WARNING with --list: uclient-fetch has no way to send
-                      an HTTP header except as a literal argv word, so for
-                      the few hundred ms of that one lookup the token is
-                      visible in `ps` to anyone else with shell access to
-                      this host at that moment (confirmed against uclient's
-                      own source; see the VERIFY comment above gb_bs_list).
-                      Not used this way for the actual restore below.
   --ssh-key PATH      path to an already-registered deploy private key, for an ssh --repo
   --branch NAME       override the device branch template (default device/{device})
   --with-packages     best-effort reinstall of the packages the backup recorded
   --dry-run           print the plan, change nothing
   --force             overwrite an existing credential file, override a board mismatch
-  --list              list the device branches found on --repo and exit; no install
+  --list              list the device branches found on --repo and exit; no restore.
+                      Reads through the same git transport the rest of this
+                      package uses (git ls-remote via GIT_ASKPASS/
+                      GIT_SSH_COMMAND, never a raw --token in argv), so it
+                      needs the package installed -- and installs it itself,
+                      the same signed apk this script always uses, if it is
+                      not there yet. Combined with --dry-run, --list only
+                      prints that plan and installs nothing.
 
 Exactly one of --token or --ssh-key is required for a real run.
 EOF
@@ -243,25 +253,25 @@ gb_bs_install_pkg() {
 # (gitbackup.origin.token_file/.key_file), since the temporary UCI config
 # gb_bs_write_config below sets those defaults explicitly.
 gb_bs_write_credential() {
-	mkdir -p /etc/gitbackup
-	chmod 0700 /etc/gitbackup
+	mkdir -p "$GB_BS_SECRET_DIR"
+	chmod 0700 "$GB_BS_SECRET_DIR"
 
 	if [ -n "$GB_BS_TOKEN" ]; then
-		if [ -e /etc/gitbackup/token ] && [ "$GB_BS_FORCE" -ne 1 ]; then
-			gb_bs_log '/etc/gitbackup/token already exists, keeping it (pass --force to replace it)'
+		if [ -e "$GB_BS_SECRET_DIR/token" ] && [ "$GB_BS_FORCE" -ne 1 ]; then
+			gb_bs_log "$GB_BS_SECRET_DIR/token already exists, keeping it (pass --force to replace it)"
 		else
-			printf '%s\n' "$GB_BS_TOKEN" >/etc/gitbackup/token
-			chmod 0600 /etc/gitbackup/token
+			printf '%s\n' "$GB_BS_TOKEN" >"$GB_BS_SECRET_DIR/token"
+			chmod 0600 "$GB_BS_SECRET_DIR/token"
 		fi
 	fi
 
 	if [ -n "$GB_BS_SSHKEY" ]; then
 		[ -r "$GB_BS_SSHKEY" ] || gb_bs_die "--ssh-key $GB_BS_SSHKEY is not a readable file (copy it onto the router first, e.g. with scp, then pass its path here)"
-		if [ -e /etc/gitbackup/id_ed25519 ] && [ "$GB_BS_FORCE" -ne 1 ]; then
-			gb_bs_log '/etc/gitbackup/id_ed25519 already exists, keeping it (pass --force to replace it)'
+		if [ -e "$GB_BS_SECRET_DIR/id_ed25519" ] && [ "$GB_BS_FORCE" -ne 1 ]; then
+			gb_bs_log "$GB_BS_SECRET_DIR/id_ed25519 already exists, keeping it (pass --force to replace it)"
 		else
-			cp "$GB_BS_SSHKEY" /etc/gitbackup/id_ed25519
-			chmod 0600 /etc/gitbackup/id_ed25519
+			cp "$GB_BS_SSHKEY" "$GB_BS_SECRET_DIR/id_ed25519"
+			chmod 0600 "$GB_BS_SECRET_DIR/id_ed25519"
 		fi
 	fi
 }
@@ -282,8 +292,8 @@ gb_bs_write_credential() {
 gb_bs_write_config() {
 	uci set gitbackup.origin.url="$GB_BS_REPO"
 	[ -n "$GB_BS_BRANCH" ] && uci set gitbackup.origin.branch="$GB_BS_BRANCH"
-	[ -n "$GB_BS_TOKEN" ] && uci set gitbackup.origin.token_file=/etc/gitbackup/token
-	[ -n "$GB_BS_SSHKEY" ] && uci set gitbackup.origin.key_file=/etc/gitbackup/id_ed25519
+	[ -n "$GB_BS_TOKEN" ] && uci set gitbackup.origin.token_file="$GB_BS_SECRET_DIR/token"
+	[ -n "$GB_BS_SSHKEY" ] && uci set gitbackup.origin.key_file="$GB_BS_SECRET_DIR/id_ed25519"
 	uci set gitbackup.main.device_id=custom
 	uci set gitbackup.main.device="$GB_BS_DEVICE"
 	uci commit gitbackup
@@ -342,115 +352,114 @@ gb_bs_propose_reboot() {
 
 # ---------------------------------------------------------------------------
 # --list -- spec acceptance criterion: "показывает доступные устройства и
-# коммиты", with nothing installed yet. Reads the operator's OWN provider
-# API directly (the same anonymous/token-authenticated shape
-# visibility.sh's gb_visibility_ok already relies on for github/gitlab/
-# gitea), because there is no git on the router at this point to `ls-remote`
-# with -- installing the whole package just to answer "which device" would
-# defeat the point of asking first.
-# ---------------------------------------------------------------------------
-
-# VERIFY: the branch-listing endpoints and their JSON shapes below are
-# documented by each provider, not measured live against a real hosted
-# repository from this stand (spec, "Проверенные факты -> Что осталось
-# непроверенным" lists the same gap for gb_visibility_ok's own, simpler
-# probe) -- unlike gb_visibility_ok's single 200/404 check, a full branch
-# list is not something this project's own "Проверенные факты" table
-# confirms against a live API. A provider this does not recognize below
-# falls back to the generic message rather than guessing at a URL shape
-# that might silently return the wrong JSON.
-gb_bs_list() {
-	_gb_l_repo="$1"
-	_gb_l_token="${2:-}"
-
-	_gb_l_host=$(gb_bs_host_of "$_gb_l_repo")
-	case "$_gb_l_repo" in
-		*://*) _gb_l_path="${_gb_l_repo#*://}" ;;
-		*:*) _gb_l_path="${_gb_l_repo#*:}" ;;
-		*) _gb_l_path='' ;;
-	esac
-	_gb_l_path="${_gb_l_path#*/}"
-	case "$_gb_l_path" in
-		*/*) _gb_l_owner="${_gb_l_path%%/*}"; _gb_l_name="${_gb_l_path#*/}" ;;
-		*) gb_bs_die "--repo $_gb_l_repo does not look like host/owner/repo" ;;
-	esac
-	_gb_l_name="${_gb_l_name%.git}"
-
-	# VERIFY: token-in-argv, checked rather than assumed (interfaces.md:
-	# "Секреты: ... никогда в argv"). Confirmed against uclient's own
-	# upstream source (github.com/openwrt/uclient, commit
-	# daad21fa2c17cae54d37149bf27bb3dd78e50a3f -- exactly the
-	# PKG_SOURCE_VERSION OpenWrt 25.12's own package/libs/uclient Makefile
-	# pins) and against the --help of the binary actually installed on the
-	# owlab 25.12.4 stand: uclient-fetch's --header/--user/--password are
-	# plain getopt_long required_argument options (uclient-fetch.c,
-	# L_HEADER/L_USER/L_PASSWORD) with no env var, no config/netrc file, and
-	# no stdin form to feed them from instead. A token passed to this
-	# function has no route into uclient-fetch except as a literal
-	# `--header=Authorization: token ...` (or `PRIVATE-TOKEN: ...`) argv
-	# word, for the sub-second lifetime of this one read-only GET --
-	# visible in `ps`/`/proc/<pid>/cmdline` to anything else with shell
-	# access to this host at that exact moment. Rewriting --list to be
-	# anonymous-only was considered and rejected: the repositories it lists
-	# device branches for are, by this project's own purpose (a router's
-	# OWN backup repo), expected private, so an anonymous-only --list would
-	# just fail outright for the case it exists to serve. Documented here
-	# and in --help's own --token entry instead of silently accepted; the
-	# credential this script actually WRITES to disk (gb_bs_write_credential)
-	# and the one `gitbackup test`/`restore` use afterwards never take this
-	# path -- git's own askpass (auth.sh, ticket 04) is not uclient-fetch and
-	# is unaffected.
-	case "$_gb_l_host" in
-		github.com)
-			_gb_l_api="https://api.github.com/repos/$_gb_l_owner/$_gb_l_name/branches?per_page=100"
-			_gb_l_hdr="Authorization: token $_gb_l_token"
-			_gb_l_namefield='@[*].name'
-			_gb_l_shafield='@[*].commit.sha'
-			;;
-		gitlab.com)
-			_gb_l_api="https://gitlab.com/api/v4/projects/$_gb_l_owner%2F$_gb_l_name/repository/branches?per_page=100"
-			_gb_l_hdr="PRIVATE-TOKEN: $_gb_l_token"
-			_gb_l_namefield='@[*].name'
-			_gb_l_shafield='@[*].commit.id'
-			;;
-		*)
-			gb_bs_log "no branch-listing API known for host '$_gb_l_host' -- open $_gb_l_repo in a browser instead"
-			return 1
-			;;
-	esac
-
-	_gb_l_tmp=$(mktemp "${TMPDIR:-/tmp}/gitbackup-bootstrap-list.XXXXXX") || return 1
-	_gb_l_fetch_ok=1
-	if [ -n "$_gb_l_token" ]; then
-		uclient-fetch --timeout=15 -qO "$_gb_l_tmp" --header="$_gb_l_hdr" "$_gb_l_api" 2>/dev/null || _gb_l_fetch_ok=0
-	else
-		uclient-fetch --timeout=15 -qO "$_gb_l_tmp" "$_gb_l_api" 2>/dev/null || _gb_l_fetch_ok=0
+# коммиты".
+#
+# Rewritten (this ticket, replacing an earlier version that hit each
+# provider's REST API anonymously/with --token in a plain argv word) to go
+# through `git ls-remote` over the exact same transport and authentication
+# the rest of this product uses: GIT_ASKPASS (auth.sh/askpass.sh, ticket
+# 04) for an https --token, GIT_SSH_COMMAND for an ssh --ssh-key. Neither
+# ever puts the credential in argv -- askpass.sh reads the token off a
+# 0600 file only when git itself asks for a password, and the ssh key is
+# named to ssh via `-i`, never inlined. The REST version could not have
+# done this: the repositories --list reads are, by this project's own
+# purpose (a router's own backup repo), expected private, so its only way
+# to authenticate was `--header=Authorization: token ...`/`PRIVATE-TOKEN:
+# ...` as a literal uclient-fetch argument, visible in `ps` for the
+# lifetime of that request (confirmed against uclient's own upstream
+# source, github.com/openwrt/uclient commit
+# daad21fa2c17cae54d37149bf27bb3dd78e50a3f -- the exact PKG_SOURCE_VERSION
+# OpenWrt 25.12's package/libs/uclient Makefile pins -- uclient-fetch's
+# --header/--user/--password are plain getopt_long required_argument
+# options with no env var, config/netrc file, or stdin form to feed them
+# from instead).
+#
+# The price of that guarantee is that --list now needs auth.sh and
+# askpass.sh actually present on disk to source/exec -- i.e. the package
+# installed -- where the REST version needed nothing but uclient-fetch.
+# gb_bs_ensure_pkg below installs it automatically (the same signed apk
+# path gb_bs_main always uses for a real run) rather than refusing outright:
+# refusing would just make the operator re-run this exact command a second
+# time with --list dropped, which accomplishes nothing --list itself could
+# not already do in one step. --list --dry-run never reaches this function
+# at all (see gb_bs_main) -- it only prints the plan, see --help.
+#
+# Shows exactly what the old REST version showed and no less: one line per
+# device/<id> branch, its id and current tip commit sha. `git ls-remote`
+# cannot enumerate a branch's OLDER commits, only its current tip -- but
+# neither could the REST version, which only ever read each branch's own
+# .commit.sha, never a commit list. What is genuinely new here: this works
+# for any host git can reach (self-hosted Gitea/Bitbucket, ssh remotes),
+# not only github.com/gitlab.com over https the way the REST version was
+# limited to.
+#
+# VERIFY: the branch-listing shape (git ls-remote --heads, refs/heads/
+# device/<id>) is exercised in tests/bootstrap/run.sh against a stubbed git
+# that fakes the askpass exchange; a real push/pull to a live private
+# GitHub/GitLab/Gitea repository from this exact code path is this
+# ticket's own mandatory owlab end-to-end run, not a host unit test
+# (interfaces.md: "то, что уже проверено интеграционно на стенде, второй
+# раз в юнит-тестах не проверяется").
+gb_bs_ensure_pkg() {
+	_gb_ep_share="${GB_SHARE:-/usr/share/gitbackup}"
+	if [ -r "$_gb_ep_share/lib.sh" ] && [ -r "$_gb_ep_share/auth.sh" ]; then
+		return 0
 	fi
-	if [ "$_gb_l_fetch_ok" -eq 0 ]; then
-		rm -f "$_gb_l_tmp"
-		gb_bs_log "could not list branches on $_gb_l_repo (network, or the repository/token is wrong) -- open it in a browser instead"
+	gb_bs_log "$GB_PKG_NAME is not installed yet -- --list reads through its own git+askpass transport (see --help); installing it first"
+	gb_bs_install_pkg
+}
+
+gb_bs_list() {
+	gb_bs_check_network "$GB_BS_REPO"
+	gb_bs_ensure_pkg
+
+	_gb_l_share="${GB_SHARE:-/usr/share/gitbackup}"
+	# shellcheck disable=SC1090,SC1091  # GB_SHARE is a runtime path, not resolvable statically
+	. "$_gb_l_share/lib.sh"
+	# shellcheck disable=SC1090,SC1091
+	. "$_gb_l_share/auth.sh"
+	GB_SHARE="$_gb_l_share"
+	export GB_SHARE
+
+	# Same disk locations gb_bs_write_credential just wrote (or left alone,
+	# for a public repo listed with neither flag) -- pointing
+	# gitbackup.origin.* at them is what lets the installed auth.sh's
+	# gb_git_env/askpass.sh find this script's own credential instead of
+	# whatever (if anything) a previous real bootstrap run left configured.
+	gb_bs_write_credential
+	uci set gitbackup.origin.url="$GB_BS_REPO"
+	[ -n "$GB_BS_TOKEN" ] && uci set gitbackup.origin.token_file="$GB_BS_SECRET_DIR/token"
+	[ -n "$GB_BS_SSHKEY" ] && uci set gitbackup.origin.key_file="$GB_BS_SECRET_DIR/id_ed25519"
+	uci commit gitbackup
+
+	# eval, not process substitution (POSIX sh, interfaces.md) -- gb_git_env's
+	# own quoting is what makes this eval safe (auth.sh, ticket 04).
+	eval "$(gb_git_env)"
+
+	_gb_l_out=$(git ls-remote --heads "$GB_BS_REPO" 2>&1)
+	_gb_l_rc=$?
+	if [ "$_gb_l_rc" -ne 0 ]; then
+		gb_bs_log "could not list branches on $GB_BS_REPO: $_gb_l_out"
 		return 1
 	fi
 
-	_gb_l_names=$(jsonfilter -i "$_gb_l_tmp" -e "$_gb_l_namefield" 2>/dev/null)
-	_gb_l_shas=$(jsonfilter -i "$_gb_l_tmp" -e "$_gb_l_shafield" 2>/dev/null)
-	rm -f "$_gb_l_tmp"
-
 	_gb_l_any=0
-	_gb_l_i=1
-	while IFS= read -r _gb_l_n; do
-		case "$_gb_l_n" in
-			device/*)
-				_gb_l_sha=$(printf '%s\n' "$_gb_l_shas" | sed -n "${_gb_l_i}p")
-				printf '%s\t%s\n' "${_gb_l_n#device/}" "${_gb_l_sha:-?}"
+	# No `IFS=` here (unlike the single-field reads elsewhere in this
+	# file): this line has to split on the tab between sha and ref, which
+	# is exactly what read's own default IFS (space/tab/newline) already
+	# does -- an empty IFS would put the whole line into _gb_l_sha instead
+	# and leave _gb_l_ref empty, matching no case branch below.
+	while read -r _gb_l_sha _gb_l_ref; do
+		case "$_gb_l_ref" in
+			refs/heads/device/*)
+				printf '%s\t%s\n' "${_gb_l_ref#refs/heads/device/}" "$_gb_l_sha"
 				_gb_l_any=1
 				;;
 		esac
-		_gb_l_i=$((_gb_l_i + 1))
 	done <<EOF
-$_gb_l_names
+$_gb_l_out
 EOF
-	[ "$_gb_l_any" -eq 1 ] || gb_bs_log "no device/* branches found on $_gb_l_repo yet"
+	[ "$_gb_l_any" -eq 1 ] || gb_bs_log "no device/* branches found on $GB_BS_REPO yet"
 	return 0
 }
 
@@ -511,7 +520,25 @@ gb_bs_main() {
 
 	if [ "$GB_BS_LIST" -eq 1 ]; then
 		[ -n "$GB_BS_REPO" ] || gb_bs_die '--list needs --repo'
-		gb_bs_list "$GB_BS_REPO" "$GB_BS_TOKEN"
+
+		# --list --dry-run: this must NOT reach gb_bs_list, which installs
+		# the package for real when it is missing -- --dry-run's whole
+		# promise is "change nothing" (ticket acceptance criterion), and
+		# an apk install is very much a change. See --help for the same
+		# note.
+		if [ "$GB_BS_DRYRUN" -eq 1 ]; then
+			printf 'dry run -- would:\n'
+			printf '  1. check network reachability of %s\n' "$GB_BS_REPO"
+			printf '  2. install %s from %s if not already installed (--list reads through its own git transport)\n' \
+				"$GB_PKG_NAME" "$GB_APK_FEED_BASE"
+			[ -n "$GB_BS_TOKEN" ] && printf '  3. write %s/token (0600)\n' "$GB_BS_SECRET_DIR"
+			[ -n "$GB_BS_SSHKEY" ] && printf '  3. write %s/id_ed25519 from %s (0600)\n' "$GB_BS_SECRET_DIR" "$GB_BS_SSHKEY"
+			printf '  4. git ls-remote --heads %s and print every device/<id> branch found\n' "$GB_BS_REPO"
+			printf 'nothing was changed.\n'
+			exit 0
+		fi
+
+		gb_bs_list
 		exit $?
 	fi
 
@@ -532,8 +559,8 @@ gb_bs_main() {
 	if [ "$GB_BS_DRYRUN" -eq 1 ]; then
 		printf 'dry run -- would:\n'
 		printf '  1. install %s from %s (apk, signature-checked)\n' "$GB_PKG_NAME" "$GB_APK_FEED_BASE"
-		[ -n "$GB_BS_TOKEN" ] && printf '  2. write /etc/gitbackup/token (0600)\n'
-		[ -n "$GB_BS_SSHKEY" ] && printf '  2. write /etc/gitbackup/id_ed25519 from %s (0600)\n' "$GB_BS_SSHKEY"
+		[ -n "$GB_BS_TOKEN" ] && printf '  2. write %s/token (0600)\n' "$GB_BS_SECRET_DIR"
+		[ -n "$GB_BS_SSHKEY" ] && printf '  2. write %s/id_ed25519 from %s (0600)\n' "$GB_BS_SECRET_DIR" "$GB_BS_SSHKEY"
 		printf '  3. set gitbackup.origin.url=%s, gitbackup.main.device=%s (temporary)\n' "$GB_BS_REPO" "$GB_BS_DEVICE"
 		printf '  4. gitbackup test\n'
 		printf '  5. gitbackup restore --device %s --commit %s --yes%s%s\n' \
@@ -558,7 +585,7 @@ gb_bs_main() {
 	gitbackup test
 	_gb_bs_rc=$?
 	[ "$_gb_bs_rc" -eq 0 ] || {
-		gb_bs_log "gitbackup test failed (exit $_gb_bs_rc) -- the credential in --token/--ssh-key was written to /etc/gitbackup, but does not work against $GB_BS_REPO yet; fix it (wrong PAT scope, deploy key not added to the repo, wrong host key) and re-run \`gitbackup test\` by hand"
+		gb_bs_log "gitbackup test failed (exit $_gb_bs_rc) -- the credential in --token/--ssh-key was written to $GB_BS_SECRET_DIR, but does not work against $GB_BS_REPO yet; fix it (wrong PAT scope, deploy key not added to the repo, wrong host key) and re-run \`gitbackup test\` by hand"
 		exit "$_gb_bs_rc"
 	}
 
