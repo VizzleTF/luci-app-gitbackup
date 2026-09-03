@@ -41,8 +41,19 @@ project:
   # `$(CP) ./files/* $(1)/` installs -- so the mapping is just that tree onto
   # the router's root, stated explicitly rather than left to luci.mk's
   # default (htdocs/ucode/luasrc), which does not apply to a non-LuCI package.
+  #
+  # applications/luci-app-gitbackup/{root,htdocs} (ticket 11) are added the
+  # same way, for the same reason `owlab sync` exists at all: a live look at
+  # the actual page on the stand without a real luci.mk/SDK build, which this
+  # dev environment cannot run (no OpenWrt buildroot checked out here, only
+  # this repo and a standalone checkout of the "luci" feed used for
+  # reference). `root/` mirrors the router's root exactly like
+  # package/gitbackup/files does (menu.d, rpcd/acl.d); `htdocs/` is luci.mk's
+  # own convention for where a LuCI app's web-served tree goes, `/www`.
   install:
     package/gitbackup/files: /
+    applications/luci-app-gitbackup/root: /
+    applications/luci-app-gitbackup/htdocs: /www
 
 defaults:
   fidelity: basic
