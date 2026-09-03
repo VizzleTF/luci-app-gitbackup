@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034  # START and USE_PROCD are read by rc.common, not this file
+#
+# gitbackup runs from cron, not as a daemon, so there is no process for
+# start_service to supervise. This file only wires the package into
+# procd/rc.common; the schedule application and the config-change trigger
+# (spec R106/R107) are schedule.sh's job and land in ticket 06. Left as
+# documented no-ops here on purpose, rather than guessed at.
+
+START=60
+USE_PROCD=1
+
+start_service() {
+	reload_service
+}
+
+stop_service() {
+	:
+}
+
+reload_service() {
+	# Ticket 06: gb_cron_apply writes /etc/crontabs/root from
+	# gitbackup.main.schedule/cron_expr and restarts crond.
+	:
+}
+
+service_triggers() {
+	# Ticket 06: procd_add_reload_trigger "gitbackup", plus the debounced
+	# on-config-change trigger described in spec R106/R107.
+	:
+}

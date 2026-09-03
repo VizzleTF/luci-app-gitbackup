@@ -1,0 +1,59 @@
+# Dev/verification router for gitbackup, via owlab (https://github.com/owfeed/owlab).
+#
+#   ./tools/stage.sh && owfeed build   build the .apk via owfeed, into dist/noarch/ --
+#                                      NOT `owlab build`/the SDK, see owfeed.yml for why
+#   owlab up                           start the router and install owlab's stock set
+#   owlab sync                         copy package/gitbackup/files onto it (no rebuild)
+#   owlab install owrt2512 dist/noarch/gitbackup-*.apk
+#                                      install the owfeed-built apk onto a running router
+#   owlab test --install 'dist/noarch/gitbackup-*.apk' \
+#              --assert 'exec gitbackup status | jsonfilter -e "@.enabled" | grep -q .'
+#                                      one-shot: start, install the built apk, assert, tear down
+#   owlab exec owrt2512 -- gitbackup status
+#   owlab down
+#
+# One router, not a matrix: the spec pins the target to OpenWrt 25.12.x/apk
+# outright ("Стек и ограничения") -- there is no opkg or pre-apk release to
+# also cover here, unlike a LuCI theme that has to survive both.
+#
+# 25.12.4, NOT .5: the stand builds from openwrt/rootfs:x86_64-<release> and
+# that tag has to EXIST in the registry -- 25.12.5 publishes none. CI's
+# workflow pins the same number for the same reason; check
+# `docker manifest inspect openwrt/rootfs:x86_64-<release>` before bumping.
+#
+# Ticket 01 review found a container (owlab-luci-app-gitbackup-r1) left over
+# from before this file was renamed to its current project/router names --
+# `owlab status`/`exec`/`install` never saw it because those are keyed by
+# project name + router id, not by what is actually running in Docker. It was
+# removed by hand (`docker rm -f`) and the stand rebuilt with `owlab up`;
+# `owlab exec` and `owlab install <apk>` both work against it as of that
+# rebuild. If a router looks unreachable again, check `docker ps` for a
+# container whose org.owlab.project/org.owlab.router labels do not match this
+# file before assuming owlab itself is broken.
+
+version: 1
+
+project:
+  name: gitbackup
+
+  # The package lives in a subdirectory and its files/ tree already mirrors
+  # the router's root (etc/, usr/), the same layout the Makefile's
+  # `$(CP) ./files/* $(1)/` installs -- so the mapping is just that tree onto
+  # the router's root, stated explicitly rather than left to luci.mk's
+  # default (htdocs/ucode/luasrc), which does not apply to a non-LuCI package.
+  install:
+    package/gitbackup/files: /
+
+defaults:
+  fidelity: basic
+  arch: auto
+  # No fixtures and no extra packages: gitbackup's own DEPENDS (git,
+  # git-http, ca-bundle, jsonfilter, coreutils-stat, openssh-client,
+  # openssh-keygen) pull in everything it needs once the built .apk is
+  # installed, and that DEPENDS resolution is itself part of what this stand
+  # verifies -- adding the same packages here would hide a wrong DEPENDS.
+
+routers:
+  - id: owrt2512
+    release: "25.12.4"
+    ports: { http: 8028, ssh: 2229 }

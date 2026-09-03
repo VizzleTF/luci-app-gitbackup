@@ -1,0 +1,62 @@
+# Seeded in ticket 01 with what exists so far: shellcheck, the POSIX sh unit
+# tests, and packaging via owfeed (not the OpenWrt SDK -- gitbackup is noarch
+# shell/UCI/JSON, and the SDK spent 40+ minutes under x86_64 emulation to
+# perform a `cp`; see owfeed.yml for the full reasoning). Ticket 15 (blocked
+# by the LuCI views, 11-14) replaces this with the full release pipeline --
+# jsmin, the ACL contract, i18n sync, eslint, and the live owlab/action
+# verification against a real router -- so this file stays small on purpose
+# rather than guessing at gates for code that does not exist yet.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Every job carries a timeout: the GitHub Actions default is six hours, and a
+# hung step is not the same failure as a red one -- it just takes six hours
+# longer to notice.
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          shellcheck -s sh \
+            package/gitbackup/files/usr/share/gitbackup/*.sh \
+            package/gitbackup/files/usr/sbin/gitbackup \
+            package/gitbackup/files/etc/init.d/gitbackup \
+            package/gitbackup/files/etc/uci-defaults/* \
+            tests/run.sh \
+            tools/stage.sh
+
+  unit-tests:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/run.sh
+
+  # Proves the package still builds the way it is actually released: staged by
+  # tools/stage.sh, packaged by owfeed, not the SDK. No sign/index/publish here --
+  # those need a key and belong to the release pipeline ticket 15 adds.
+  build:
+    name: build (owfeed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owfeed/owfeed/setup@v0.5.1
+        with:
+          version: v0.5.1
+      - run: ./tools/stage.sh
+      - run: owfeed build
+      - run: ls dist/noarch/gitbackup-*.apk

@@ -1,0 +1,60 @@
+# How gitbackup's .apk is actually built -- see https://github.com/owfeed/owfeed
+#
+#   ./tools/stage.sh     # produce dist/root, the tree owfeed packages
+#   owfeed build         # dist/noarch/gitbackup-<version>.apk
+#
+# Why this replaced the SDK (ticket 01 review): gitbackup is noarch -- POSIX shell, UCI
+# text and JSON, not one compiled byte -- and an SDK build under x86_64 emulation ran
+# past forty minutes to perform what amounts to a `cp` before it was stopped. What the
+# SDK contributed was three things owfeed also does: the .lmo translation catalogues
+# (unused here -- gitbackup ships none of its own, see applications/luci-app-gitbackup
+# for those, a later ticket), the conffiles/scripts sidecars package-pack.mk emits, and
+# -- critical for this package -- the default_postinst wrapper, without which
+# /etc/uci-defaults/99-gitbackup would never run at all (verified on the owlab stand).
+#
+# The SDK verification did not go away with it: owfeed fetches the host `apk` out of a
+# release SDK and holds it to the same ed25519 signature over sha256sums, with the key
+# pinned from another host.
+#
+# package/gitbackup/Makefile stays, and is not a second source of truth for anything
+# declared here (name, version, depends, conffiles): it is still how anyone can build
+# this package in a real SDK. It IS the source of truth for lifecycle scripts --
+# tools/stage.sh reads postinst/prerm out of it, the same way luci-theme-footstrap's
+# does -- but gitbackup currently defines neither there (see tools/stage.sh for why), so
+# nothing is extracted today and no `scripts:` block appears below.
+version: 1
+
+feed:
+  name: gitbackup
+  # Same disclaimer as luci-theme-footstrap's owfeed.yml: this repository publishes
+  # release assets, not a feed anyone subscribes to. The url only has to satisfy the
+  # schema; `owfeed publish` is never run from here.
+  url: https://github.com/VizzleTF/luci-app-gitbackup
+  title: gitbackup
+  maintainer: "VizzleTF <vizzlef@gmail.com>"
+  license: GPL-2.0-only
+  homepage: https://github.com/VizzleTF/luci-app-gitbackup
+
+publish:
+  - target: github-pages
+
+packages:
+  - name: gitbackup
+    build: mkpkg
+    # Never "all" -- apk rejects it. Matches package/gitbackup/Makefile's PKGARCH:=all,
+    # which is package-pack.mk's spelling of the same fact for an SDK build.
+    arch: noarch
+    version-from: file:./dist/VERSION
+    files: ./dist/root
+    description: "Automatic configuration backup to a Git repository"
+    # Exactly package/gitbackup/Makefile's DEPENDS, each entry earned by a measured
+    # 25.12.4 failure (see the Makefile's own comment): the `+` is package.mk syntax
+    # for "select by default", which has no owfeed equivalent and no meaning here.
+    depends: [git, git-http, ca-bundle, jsonfilter, coreutils-stat, openssh-client, openssh-keygen]
+    license: GPL-2.0-only
+    url: https://github.com/VizzleTF/luci-app-gitbackup
+    maintainer: "VizzleTF <vizzlef@gmail.com>"
+    # /etc/config/gitbackup must survive a package upgrade untouched -- an unnamed
+    # conffile is an ordinary file to apk, replaced on every upgrade with the package
+    # default, wiping the user's configuration.
+    conffiles: ["/etc/config/gitbackup"]

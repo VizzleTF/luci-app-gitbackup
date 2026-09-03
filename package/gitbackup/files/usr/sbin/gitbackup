@@ -1,0 +1,183 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# gitbackup -- CLI entry point and exit-code contract.
+#
+# Exit codes, shared with every module: 0 ok, 1 general error, 2 invalid
+# configuration, 3 network or authentication, 4 refused for safety.
+#
+# GB_SHARE and GB_STATE_DIR are overridable only so tests/run.sh can point
+# this script at a tree that is not /usr/share/gitbackup and a state
+# directory that is not /var/run/gitbackup; the router never sets either.
+
+set -u
+
+GB_SHARE="${GB_SHARE:-/usr/share/gitbackup}"
+GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
+
+# shellcheck disable=SC1091  # GB_SHARE is a runtime path, not resolvable statically
+. "$GB_SHARE/lib.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/device.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: gitbackup <command> [options]
+
+Commands:
+  run        run a backup now
+  status     print current status as JSON
+  collect    build a backup set and manifest without pushing
+  diff       show what changed since the last successful run
+  keygen     generate the SSH deploy key
+  pubkey     print the deploy key's public key
+  test       verify connectivity and remote configuration
+  paths      list the effective sysupgrade paths
+  restore    restore configuration from a commit
+  card       print a recovery card
+  log        show recent gitbackup log entries
+EOF
+}
+
+# gb_cron_looks_valid <expr>
+#
+# A minimal structural check -- not the validator schedule.sh will own once
+# it exists (ticket 06), just enough to keep config validation honest today.
+# busybox crond has no @-macros at all (CONFIG_FEATURE_CROND_SPECIAL_TIMES=n,
+# measured on the 25.12.4 stand) and silently drops any crontab line shorter
+# than six fields, so a config this obviously broken is worth exit 2 now
+# rather than a cron job that never fires and never says why.
+gb_cron_looks_valid() {
+	# shellcheck disable=SC2086  # word-splitting is the point: counting the expression's fields
+	set -- $1
+	[ "$#" -eq 5 ] || return 1
+	case "$1" in '@'*) return 1 ;; esac
+	return 0
+}
+
+# gb_validate_config -- resolves the device name and enforces the config rules
+# from the spec, dying with exit 2 on the first one that fails. For subcommands
+# that actually act on the remote -- run, test, restore, and every other
+# not-implemented-yet stub in this ticket -- an unusable config is worth
+# refusing before anything starts. status does NOT call this (see
+# gb_status_config): a freshly installed router's default config is not an
+# error a read-only status check gets to refuse, only something it has to
+# report honestly. Sets GB_DEVICE, GB_URL and GB_SCRUB for callers.
+gb_validate_config() {
+	GB_DEVICE=$(gb_device_id) || exit $?
+
+	_gb_sched=$(gb_uci_get gitbackup.main.schedule daily)
+	if [ "$_gb_sched" = cron ]; then
+		_gb_cron=$(gb_uci_get gitbackup.main.cron_expr)
+		gb_cron_looks_valid "$_gb_cron" ||
+			gb_die 2 "gitbackup.main.cron_expr: '$_gb_cron' is not a 5-field cron expression busybox crond can run (no @macros)"
+	fi
+
+	GB_URL=$(gb_uci_get gitbackup.origin.url)
+	[ -n "$GB_URL" ] || gb_die 2 'gitbackup.origin.url: empty, a repository url is required'
+
+	GB_SCRUB=$(_gb_effective_scrub)
+}
+
+# _gb_effective_scrub -- R99: a public remote is scrubbed whether the user
+# remembered to say so or not. This overrides only the in-memory decision for
+# this run/status call, not the user's saved gitbackup.security.scrub --
+# silently rewriting their config is its own kind of surprise. Shared by the
+# strict and the lenient validator so the two never disagree about it.
+_gb_effective_scrub() {
+	_gb_vis=$(gb_uci_get gitbackup.origin.visibility private)
+	_gb_scrub=$(gb_uci_get gitbackup.security.scrub 0)
+	if [ "$_gb_vis" = public ] && [ "$(gb_json_bool "$_gb_scrub")" != true ]; then
+		gb_log notice 'gitbackup.origin.visibility=public forces security.scrub on for this run'
+		_gb_scrub=1
+	fi
+	printf '%s\n' "$_gb_scrub"
+}
+
+# gb_status_config -- the same fields gb_validate_config resolves, but never
+# exits. A field that would make the strict validator die instead lands in
+# GB_MISSING (a space-separated list of option names) and GB_CONFIGURED is set
+# to false; `gitbackup status` on the acceptance criterion's fresh-install
+# config (device_id=hostname, hostname 'OpenWrt', empty url) must print valid
+# JSON, not exit 2. Sets GB_DEVICE (possibly empty), GB_URL, GB_SCRUB,
+# GB_CONFIGURED and GB_MISSING.
+gb_status_config() {
+	GB_MISSING=''
+
+	# gb_device_id dies (exit 2) inside this command substitution's own
+	# subshell on any of its three failure modes; the subshell's exit status
+	# lands in $?, and the die's own log line is discarded here rather than
+	# reported twice.
+	if ! GB_DEVICE=$(gb_device_id 2>/dev/null); then
+		GB_DEVICE=''
+		GB_MISSING="$GB_MISSING device_id"
+	fi
+
+	_gb_sched=$(gb_uci_get gitbackup.main.schedule daily)
+	if [ "$_gb_sched" = cron ]; then
+		_gb_cron=$(gb_uci_get gitbackup.main.cron_expr)
+		gb_cron_looks_valid "$_gb_cron" || GB_MISSING="$GB_MISSING cron_expr"
+	fi
+
+	GB_URL=$(gb_uci_get gitbackup.origin.url)
+	[ -n "$GB_URL" ] || GB_MISSING="$GB_MISSING url"
+
+	GB_SCRUB=$(_gb_effective_scrub)
+
+	if [ -n "$GB_MISSING" ]; then
+		GB_CONFIGURED=false
+	else
+		GB_CONFIGURED=true
+	fi
+}
+
+cmd_status() {
+	_gb_enabled=$(gb_uci_get gitbackup.main.enabled 0)
+	_gb_token_file=$(gb_uci_get gitbackup.origin.token_file /etc/gitbackup/token)
+	_gb_token_set=false
+	[ -s "$_gb_token_file" ] && _gb_token_set=true
+
+	_gb_last_run='null'
+	[ -f "$GB_STATE_DIR/last_run" ] && _gb_last_run=$(cat "$GB_STATE_DIR/last_run")
+
+	printf '{\n'
+	printf '  "enabled": %s,\n' "$(gb_json_bool "$_gb_enabled")"
+	printf '  "configured": %s,\n' "$GB_CONFIGURED"
+	printf '  "device": %s,\n' "$(gb_json_str "$GB_DEVICE")"
+	printf '  "scrub": %s,\n' "$(gb_json_bool "$GB_SCRUB")"
+	printf '  "token_set": %s,\n' "$_gb_token_set"
+	printf '  "last_run": %s,\n' "$_gb_last_run"
+	printf '  "missing": ['
+	_gb_first=1
+	for _gb_m in $GB_MISSING; do
+		[ "$_gb_first" -eq 1 ] || printf ','
+		printf '%s' "$(gb_json_str "$_gb_m")"
+		_gb_first=0
+	done
+	printf ']\n'
+	printf '}\n'
+}
+
+[ "$#" -ge 1 ] || { usage; exit 0; }
+
+cmd="$1"
+shift
+
+case "$cmd" in
+	status)
+		# Lenient on purpose: see gb_status_config. A fresh install's default
+		# config must not turn a read-only status check into exit 2.
+		gb_status_config
+		cmd_status
+		;;
+	run|collect|diff|keygen|pubkey|test|paths|restore|card|log)
+		gb_validate_config
+		# Honest placeholders: exit 1 and say so, rather than a stub that
+		# pretends to have run. Each lands in its own ticket.
+		gb_die 1 "$cmd: not implemented yet"
+		;;
+	*)
+		usage >&2
+		gb_die 1 "unknown command '$cmd'"
+		;;
+esac
