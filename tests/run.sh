@@ -35,7 +35,7 @@ only="${1:-}"
 # A missing module has to stop the run here. Every test body is a subshell, and
 # a failed `.` inside one kills that subshell without asserting anything -- the
 # suite would report "0 failed" for code that does not exist.
-for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$share/restore.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup"; do
+for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$share/restore.sh" "$share/card.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup" "$files/usr/libexec/rpcd/luci.gitbackup"; do
 	[ -r "$module" ] || { printf 'missing: %s\n' "$module" >&2; exit 1; }
 done
 
@@ -297,29 +297,65 @@ STUB
 
 cat >"$work/bin/jsonfilter" <<'STUB'
 #!/bin/sh
-# Test double for jsonfilter(1). Supports the two forms the modules use --
-# `jsonfilter -e @.<field>` and, since restore.sh's own board check needs
-# release.target, one level of nesting `jsonfilter -e @.<parent>.<field>` --
-# over a stdin object, and, like the real one, prints nothing and exits 0
-# when the field (or its parent) is absent.
+# Test double for jsonfilter(1). Supports the forms the modules -- and, as
+# of ticket 10, the rpcd plugin -- actually use: `jsonfilter -e @.<field>`
+# for a scalar (a quoted string, confirmed live against the real tool, OR a
+# bare number/true/false/null, also confirmed live -- ticket 10's own
+# params like "lines"/"force"/"dry_run" are never quoted), one level of
+# nesting `@.<parent>.<field>` (restore.sh's own board.release.target), and
+# one level of "@.<field>[*]" array iteration (rpcd's own set_paths, one
+# element per line -- confirmed live too). Like the original stub, this
+# always exits 0 and simply prints nothing for a field that is not there;
+# no caller anywhere in this tree checks this command's exit status, only
+# the string it prints.
 [ "${1:-}" = "-e" ] || { echo "jsonfilter stub: expected -e, got '${1:-}'" >&2; exit 64; }
 expr="${2:-}"
+input=$(cat)
 case "$expr" in
 	@.*) field="${expr#@.}" ;;
 	*) echo "jsonfilter stub: unsupported expression '$expr'" >&2; exit 64 ;;
 esac
+
+# _gb_jf_scalar <json-blob> <key> -- quoted-string match first, then a bare
+# (unquoted) token up to the next comma/brace, so a number or a boolean
+# extracts the same as the real tool's own output for one. Which branch to
+# use is decided by whether a quote actually follows the colon, NOT by
+# whether the quoted match came back empty -- a genuinely empty string
+# value ("value":"") must stay empty, not fall through to the bare-token
+# regex, which would otherwise swallow the closing quote itself as if it
+# were unquoted content (found by t_rpcd_set_secret_perms_and_no_log's own
+# "clear the secret" case: "value":"" was coming back as the two-character
+# string \"\" instead of "").
+_gb_jf_scalar() {
+	if printf '%s' "$1" | grep -q '"'"$2"'"[[:space:]]*:[[:space:]]*"'; then
+		printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+	else
+		printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | \
+			head -n 1 | sed 's/[[:space:]]*$//'
+	fi
+}
+
 case "$field" in
+	*'[*]')
+		key="${field%'[*]'}"
+		printf '%s' "$input" | \
+			sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | \
+			tr ',' '\n' | sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p'
+		;;
 	*.*.*) echo "jsonfilter stub: more than one level of nesting is not supported" >&2; exit 64 ;;
 	*.*)
 		parent="${field%%.*}"
 		child="${field#*.}"
-		sed -n 's/.*"'"$parent"'"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' | \
-			sed -n 's/.*"'"$child"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+		blob=$(printf '%s' "$input" | sed -n 's/.*"'"$parent"'"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p')
+		val=$(_gb_jf_scalar "$blob" "$child")
+		[ -n "$val" ] && printf '%s\n' "$val"
 		;;
 	*)
-		sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+		val=$(_gb_jf_scalar "$input" "$field")
+		[ -n "$val" ] && printf '%s\n' "$val"
 		;;
 esac
+exit 0
 STUB
 
 cat >"$work/bin/logger" <<'STUB'
@@ -3524,6 +3560,470 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# card.sh (ticket 09, spec "Recovery card и RECOVERY.md")
+# --------------------------------------------------------------------------
+
+# t_card_https_token_flag -- an https:// remote's card recommends --token,
+# not --ssh-key: the two auth flags are mutually meaningful by scheme, and
+# handing an operator the wrong one is a dead end read from an offline card
+# with no LuCI available to correct it.
+t_card_https_token_flag() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/card.sh"
+		GB_DEVICE=rt1
+		GB_URL='https://github.com/acme/routers'
+		out="$work/card-https.md"
+		gb_card "$out"
+		eq 'gb_card returns 0' '0' "$?"
+		body=$(cat "$out")
+		contains 'the one-liner carries --repo with the configured URL' '--repo https://github.com/acme/routers' "$body"
+		contains 'and --device with the resolved device id' '--device rt1' "$body"
+		contains 'an https remote is told to bring --token' '--token' "$body"
+		case "$body" in
+			*'--ssh-key'*) no 'and NOT --ssh-key for an https remote' "$body" ;;
+			*) ok 'and NOT --ssh-key for an https remote' ;;
+		esac
+		contains 'links to the repository'\''s own web UI' 'https://github.com/acme/routers' "$body"
+		contains 'names Path 0 for when bootstrap.sh cannot run' 'sysupgrade -r' "$body"
+	)
+}
+
+# t_card_ssh_key_flag -- the scp-like/ssh form gets --ssh-key instead, and
+# its web link is coerced to https (same reasoning as gb_deeplink: a browser
+# can never open an ssh:// URL).
+t_card_ssh_key_flag() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/card.sh"
+		GB_DEVICE=rt2
+		GB_URL='git@gitlab.example.com:acme/routers.git'
+		out="$work/card-ssh.md"
+		gb_card "$out"
+		body=$(cat "$out")
+		contains 'an ssh remote is told to bring --ssh-key' '--ssh-key' "$body"
+		case "$body" in
+			*'--token <TOKEN>'*) no 'and NOT --token for an ssh remote' "$body" ;;
+			*) ok 'and NOT --token for an ssh remote' ;;
+		esac
+		contains 'the web link is coerced to https, never ssh' 'https://gitlab.example.com/acme/routers' "$body"
+	)
+}
+
+# t_card_no_secret -- the card is built from GB_URL/GB_DEVICE alone; neither
+# gb_card nor its output ever touches, nor could ever repeat, the deploy
+# key's private half or the PAT sitting on disk. A marker planted in the
+# very files gb_git_env points at proves that content never gets read into
+# the card by any accidental `cat`.
+t_card_no_secret() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/card.sh"
+		GB_DEVICE=rt1
+		GB_URL='https://github.com/acme/routers'
+		GB_ETC_DIR="$work/card-secret-etc"
+		mkdir -p "$GB_ETC_DIR"
+		printf 'ghp_supersecrettoken\n' >"$GB_ETC_DIR/token"
+		printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nsupersecretkeymaterial\n-----END OPENSSH PRIVATE KEY-----\n' >"$GB_ETC_DIR/id_ed25519"
+		out="$work/card-secret.md"
+		gb_card "$out"
+		body=$(cat "$out")
+		case "$body" in
+			*'ghp_supersecrettoken'*) no 'the token value never appears in the card' "$body" ;;
+			*) ok 'the token value never appears in the card' ;;
+		esac
+		case "$body" in
+			*'supersecretkeymaterial'*) no 'the deploy key'\''s private half never appears in the card' "$body" ;;
+			*) ok 'the deploy key'\''s private half never appears in the card' ;;
+		esac
+	)
+}
+
+# t_card_never_dies -- gb_card is called from the middle of a real backup
+# run (usr/sbin/gitbackup: `gb_card ... 2>/dev/null`), in the SAME process
+# as the run it rides along with. gb_die calls exit, so if gb_card ever hit
+# one on a malformed or missing GB_URL, a cosmetic recovery-document bug
+# would silently abort the actual backup. It must degrade to a shorter card
+# and return 0 instead, for both a garbage URL and no URL/device at all.
+t_card_never_dies() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/card.sh"
+		GB_DEVICE=''
+		GB_URL='not a valid remote url'
+		out="$work/card-garbage.md"
+		gb_card "$out"
+		eq 'a malformed GB_URL still returns 0, never gb_die'\''s exit' '0' "$?"
+		eq 'and still produces a non-empty file' '1' "$([ -s "$out" ] && echo 1 || echo 0)"
+
+		unset GB_DEVICE GB_URL
+		out2="$work/card-empty.md"
+		gb_card "$out2"
+		eq 'no GB_URL/GB_DEVICE at all still returns 0' '0' "$?"
+		eq 'and still produces a non-empty file' '1' "$([ -s "$out2" ] && echo 1 || echo 0)"
+	)
+}
+
+# --------------------------------------------------------------------------
+# rpcd (ticket 10, spec "rpcd и ACL")
+# --------------------------------------------------------------------------
+
+# rpcd <argv...> -- invokes the plugin the same way rpcd(8) itself does
+# (argv, plus one line of JSON on stdin for "call"), pointed at this
+# checkout's own tree/state dir/CLI, same override seam `cli()` above
+# already uses.
+rpcd() {
+	GB_SHARE="$share" GB_STATE_DIR="$work/rpcd-state" GB_BIN="$files/usr/sbin/gitbackup" \
+		GB_LOCK_FILE="$work/rpcd-gitbackup.lock" GB_SYSUPGRADE_CONF="${GB_TEST_SYSUPGRADE_CONF:-$work/rpcd-sysupgrade.conf}" \
+		sh "$files/usr/libexec/rpcd/luci.gitbackup" "$@"
+}
+
+# rpcd_call <method> [<json-params>] -- <json-params> defaults to "{}",
+# matching a real ubus call with no arguments.
+rpcd_call() {
+	printf '%s\n' "${2:-\{\}}" | rpcd call "$1"
+}
+
+# assert_json <name> <json> -- passes silently (no assertion recorded) when
+# python3 is not on PATH, same "skip rather than fake a result" convention
+# t_cli_status_json already established for this exact tradeoff.
+assert_json() {
+	command -v python3 >/dev/null 2>&1 || return 0
+	if printf '%s' "$2" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+		ok "$1"
+	else
+		no "$1" "not valid JSON: [$2]"
+	fi
+}
+
+# t_rpcd_acl_matches_plugin -- the ticket's own explicit acceptance
+# criterion: "каждый метод из ACL существует в плагине, и каждый метод
+# плагина объявлен в ACL -- проверено скриптом, а не глазами". Checked in
+# three independent directions (ACL <-> dispatcher, dispatcher <-> "list")
+# so a method added to only one of the three places -- exactly the failure
+# mode that would leave a button quietly returning "Access denied" to every
+# non-root user, per this ticket's own brief -- fails loud here instead.
+t_rpcd_acl_matches_plugin() {
+	plugin="$files/usr/libexec/rpcd/luci.gitbackup"
+	acl="$root/applications/luci-app-gitbackup/root/usr/share/rpcd/acl.d/luci-app-gitbackup.json"
+
+	[ -r "$acl" ] || { no 'acl.d file exists' "missing: $acl"; return; }
+
+	# Each *_methods variable is newline-joined (sort -u's own output) --
+	# fine for `for x in $var` word-splitting below, but a substring check
+	# needs a SPACE-joined haystack (same "tr '\n' ' '" this file's own
+	# t_config_sections_match_code already relies on for exactly this
+	# reason) -- a `case " $haystack " in *" $needle "*)` against a
+	# newline-joined string never matches at all, since no needle is ever
+	# preceded/followed by a literal space in it, only by a newline.
+	acl_methods=$(awk '
+		/"luci\.gitbackup":/ { grab=1; next }
+		grab && /\]/ { grab=0; next }
+		grab { print }
+	' "$acl" | sed -n 's/.*"\([a-zA-Z_]*\)".*/\1/p' | sort -u)
+	case_methods=$(sed -n 's/^\t\t\t\([a-z_][a-z_]*\)) .*/\1/p' "$plugin" | sort -u)
+	list_methods=$(sed -n 's/^\t"\([a-z_]*\)":.*/\1/p' "$plugin" | sort -u)
+
+	[ -n "$acl_methods" ] || { no 'the ACL parser found at least one method' 'found none -- the parser itself is broken'; return; }
+	[ -n "$case_methods" ] || { no 'the dispatcher parser found at least one method' 'found none -- the parser itself is broken'; return; }
+
+	# Trailing space added explicitly on the outside of each command
+	# substitution, not just via tr's own newline-to-space conversion:
+	# $(...) strips every trailing newline before `tr` ever sees it, so
+	# the LAST (alphabetically, after sort -u) method in each list would
+	# otherwise come out with no trailing space at all and never match its
+	# own " name " substring pattern below -- found by this exact test
+	# failing on "validate_cron" and nothing else, the one entry sort -u
+	# always puts last.
+	acl_hay=" $(printf '%s' "$acl_methods" | tr '\n' ' ') "
+	case_hay=" $(printf '%s' "$case_methods" | tr '\n' ' ') "
+	list_hay=" $(printf '%s' "$list_methods" | tr '\n' ' ') "
+
+	missing_in_dispatcher=''
+	for m in $acl_methods; do
+		case "$case_hay" in
+			*" $m "*) ;;
+			*) missing_in_dispatcher="$missing_in_dispatcher $m" ;;
+		esac
+	done
+	eq 'every ACL-declared luci.gitbackup method exists in the plugin dispatcher' '' "$missing_in_dispatcher"
+
+	missing_in_acl=''
+	for m in $case_methods; do
+		case "$acl_hay" in
+			*" $m "*) ;;
+			*) missing_in_acl="$missing_in_acl $m" ;;
+		esac
+	done
+	eq 'every plugin dispatcher method is declared in the ACL' '' "$missing_in_acl"
+
+	missing_from_list=''
+	for m in $case_methods; do
+		case "$list_hay" in *" $m "*) ;; *) missing_from_list="$missing_from_list $m" ;; esac
+	done
+	eq 'every dispatcher method is also declared by "list"' '' "$missing_from_list"
+
+	missing_from_case=''
+	for m in $list_methods; do
+		case "$case_hay" in *" $m "*) ;; *) missing_from_case="$missing_from_case $m" ;; esac
+	done
+	eq '"list" declares no method the dispatcher does not implement' '' "$missing_from_case"
+
+	# Checked against the parsed method sets, not a raw grep -- the plugin's
+	# own header comment says "get_secret does not exist" in so many words,
+	# which a plain `grep -c get_secret` would count as a hit.
+	eq 'the ACL never declares a get_secret method' '' "$(printf '%s' "$acl_hay" | grep -o ' get_secret ')"
+	eq 'the plugin never dispatches a get_secret method' '' "$(printf '%s' "$case_hay" | grep -o ' get_secret ')"
+	eq 'the ACL grants uci access to the gitbackup package in the read tier' \
+		'1' "$(awk '/"read":/{f=1} f&&/"uci":.*"gitbackup"/{print 1; exit} /"write":/{exit}' "$acl" | grep -c 1)"
+	eq 'the ACL grants uci access to the gitbackup package in the write tier' \
+		'1' "$(awk '/"write":/{f=1} f&&/"uci":.*"gitbackup"/{print 1; exit}' "$acl" | grep -c 1)"
+}
+
+t_rpcd_status_hides_secret() {
+	GB_ETC_DIR="$work/rpcd-etc-status"; export GB_ETC_DIR
+	mkdir -p "$GB_ETC_DIR"
+	printf 'the-actual-secret-value\n' >"$GB_ETC_DIR/token"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git' \
+		"gitbackup.origin.token_file=$GB_ETC_DIR/token"
+	out=$(rpcd_call status)
+	assert_json 'status is valid JSON' "$out"
+	contains 'status reports token_set: true' '"token_set": true' "$out"
+	case "$out" in
+		*'the-actual-secret-value'*) no 'status never contains the secret value' "leaked in [$out]" ;;
+		*) ok 'status never contains the secret value' ;;
+	esac
+	unset GB_ETC_DIR
+}
+
+t_rpcd_log_wraps_cli_text() {
+	printf 'gitbackup: notice: run: pushed abc123 to device/rt1\n' >"$work/rpcd-logread"
+	GB_TEST_LOGREAD="$work/rpcd-logread"; export GB_TEST_LOGREAD
+	out=$(rpcd_call log '{"lines":5}')
+	assert_json 'log is valid JSON' "$out"
+	contains 'log wraps the CLI'\''s own log text in a "text" field' 'pushed abc123' "$out"
+	unset GB_TEST_LOGREAD
+}
+
+t_rpcd_pubkey_before_and_after_keygen() {
+	GB_ETC_DIR="$work/rpcd-etc-pk"; export GB_ETC_DIR
+	fixture "gitbackup.origin.key_file=$GB_ETC_DIR/id_ed25519"
+
+	out=$(rpcd_call pubkey)
+	assert_json 'pubkey error is valid JSON' "$out"
+	contains 'pubkey before keygen answers with a "reason"' '"reason"' "$out"
+
+	rpcd_call keygen >/dev/null
+	out=$(rpcd_call pubkey)
+	assert_json 'pubkey success is valid JSON' "$out"
+	contains 'pubkey after keygen answers with the public key' 'ssh-ed25519' "$out"
+	unset GB_ETC_DIR
+}
+
+t_rpcd_list_paths() {
+	printf '/etc/config/network\n/etc/config/dhcp\n' >"$work/rpcd-sysupgrade-l"
+	GB_TEST_SYSUPGRADE_L="$work/rpcd-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+	out=$(rpcd_call list_paths)
+	assert_json 'list_paths is valid JSON' "$out"
+	contains 'list_paths includes /etc/config/network' '/etc/config/network' "$out"
+	contains 'list_paths includes /etc/config/dhcp' '/etc/config/dhcp' "$out"
+	unset GB_TEST_SYSUPGRADE_L
+}
+
+t_rpcd_validate_cron() {
+	out=$(rpcd_call validate_cron '{"expr":"0 3 * * *"}')
+	assert_json 'validate_cron (valid) is valid JSON' "$out"
+	contains 'a valid expression answers valid: true' '"valid": true' "$out"
+	contains 'and names the next run' '"next"' "$out"
+
+	out=$(rpcd_call validate_cron '{"expr":"@daily"}')
+	assert_json 'validate_cron (invalid) is valid JSON' "$out"
+	contains 'an invalid expression answers valid: false' '"valid": false' "$out"
+	contains 'with a human-readable reason, not just a code' 'busybox crond' "$out"
+}
+
+# t_rpcd_call_params_survive_no_trailing_newline -- found live against the
+# REAL rpcd daemon, never by a manual `printf '...\n' | plugin call ...`
+# test (every `rpcd_call` helper call above does exactly that, trailing
+# newline included, which is precisely why none of them caught this): the
+# real daemon's own call params arrive on stdin with NO trailing newline at
+# all, so `read -r` reads the whole line correctly but still returns
+# nonzero for reaching EOF instead of a newline. An earlier version of the
+# dispatcher's own `IFS= read -r _gb_rpc_input || _gb_rpc_input='{}'`
+# treated that nonzero status as "nothing was read" and threw the real,
+# fully-read params away in favor of an empty "{}" -- which would have
+# silently broken every parameterized method (log/diff/history/
+# validate_cron/set_secret/set_paths/restore) the moment this ran under
+# real ubus, while every hand-typed test here kept looking green.
+t_rpcd_call_params_survive_no_trailing_newline() {
+	out=$(printf '%s' '{"expr":"0 3 * * *"}' | rpcd call validate_cron)
+	contains 'a call param with no trailing newline on stdin still reaches the method' \
+		'"valid": true' "$out"
+}
+
+# t_rpcd_set_secret_perms_and_no_log -- ticket 10 acceptance criterion:
+# "set_secret пишет файл 0600 и не логирует значение".
+t_rpcd_set_secret_perms_and_no_log() {
+	GB_ETC_DIR="$work/rpcd-etc-secret"; export GB_ETC_DIR
+	GB_TEST_LOG="$work/rpcd-logger.log"; export GB_TEST_LOG
+	: >"$GB_TEST_LOG"
+	fixture "gitbackup.origin.token_file=$GB_ETC_DIR/token"
+
+	out=$(rpcd_call set_secret '{"value":"ghp_thisIsTheSecret"}')
+	assert_json 'set_secret is valid JSON' "$out"
+	contains 'set_secret reports token_set: true' '"token_set": true' "$out"
+
+	# The stat stub (this file, above) only answers '%a %u %g' or '%u %g' --
+	# not a bare '%a' -- so the mode is pulled out of the three-field form.
+	_mode=$(stat -c '%a %u %g' "$GB_ETC_DIR/token" 2>/dev/null | awk '{print $1}')
+	eq 'the token file is written 0600' '600' "$_mode"
+
+	case "$out" in
+		*'ghp_thisIsTheSecret'*) no 'the JSON response never echoes the secret value' "leaked in [$out]" ;;
+		*) ok 'the JSON response never echoes the secret value' ;;
+	esac
+	case "$(cat "$GB_TEST_LOG")" in
+		*'ghp_thisIsTheSecret'*) no 'the secret value is never written to the log' "leaked in [$(cat "$GB_TEST_LOG")]" ;;
+		*) ok 'the secret value is never written to the log' ;;
+	esac
+
+	out=$(rpcd_call set_secret '{"value":""}')
+	contains 'clearing the secret reports token_set: false' '"token_set": false' "$out"
+	eq 'and the file exists but is empty, not a lone newline' '0' "$(wc -c <"$GB_ETC_DIR/token" | tr -d ' ')"
+
+	unset GB_ETC_DIR GB_TEST_LOG
+}
+
+t_rpcd_set_paths_validates_serverside() {
+	GB_TEST_SYSUPGRADE_CONF="$work/rpcd-sysupgrade.conf"
+	out=$(rpcd_call set_paths '{"paths":["/etc/config/network","/proc/cpuinfo","relative","/etc/gitbackup/token","/tmp/x"]}')
+	assert_json 'set_paths is valid JSON' "$out"
+	contains 'the one valid path is reported written' '"/etc/config/network"' "$out"
+	contains '/proc/* is rejected with a reason, not silently' '"/proc/cpuinfo"' "$out"
+	contains 'a relative path is rejected' '"relative"' "$out"
+	contains '/etc/gitbackup/** is rejected as reserved' '"/etc/gitbackup/token"' "$out"
+	contains '/tmp/* is rejected as non-persistent' '"/tmp/x"' "$out"
+	eq 'only the valid path actually lands in sysupgrade.conf' '/etc/config/network' \
+		"$(cat "$GB_TEST_SYSUPGRADE_CONF" 2>/dev/null)"
+	unset GB_TEST_SYSUPGRADE_CONF
+}
+
+# t_rpcd_long_methods_return_immediately -- ticket 10 acceptance criterion:
+# "Долгие методы (run, restore, test) не блокируют ubus дольше таймаута".
+# GB_URL points nowhere real, so each backgrounded CLI invocation fails
+# fast on its own -- this test only cares that the ubus-facing call itself
+# never waits around for that to happen.
+t_rpcd_long_methods_return_immediately() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://127.0.0.1:1/o/r.git'
+
+	for m in run test; do
+		_t0=$(date +%s)
+		out=$(rpcd_call "$m")
+		_t1=$(date +%s)
+		assert_json "$m is valid JSON" "$out"
+		contains "$m answers immediately with started: true" '"started": true' "$out"
+		eq "$m's own call returns in well under a second, not after a network timeout" '1' \
+			"$([ "$((_t1 - _t0))" -le 2 ] && echo 1 || echo 0)"
+	done
+
+	_t0=$(date +%s)
+	out=$(rpcd_call restore '{"device":"rt1"}')
+	_t1=$(date +%s)
+	assert_json 'restore is valid JSON' "$out"
+	contains 'restore answers immediately with started: true' '"started": true' "$out"
+	eq 'restore'\''s own call returns immediately too' '1' \
+		"$([ "$((_t1 - _t0))" -le 2 ] && echo 1 || echo 0)"
+
+	out=$(rpcd_call restore '{}')
+	contains 'restore with no device is refused with a reason, never backgrounded blind' '"reason"' "$out"
+}
+
+# t_rpcd_history_and_diff -- against a REAL bare repository (interfaces.md:
+# the one sanctioned exception to stubbing git, same as gitio.sh/restore.sh
+# above), because history/diff (R163i) are this ticket's own on-demand
+# shallow-clone-in-/tmp logic, not a CLI passthrough -- there is nothing
+# else that already proves this plumbing works.
+t_rpcd_history_and_diff() {
+	# Exported before the very first `git` call, not just before the rpcd
+	# call below: the fixture setup a few lines down (a real checkout, two
+	# real commits) needs the stub's real-git passthrough exactly as much
+	# as the method call does -- found by this test itself failing on
+	# "git stub: unsupported subcommand 'init'" the first time through.
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+
+	_bare="$work/rpcd-history-bare.git"
+	_co="$work/rpcd-history-checkout"
+	rm -rf "$_bare" "$_co"
+	git init --bare -q "$_bare"
+	git init -q "$_co"
+	(
+		cd "$_co" || exit 1
+		git config user.email t@t; git config user.name t
+		mkdir -p devices/rt1/files/etc/config
+		printf 'option one x\n' >devices/rt1/files/etc/config/network
+		echo '{"generated":"t1"}' >devices/rt1/manifest.json
+		git add -A
+		GIT_AUTHOR_DATE=2026-08-01T00:00:00 GIT_COMMITTER_DATE=2026-08-01T00:00:00 \
+			git commit -q -m '2026-08-01 00:00 rt1: network'
+		printf 'option one y\n' >devices/rt1/files/etc/config/network
+		printf 'option x 1\n' >devices/rt1/files/etc/config/dhcp
+		echo '{"generated":"t2"}' >devices/rt1/manifest.json
+		git add -A
+		GIT_AUTHOR_DATE=2026-08-02T00:00:00 GIT_COMMITTER_DATE=2026-08-02T00:00:00 \
+			git commit -q -m '2026-08-02 00:00 rt1: network, dhcp'
+		git branch -m device/rt1
+		git remote add origin "$_bare"
+		git push -q origin device/rt1
+	)
+	_sha_old=$(git -C "$_co" log --format=%H | tail -n 1)
+	_sha_new=$(git -C "$_co" log --format=%H | head -n 1)
+
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$_bare"
+
+	out=$(rpcd_call history '{"limit":10}')
+	assert_json 'history is valid JSON' "$out"
+	contains 'history names the resolved branch' '"branch": "device/rt1"' "$out"
+	contains 'history includes the newest commit'\''s sha' "$_sha_new" "$out"
+	contains 'and its date-first subject (G03.1)' '2026-08-02 00:00 rt1' "$out"
+	contains 'and the oldest (root) commit'\''s changed files, --root and all' 'devices/rt1/files/etc/config/network' "$out"
+
+	out=$(rpcd_call diff "{\"from\":\"$_sha_old\",\"to\":\"$_sha_new\"}")
+	assert_json 'diff is valid JSON' "$out"
+	contains 'diff shows the network option changing' '-option one x' "$out"
+	contains 'diff shows dhcp being added' '+option x 1' "$out"
+
+	out=$(rpcd_call diff '{}')
+	contains 'diff with no from/to is refused with a reason' '"reason"' "$out"
+
+	unset GB_TEST_GIT_REAL
+}
+
+# t_rpcd_history_no_backup_yet -- a configured remote whose branch has
+# never been pushed to (a router that has never run `run` yet) is not an
+# error -- an empty history, same as gb_remote_head's own "branch does not
+# exist" contract (gitio.sh) is 0/empty, never a failure.
+t_rpcd_history_no_backup_yet() {
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+	_bare="$work/rpcd-history-empty-bare.git"
+	rm -rf "$_bare"
+	git init --bare -q "$_bare"
+
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$_bare"
+
+	out=$(rpcd_call history '{}')
+	assert_json 'history on a branchless repo is still valid JSON' "$out"
+	contains 'and answers an empty commit list, not an error' '"commits": []' "$out"
+	unset GB_TEST_GIT_REAL
+}
+
+t_rpcd_history_unconfigured() {
+	fixture 'gitbackup.origin.url='
+	out=$(rpcd_call history '{}')
+	assert_json 'history with no remote configured is still valid JSON' "$out"
+	contains 'and explains why, via "reason"' '"reason"' "$out"
+}
+
+# --------------------------------------------------------------------------
 # packaging
 # --------------------------------------------------------------------------
 
@@ -3592,7 +4092,8 @@ t_config_sections_match_code() {
 	declared=$(sed -n "s/^config [A-Za-z0-9_]*[[:space:]]*'\\([A-Za-z0-9_]*\\)'.*/\\1/p" "$cfg" | sort -u | tr '\n' ' ')
 	used=$(grep -oh 'gitbackup\.[A-Za-z0-9_]*\.' \
 		"$share"/*.sh "$files/usr/sbin/gitbackup" \
-		"$files/etc/init.d/gitbackup" "$files/etc/uci-defaults/"* 2>/dev/null |
+		"$files/etc/init.d/gitbackup" "$files/etc/uci-defaults/"* \
+		"$files/usr/libexec/rpcd/luci.gitbackup" 2>/dev/null |
 		sed 's/^gitbackup\.//; s/\.$//' | sort -u)
 	[ -n "$used" ] || { no 'the code addresses at least one gitbackup.<section>.<option>' \
 		'grep found none -- the search itself is broken'; return; }
@@ -3625,6 +4126,7 @@ etc/uci-defaults/99-gitbackup
 usr/sbin/gitbackup
 usr/share/gitbackup/askpass.sh
 usr/share/gitbackup/auth.sh
+usr/share/gitbackup/card.sh
 usr/share/gitbackup/collect.sh
 usr/share/gitbackup/device.sh
 usr/share/gitbackup/exclude.list
@@ -3636,6 +4138,7 @@ usr/share/gitbackup/schedule.sh
 usr/share/gitbackup/scrub.list
 usr/share/gitbackup/scrub.sh
 usr/share/gitbackup/visibility.sh
+usr/libexec/rpcd/luci.gitbackup
 EOF
 	_gb_stray=$(cd "$files" && find . -type f | sed 's#^\./##' | while IFS= read -r _gb_f; do
 		grep -qxF "$_gb_f" "$_gb_allow" || printf '%s\n' "$_gb_f"
@@ -3646,7 +4149,7 @@ EOF
 t_no_bashisms() {
 	found=''
 	for f in "$share"/*.sh "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup" \
-		"$files/etc/uci-defaults/99-gitbackup"; do
+		"$files/etc/uci-defaults/99-gitbackup" "$files/usr/libexec/rpcd/luci.gitbackup"; do
 		grep -n '\[\[\|\${[A-Za-z_]*^^\|<(\|^function ' "$f" >/dev/null 2>&1 &&
 			found="$found $f"
 	done
@@ -3748,6 +4251,23 @@ run_test 'cli: run -- a busy lock is skipped, not an error' t_cli_run_flock_busy
 run_test 'cli: run -- not enough space in /tmp' t_cli_run_space_check_fails
 run_test 'run: integration on a real local bare repository (3 runs)' t_run_integration_bare_repo
 run_test 'cli: log shows run timings (A01)' t_cli_log
+run_test 'card.sh: https remote recommends --token, not --ssh-key' t_card_https_token_flag
+run_test 'card.sh: ssh remote recommends --ssh-key, web link coerced to https' t_card_ssh_key_flag
+run_test 'card.sh: never leaks the token or deploy key onto the card' t_card_no_secret
+run_test 'card.sh: never dies on a malformed or missing GB_URL/GB_DEVICE' t_card_never_dies
+run_test 'rpcd: ACL matches the plugin dispatcher, both directions' t_rpcd_acl_matches_plugin
+run_test 'rpcd: status never leaks the secret, only token_set' t_rpcd_status_hides_secret
+run_test 'rpcd: log wraps the CLI'\''s own text' t_rpcd_log_wraps_cli_text
+run_test 'rpcd: pubkey before and after keygen' t_rpcd_pubkey_before_and_after_keygen
+run_test 'rpcd: list_paths' t_rpcd_list_paths
+run_test 'rpcd: validate_cron -- valid and invalid' t_rpcd_validate_cron
+run_test 'rpcd: call params survive a stdin with no trailing newline (real rpcd shape)' t_rpcd_call_params_survive_no_trailing_newline
+run_test 'rpcd: set_secret writes 0600 and never logs the value' t_rpcd_set_secret_perms_and_no_log
+run_test 'rpcd: set_paths validates server-side' t_rpcd_set_paths_validates_serverside
+run_test 'rpcd: run/test/restore return immediately, not after a timeout' t_rpcd_long_methods_return_immediately
+run_test 'rpcd: history and diff against a real bare repository' t_rpcd_history_and_diff
+run_test 'rpcd: history on a branch with no backup yet' t_rpcd_history_no_backup_yet
+run_test 'rpcd: history with no remote configured' t_rpcd_history_unconfigured
 run_test 'packaging: Makefile contract' t_makefile_contract
 run_test 'packaging: config sections match code' t_config_sections_match_code
 run_test 'packaging: owfeed.yml matches Makefile' t_owfeed_yml_matches_makefile
