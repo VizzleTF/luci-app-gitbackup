@@ -1,0 +1,18 @@
+# gitbackup hard-exclude list.
+#
+# One glob pattern per line, matched against an absolute path -- either one
+# `sysupgrade -l` reported or a directory found while looking for empty
+# directories (collect.sh, _gb_collect_is_excluded). "#" starts a comment,
+# blank lines are ignored. A pattern ending in "/**" matches the path
+# itself and everything under it; anything else is matched with plain
+# shell `case` glob rules.
+#
+# This block is unconditional: it is enforced at every visibility setting.
+# The extra secret-file excludes visibility=public adds (/etc/shadow,
+# dropbear host keys, uhttpd.key, /etc/ssl/private/**, WireGuard private
+# keys -- spec "Scrub") are not here: they depend on a UCI setting this
+# file has no way to read, and belong to scrub.sh instead (ticket 05).
+
+# The package's own credentials must never end up inside its own backup,
+# no matter how the router is configured (R76).
+/etc/gitbackup/**

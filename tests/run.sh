@@ -35,7 +35,7 @@ only="${1:-}"
 # A missing module has to stop the run here. Every test body is a subshell, and
 # a failed `.` inside one kills that subshell without asserting anything -- the
 # suite would report "0 failed" for code that does not exist.
-for module in "$share/lib.sh" "$share/device.sh" "$files/usr/sbin/gitbackup"; do
+for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$files/usr/sbin/gitbackup"; do
 	[ -r "$module" ] || { printf 'missing: %s\n' "$module" >&2; exit 1; }
 done
 
@@ -117,6 +117,73 @@ done
 exit 0
 STUB
 
+cat >"$work/bin/sysupgrade" <<'STUB'
+#!/bin/sh
+# Test double for sysupgrade(1). collect.sh only ever calls `-l`; answers
+# with the contents of GB_TEST_SYSUPGRADE_L, one path per line -- the fixed
+# list ticket 02's tests hand it, standing in for the real tool's own merge
+# of /etc/sysupgrade.conf, /lib/upgrade/keep.d/* and changed conffiles.
+case "${1:-}" in
+	-l|--list-backup) ;;
+	*) echo "sysupgrade stub: unsupported argument '${1:-}'" >&2; exit 64 ;;
+esac
+cat "${GB_TEST_SYSUPGRADE_L:-/dev/null}"
+STUB
+
+cat >"$work/bin/apk" <<'STUB'
+#!/bin/sh
+# Test double for apk(1). collect.sh only ever calls `list --installed`;
+# answers with the contents of GB_TEST_APK_INSTALLED.
+if [ "${1:-}" = "list" ] && [ "${2:-}" = "--installed" ]; then
+	cat "${GB_TEST_APK_INSTALLED:-/dev/null}"
+	exit 0
+fi
+echo "apk stub: unsupported call '$*'" >&2
+exit 64
+STUB
+
+cat >"$work/bin/stat" <<'STUB'
+#!/bin/sh
+# Test double for GNU/busybox stat(1), backed by the host's real stat(1).
+# collect.sh only ever calls `stat -c '%a %u %g' <path>` (no -L, i.e.
+# lstat semantics -- a symlink reports its own mode, never the target's).
+# macOS ships a BSD stat with different flags entirely, so this stub
+# translates on Darwin; elsewhere it defers straight to the real GNU stat,
+# found via the POSIX default PATH so it does not recurse into itself.
+[ "${1:-}" = "-c" ] || { echo "stat stub: expected -c, got '${1:-}'" >&2; exit 64; }
+fmt="$2"; path="$3"
+[ "$fmt" = '%a %u %g' ] || { echo "stat stub: unsupported format '$fmt'" >&2; exit 64; }
+if [ "$(uname -s)" = "Darwin" ]; then
+	/usr/bin/stat -f '%Lp %u %g' "$path"
+else
+	command -p stat -c '%a %u %g' "$path"
+fi
+STUB
+
+cat >"$work/bin/uclient-fetch" <<'STUB'
+#!/bin/sh
+# Test double for uclient-fetch(1). visibility.sh's whole gate rests on how
+# this real tool reports an HTTP status, so the stub has to answer with the
+# real tool's own behavior instead of a shape convenient for the test --
+# verified against openwrt/uclient's uclient-fetch.c (header_done_cb's
+# `default: fprintf(stderr, "HTTP error %d\n", ...); error_ret = 8` for any
+# status code other than 200/204/206/416, and handle_uclient_error's
+# `error_ret = 4` with "Connection error: ..." for a refused/timed-out
+# connection). GB_TEST_HTTP is a file of "<url> <code>" lines, one request
+# answered per matching line; a URL with no matching line behaves like an
+# unreachable host, the same as the real tool facing a dead link -- there is
+# no "answers the same for every URL" fallback, which is the shape of mock
+# that proves nothing (ticket 03's own warning).
+url=""
+for gb_a in "$@"; do url="$gb_a"; done
+code=$(awk -v u="$url" '$1==u{print $2; exit}' "${GB_TEST_HTTP:-/dev/null}")
+case "$code" in
+	2??) exit 0 ;;
+	[0-9][0-9][0-9]) echo "HTTP error $code" >&2; exit 8 ;;
+	*) echo "Connection error: Connection failed" >&2; exit 4 ;;
+esac
+STUB
+
 chmod 0755 "$work/bin"/*
 PATH="$work/bin:$PATH"
 export PATH
@@ -156,6 +223,20 @@ fixture() {
 	for kv in "$@"; do printf '%s\n' "$kv" >>"$work/uci"; done
 	GB_TEST_UCI="$work/uci"
 	export GB_TEST_UCI
+}
+
+# http_fixture <url=code>... -> writes a uclient-fetch fixture and points the
+# stub at it. <code> is a 3-digit HTTP status, or anything else to mean
+# "unreachable" (the stub's fallback case).
+http_fixture() {
+	: >"$work/http"
+	for kv in "$@"; do
+		gb_u="${kv%%=*}"
+		gb_c="${kv#*=}"
+		printf '%s %s\n' "$gb_u" "$gb_c" >>"$work/http"
+	done
+	GB_TEST_HTTP="$work/http"
+	export GB_TEST_HTTP
 }
 
 run_test() {
@@ -373,6 +454,495 @@ t_expand() {
 }
 
 # --------------------------------------------------------------------------
+# collect.sh
+# --------------------------------------------------------------------------
+
+# collect_fixture -- a fake router filesystem under $work/froot, and
+# collect.sh's seams (GB_ROOT, GB_EXCLUDE_LIST, GB_DEVICE, the sysupgrade/apk
+# stubs) pointed at it. Callers add files under $work/froot and call
+# sysupgrade_list before calling gb_collect against $work/out.
+collect_fixture() {
+	rm -rf "$work/froot" "$work/out"
+	mkdir -p "$work/froot/etc" "$work/out"
+	GB_ROOT="$work/froot"; export GB_ROOT
+	GB_EXCLUDE_LIST="$share/exclude.list"; export GB_EXCLUDE_LIST
+	GB_TEST_SYSUPGRADE_L="$work/sysupgrade_l"; export GB_TEST_SYSUPGRADE_L
+	: >"$GB_TEST_SYSUPGRADE_L"
+	GB_TEST_APK_INSTALLED="$work/apk_installed"; export GB_TEST_APK_INSTALLED
+	: >"$GB_TEST_APK_INSTALLED"
+	GB_TEST_BOARD='{"hostname":"testhost","model":"Test Board"}'; export GB_TEST_BOARD
+	GB_DEVICE='rt1'; export GB_DEVICE
+}
+
+# sysupgrade_list <path>... -- appends absolute paths to the sysupgrade -l stub's answer.
+sysupgrade_list() {
+	for gb_p in "$@"; do printf '%s\n' "$gb_p" >>"$GB_TEST_SYSUPGRADE_L"; done
+}
+
+t_collect_layout() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		mkdir -p "$work/froot/etc/config" "$work/froot/etc/apk/repositories.d"
+		printf 'config network\n' >"$work/froot/etc/config/network"
+		sysupgrade_list '/etc/config/network'
+		printf 'https://example.org/repo\n' >"$work/froot/etc/apk/repositories.d/distfeeds.list"
+		printf 'NAME="OpenWrt"\nVERSION_ID="25.12.4"\n' >"$work/froot/etc/os-release"
+
+		gb_collect "$work/out" >/dev/null 2>&1
+		eq 'gb_collect returns 0' '0' "$?"
+
+		eq 'the file lands under files/ with its path preserved' 'config network' \
+			"$(cat "$work/out/files/etc/config/network" 2>/dev/null)"
+
+		for gb_f in board.json installed_packages.txt repositories.txt sysupgrade.conf os-release.txt; do
+			if [ -f "$work/out/meta/$gb_f" ]; then
+				ok "meta/$gb_f is written"
+			else
+				no "meta/$gb_f is written" 'missing'
+			fi
+		done
+		contains 'meta/repositories.txt holds the repositories.d content' \
+			'https://example.org/repo' "$(cat "$work/out/meta/repositories.txt")"
+
+		gb_manifest="$(gb_manifest_path "$work/out")"
+		if [ -f "$gb_manifest" ]; then
+			ok 'manifest.json is written'
+		else
+			no 'manifest.json is written' 'missing'
+		fi
+		contains 'manifest.json names the collected file' \
+			'"path":"/etc/config/network"' "$(cat "$gb_manifest")"
+		contains 'manifest.json records the device from GB_DEVICE' \
+			'"device": "rt1"' "$(cat "$gb_manifest")"
+	)
+}
+
+t_collect_paths_from_sysupgrade_only() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		printf 'a\n' >"$work/froot/etc/listed"
+		printf 'b\n' >"$work/froot/etc/unlisted"
+		sysupgrade_list '/etc/listed'
+
+		gb_collect "$work/out" >/dev/null 2>&1
+
+		if [ -f "$work/out/files/etc/listed" ]; then
+			ok 'a path sysupgrade -l reports is collected'
+		else
+			no 'a path sysupgrade -l reports is collected' 'missing'
+		fi
+		if [ -e "$work/out/files/etc/unlisted" ]; then
+			no 'a path sysupgrade -l does not report is left out' 'it was collected anyway'
+		else
+			ok 'a path sysupgrade -l does not report is left out'
+		fi
+		case "$(cat "$(gb_manifest_path "$work/out")")" in
+			*unlisted*) no 'manifest has no trace of the unlisted file' 'found it' ;;
+			*) ok 'manifest has no trace of the unlisted file' ;;
+		esac
+	)
+}
+
+t_collect_symlink_not_dereferenced() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		mkdir -p "$work/froot/tmp/resolv.conf.d"
+		printf 'nameserver 1.1.1.1\n' >"$work/froot/tmp/resolv.conf.d/resolv.conf.auto"
+		ln -s '/tmp/resolv.conf.d/resolv.conf.auto' "$work/froot/etc/resolv.conf"
+		sysupgrade_list '/etc/resolv.conf'
+
+		gb_collect "$work/out" >/dev/null 2>&1
+
+		if [ -L "$work/out/files/etc/resolv.conf" ]; then
+			ok 'the collected path is still a symlink'
+		else
+			no 'the collected path is still a symlink' 'it was dereferenced into a regular file'
+		fi
+		eq 'the symlink target is preserved verbatim' '/tmp/resolv.conf.d/resolv.conf.auto' \
+			"$(readlink "$work/out/files/etc/resolv.conf")"
+
+		gb_manifest_text="$(cat "$(gb_manifest_path "$work/out")")"
+		contains 'manifest records it as type symlink' '"type":"symlink"' "$gb_manifest_text"
+		contains 'manifest records the target instead of hashing content' \
+			'"target":"/tmp/resolv.conf.d/resolv.conf.auto"' "$gb_manifest_text"
+	)
+}
+
+t_collect_file_manifest_fields() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		printf 'secret-ish content\n' >"$work/froot/etc/thing"
+		chmod 600 "$work/froot/etc/thing"
+		sysupgrade_list '/etc/thing'
+
+		gb_collect "$work/out" >/dev/null 2>&1
+		gb_manifest_text="$(cat "$(gb_manifest_path "$work/out")")"
+
+		# The expected hash comes from sha256sum on the source, not from any
+		# path collect.sh itself takes to produce it.
+		gb_want_sha=$(sha256sum "$work/froot/etc/thing" | awk '{print $1}')
+		contains 'manifest records the type as file' '"type":"file"' "$gb_manifest_text"
+		contains 'manifest records the file mode' '"mode":600' "$gb_manifest_text"
+		contains 'manifest records the sha256 of the content' \
+			"\"sha256\":\"$gb_want_sha\"" "$gb_manifest_text"
+	)
+}
+
+t_collect_empty_dir() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		mkdir -p "$work/froot/etc/empty" "$work/froot/etc/nonempty"
+		printf 'x\n' >"$work/froot/etc/nonempty/file"
+		sysupgrade_list '/etc/nonempty/file'
+		printf '/etc/empty\n/etc/nonempty\n' >"$work/froot/etc/sysupgrade.conf"
+
+		gb_collect "$work/out" >/dev/null 2>&1
+		gb_manifest_text="$(cat "$(gb_manifest_path "$work/out")")"
+
+		contains 'an empty directory becomes a dir entry' \
+			'{"path":"/etc/empty","type":"dir"' "$gb_manifest_text"
+		case "$gb_manifest_text" in
+			*'"path":"/etc/nonempty","type":"dir"'*)
+				no 'a directory that has content gets no dir entry of its own' 'it did' ;;
+			*) ok 'a directory that has content gets no dir entry of its own' ;;
+		esac
+	)
+}
+
+t_collect_empty_dir_trailing_slash_source() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		# /lib/upgrade/keep.d/* lines name a directory with a trailing "/"
+		# (measured on the 25.12.4 owlab stand, e.g. base-files' own
+		# "/etc/config/") -- found live because it made the path in the
+		# manifest come out as "/etc/config/" instead of "/etc/config".
+		mkdir -p "$work/froot/lib/upgrade/keep.d" "$work/froot/etc/trailing"
+		printf '/etc/trailing/\n' >"$work/froot/lib/upgrade/keep.d/some-pkg"
+
+		gb_collect "$work/out" >/dev/null 2>&1
+		gb_manifest_text="$(cat "$(gb_manifest_path "$work/out")")"
+
+		contains 'the trailing slash in the source line is stripped from the manifest path' \
+			'"path":"/etc/trailing","type":"dir"' "$gb_manifest_text"
+		case "$gb_manifest_text" in
+			*'/etc/trailing/"'*)
+				no 'the manifest path never carries a trailing slash' 'it did' ;;
+			*) ok 'the manifest path never carries a trailing slash' ;;
+		esac
+	)
+}
+
+t_collect_hard_exclude() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		mkdir -p "$work/froot/etc/gitbackup"
+		printf 'shh\n' >"$work/froot/etc/gitbackup/token"
+		sysupgrade_list '/etc/gitbackup/token'
+		printf '/etc/gitbackup\n' >"$work/froot/etc/sysupgrade.conf"
+
+		gb_collect "$work/out" >/dev/null 2>&1
+
+		if [ -e "$work/out/files/etc/gitbackup" ]; then
+			no '/etc/gitbackup is absent from the tree' 'it was collected'
+		else
+			ok '/etc/gitbackup is absent from the tree'
+		fi
+		case "$(cat "$(gb_manifest_path "$work/out")")" in
+			*gitbackup*) no '/etc/gitbackup is absent from the manifest' 'found it' ;;
+			*) ok '/etc/gitbackup is absent from the manifest' ;;
+		esac
+	)
+}
+
+t_collect_manifest_equal() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		gb_a="$work/manifest_a.json"
+		gb_b="$work/manifest_b.json"
+		gb_c="$work/manifest_c.json"
+		cat >"$gb_a" <<'EOF'
+{
+  "version": "1",
+  "generated": "2026-01-01T00:00:00Z",
+  "hostname": "r1",
+  "device": "r1",
+  "openwrt": "25.12.4",
+  "board": "generic",
+  "entries": [
+    {"path":"/etc/config/network","type":"file","mode":644,"uid":0,"gid":0,"sha256":"abc"}
+  ],
+  "scrubbed": [
+  ]
+}
+EOF
+		# Same entries/scrubbed, different generated timestamp and hostname:
+		# neither participates in the comparison (spec, "Сбор и manifest.json").
+		cat >"$gb_b" <<'EOF'
+{
+  "version": "1",
+  "generated": "2026-06-15T12:30:00Z",
+  "hostname": "r1-renamed",
+  "device": "r1",
+  "openwrt": "25.12.4",
+  "board": "generic",
+  "entries": [
+    {"path":"/etc/config/network","type":"file","mode":644,"uid":0,"gid":0,"sha256":"abc"}
+  ],
+  "scrubbed": [
+  ]
+}
+EOF
+		# Same file, mode changed by a chmod: must be caught (R24's own test).
+		cat >"$gb_c" <<'EOF'
+{
+  "version": "1",
+  "generated": "2026-01-01T00:00:00Z",
+  "hostname": "r1",
+  "device": "r1",
+  "openwrt": "25.12.4",
+  "board": "generic",
+  "entries": [
+    {"path":"/etc/config/network","type":"file","mode":600,"uid":0,"gid":0,"sha256":"abc"}
+  ],
+  "scrubbed": [
+  ]
+}
+EOF
+		gb_manifest_equal "$gb_a" "$gb_b"
+		eq 'two runs with the same entries are equal despite generated/hostname differing' '0' "$?"
+		gb_manifest_equal "$gb_a" "$gb_c"
+		eq 'a mode change (chmod) makes the manifests unequal' '1' "$?"
+	)
+}
+
+t_collect_json_special_chars() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		gb_weird='/etc/weird "name" тест.conf'
+		printf 'x\n' >"$work/froot$gb_weird"
+		sysupgrade_list "$gb_weird"
+
+		gb_collect "$work/out" >/dev/null 2>&1
+		gb_manifest_file="$(gb_manifest_path "$work/out")"
+
+		if command -v python3 >/dev/null 2>&1; then
+			if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$gb_manifest_file" 2>/dev/null; then
+				ok 'manifest.json stays valid JSON with quotes, spaces and non-ASCII in a path'
+			else
+				no 'manifest.json stays valid JSON with quotes, spaces and non-ASCII in a path' \
+					"$(cat "$gb_manifest_file")"
+			fi
+		fi
+		contains 'the quote in the path is escaped, not left to break the JSON' \
+			'\"name\"' "$(cat "$gb_manifest_file")"
+	)
+}
+
+# --------------------------------------------------------------------------
+# remoteurl.sh
+# --------------------------------------------------------------------------
+
+t_remoteurl_valid_forms() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"
+		# url|scheme host port owner repo -- port is "0" when the URL named
+		# none (remoteurl.sh does not guess a scheme's default, see its own
+		# comment on gb_parse_url). 14 fixtures: the scp-like form (with and
+		# without an explicit user@, since git accepts both), ssh:// with and
+		# without a port, https:// with and without a port, self-hosted hosts,
+		# with and without a trailing .git, and dots/dashes in owner/repo.
+		while IFS='|' read -r gb_url gb_want; do
+			[ -n "$gb_url" ] || continue
+			gb_got=$(gb_parse_url "$gb_url") || gb_got='<rejected>'
+			eq "parses: $gb_url" "$gb_want" "$gb_got"
+		done <<'FIXTURES'
+git@github.com:owner/repo.git|ssh github.com 0 owner repo
+git@gitlab.com:group/repo|ssh gitlab.com 0 group repo
+git@git.example.com:my-org/my.repo.git|ssh git.example.com 0 my-org my.repo
+example.com:owner/repo.git|ssh example.com 0 owner repo
+ssh://git@example.com:2222/owner/repo.git|ssh example.com 2222 owner repo
+ssh://git@github.com/owner/repo.git|ssh github.com 0 owner repo
+ssh://git@example.com/owner.name/repo.name.git|ssh example.com 0 owner.name repo.name
+https://git.example.com:8443/owner/repo.git|https git.example.com 8443 owner repo
+https://github.com/owner/repo.git|https github.com 0 owner repo
+https://gitlab.com/owner/repo|https gitlab.com 0 owner repo
+https://git.example.com:3000/my-org/my-repo.git|https git.example.com 3000 my-org my-repo
+https://bitbucket.org/workspace/repo.git|https bitbucket.org 0 workspace repo
+git@codeberg.org:owner/repo.git|ssh codeberg.org 0 owner repo
+https://host:1/o/r|https host 1 o r
+FIXTURES
+	)
+}
+
+t_remoteurl_garbage_rejected() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"
+		# A malformed URL must fail outright, not get parsed halfway into a
+		# wrong-but-plausible {scheme,host,owner,repo} (ticket 03 acceptance
+		# criterion) -- gb_parse_url must print nothing and return non-zero.
+		for gb_url in \
+			'ftp://host/owner/repo' \
+			'https://host/onlyowner' \
+			'git@host:owner' \
+			'https://host/owner/repo/extra' \
+			'not a url at all' \
+			'' \
+			'https://host:abc/owner/repo' \
+			'/local/path:owner/repo'
+		do
+			gb_got=$(gb_parse_url "$gb_url")
+			gb_rc=$?
+			eq "rejected outright: '$gb_url'" '1' "$gb_rc"
+			eq "and nothing was printed for: '$gb_url'" '' "$gb_got"
+		done
+	)
+}
+
+t_remoteurl_provider() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"
+		fixture 'gitbackup.origin.provider=auto'
+		eq 'github.com is detected as github' 'github' "$(gb_provider github.com)"
+		eq 'gitlab.com is detected as gitlab' 'gitlab' "$(gb_provider gitlab.com)"
+		eq 'bitbucket.org is detected as bitbucket' 'bitbucket' "$(gb_provider bitbucket.org)"
+		# Codeberg runs Forgejo, whose anonymous repo API is shaped like
+		# Gitea's (spec, "Проверенные факты"); the UCI provider enum has no
+		# separate codeberg/forgejo value.
+		eq 'codeberg.org is detected as gitea (forgejo-compatible API)' 'gitea' "$(gb_provider codeberg.org)"
+		eq 'an unrecognized host falls back to generic' 'generic' "$(gb_provider git.example.com)"
+
+		fixture 'gitbackup.origin.provider=gitea'
+		eq 'an explicit option provider wins over host detection' 'gitea' "$(gb_provider github.com)"
+	)
+}
+
+t_remoteurl_deeplink() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"
+		eq 'github deep link' 'https://github.com/acme/site/settings/keys/new' \
+			"$(gb_deeplink github https github.com acme site)"
+		eq 'gitlab deep link is built from the remote'\''s own host, not gitlab.com' \
+			'https://gitlab.example.com/acme/site/-/settings/repository' \
+			"$(gb_deeplink gitlab ssh gitlab.example.com acme site)"
+		eq 'gitea/forgejo deep link is built from the remote'\''s own host' \
+			'https://git.example.com/acme/site/settings/keys' \
+			"$(gb_deeplink gitea ssh git.example.com acme site)"
+		eq 'bitbucket deep link' 'https://bitbucket.org/acme/site/admin/access-keys/' \
+			"$(gb_deeplink bitbucket https bitbucket.org acme site)"
+		gb_out=$(gb_deeplink generic ssh git.example.com acme site)
+		contains 'generic gets an instruction naming authorized_keys, not a link' 'authorized_keys' "$gb_out"
+		contains 'and it recommends restrict,command="git-shell"' 'git-shell' "$gb_out"
+		case "$gb_out" in
+			http*://*) no 'the generic instruction is not itself a clickable URL' "$gb_out" ;;
+			*) ok 'the generic instruction is not itself a clickable URL' ;;
+		esac
+	)
+}
+
+# --------------------------------------------------------------------------
+# visibility.sh
+# --------------------------------------------------------------------------
+
+t_visibility_public_refused() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/visibility.sh"
+		fixture 'gitbackup.origin.provider=auto'
+		GB_STATE_DIR="$work/vis-public"; export GB_STATE_DIR
+		# The mock varies per URL on purpose (ticket 03: "мок, который отвечает
+		# одинаково на любой URL, ничего не проверяет") -- this is the one
+		# acceptance criterion the ticket calls out by name: a repository the
+		# provider's anonymous API answers 200 for must come back exit 4, so
+		# whatever calls gb_visibility_ok in `run` (ticket 04/05) never pushes.
+		http_fixture 'https://api.github.com/repos/acme/pub=200'
+		( gb_visibility_ok 'https://github.com/acme/pub.git' ) >/dev/null 2>&1
+		eq 'a repository visible to an anonymous GET is refused with exit 4' '4' "$?"
+	)
+}
+
+t_visibility_private_ok() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/visibility.sh"
+		fixture 'gitbackup.origin.provider=auto'
+		GB_STATE_DIR="$work/vis-private"; export GB_STATE_DIR
+		http_fixture 'https://api.github.com/repos/acme/priv=404'
+		( gb_visibility_ok 'https://github.com/acme/priv.git' ) >/dev/null 2>&1
+		eq 'a 404 (private or nonexistent -- anonymously the same answer) is let through, exit 0' \
+			'0' "$?"
+	)
+}
+
+t_visibility_inconclusive_is_skipped() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/visibility.sh"
+		fixture 'gitbackup.origin.provider=auto'
+
+		GB_STATE_DIR="$work/vis-5xx"; export GB_STATE_DIR
+		http_fixture 'https://api.github.com/repos/acme/flaky=500'
+		( gb_visibility_ok 'https://github.com/acme/flaky.git' ) >/dev/null 2>&1
+		eq 'a 5xx from the API is skipped (exit 3), never silently treated as private' '3' "$?"
+
+		GB_STATE_DIR="$work/vis-down"; export GB_STATE_DIR
+		http_fixture
+		( gb_visibility_ok 'https://github.com/acme/offline.git' ) >/dev/null 2>&1
+		eq 'an unreachable API is skipped (exit 3), never silently treated as private' '3' "$?"
+	)
+}
+
+t_visibility_cache() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/visibility.sh"
+		fixture 'gitbackup.origin.provider=auto'
+		GB_STATE_DIR="$work/vis-cache"; export GB_STATE_DIR
+
+		http_fixture 'https://api.github.com/repos/acme/priv=404'
+		( gb_visibility_ok 'https://github.com/acme/priv.git' ) >/dev/null 2>&1
+		eq 'first check reads the private verdict from the (mocked) network' '0' "$?"
+
+		# Break the mock so a real second request would answer "unreachable"
+		# (exit 3) instead -- a still-0 result proves the cache answered
+		# without touching the network at all, not just that 0 came back twice.
+		http_fixture
+		( gb_visibility_ok 'https://github.com/acme/priv.git' ) >/dev/null 2>&1
+		eq 'a second check within a day reuses the cached verdict' '0' "$?"
+
+		# A day-old cache entry, written directly rather than waited for
+		# (spec: kept "на сутки"/one day) -- must not be reused.
+		gb_stale_ts=$(( $(command -p date +%s) - 90000 ))
+		printf 'https://github.com/acme/priv.git\n%s\n0\n' "$gb_stale_ts" >"$GB_STATE_DIR/visibility"
+		http_fixture 'https://api.github.com/repos/acme/priv=200'
+		( gb_visibility_ok 'https://github.com/acme/priv.git' ) >/dev/null 2>&1
+		eq 'a cache entry older than a day is re-checked, not reused' '4' "$?"
+	)
+}
+
+t_visibility_generic_needs_acknowledgement() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/visibility.sh"
+		GB_STATE_DIR="$work/vis-generic"; export GB_STATE_DIR
+		GB_TEST_LOG="$work/vislog"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+
+		fixture 'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=0'
+		gb_out=$( ( gb_visibility_ok 'git@intranet.example:acme/site.git' ) 2>&1 >/dev/null )
+		eq 'a generic remote without acknowledged=1 is refused with exit 2' '2' "$?"
+		contains 'and the message names what a public one would expose' '/etc/shadow' "$gb_out"
+		contains 'including WireGuard private keys' 'WireGuard' "$gb_out"
+
+		fixture 'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+		( gb_visibility_ok 'git@intranet.example:acme/site.git' ) >/dev/null 2>&1
+		eq 'an acknowledged generic remote proceeds -- nothing about it can be checked' '0' "$?"
+		unset GB_TEST_LOG
+	)
+}
+
+# --------------------------------------------------------------------------
 # usr/sbin/gitbackup
 # --------------------------------------------------------------------------
 
@@ -581,6 +1151,24 @@ run_test 'device.sh: board strategy' t_device_board
 run_test 'device.sh: unknown device_id strategy' t_device_unknown_strategy
 run_test 'device.sh: board strategy with no usable MAC' t_device_board_no_mac
 run_test 'device.sh: gb_expand' t_expand
+run_test 'collect.sh: layout (files/meta/manifest.json)' t_collect_layout
+run_test 'collect.sh: paths come only from sysupgrade -l' t_collect_paths_from_sysupgrade_only
+run_test 'collect.sh: symlinks are not dereferenced' t_collect_symlink_not_dereferenced
+run_test 'collect.sh: manifest fields for a file' t_collect_file_manifest_fields
+run_test 'collect.sh: empty directories become dir entries' t_collect_empty_dir
+run_test 'collect.sh: a trailing slash in a keep.d source is stripped' t_collect_empty_dir_trailing_slash_source
+run_test 'collect.sh: /etc/gitbackup/** is always hard-excluded' t_collect_hard_exclude
+run_test 'collect.sh: gb_manifest_equal' t_collect_manifest_equal
+run_test 'collect.sh: JSON escaping of odd paths' t_collect_json_special_chars
+run_test 'remoteurl.sh: valid URL forms parse' t_remoteurl_valid_forms
+run_test 'remoteurl.sh: garbage URLs are rejected outright' t_remoteurl_garbage_rejected
+run_test 'remoteurl.sh: provider detection and override' t_remoteurl_provider
+run_test 'remoteurl.sh: deploy-key deep links' t_remoteurl_deeplink
+run_test 'visibility.sh: a publicly visible repository is refused' t_visibility_public_refused
+run_test 'visibility.sh: a private/nonexistent repository is allowed' t_visibility_private_ok
+run_test 'visibility.sh: 5xx and offline are skipped, not ok' t_visibility_inconclusive_is_skipped
+run_test 'visibility.sh: cache is honored for a day and expires after' t_visibility_cache
+run_test 'visibility.sh: generic remote requires acknowledgement' t_visibility_generic_needs_acknowledgement
 run_test 'cli: usage' t_cli_usage
 run_test 'cli: unwritten subcommands' t_cli_not_implemented
 run_test 'cli: status json' t_cli_status_json
