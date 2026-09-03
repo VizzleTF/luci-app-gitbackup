@@ -1,0 +1,635 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# luci.gitbackup -- rpcd plugin, ubus object "luci.gitbackup" (spec "rpcd и
+# ACL"). Everything the CLI (usr/sbin/gitbackup) can do becomes reachable
+# from the web here, and nothing more: this file's own job is translating
+# between the rpcd "list"/"call" protocol (TechRef:
+# https://openwrt.org/docs/techref/rpcd) and either a `gitbackup` CLI
+# invocation or, for the handful of methods the CLI itself does not expose
+# (history/diff/audit_paths/set_paths/set_secret/validate_cron -- spec:
+# "Методы сверх списка брифа"), a small amount of shell logic of its own.
+#
+# Protocol, confirmed against this checkout's own stock examples
+# (luci-app-https-dns-proxy, luci-app-squid) rather than invented:
+#   luci.gitbackup list         -> one JSON object, method name -> example
+#                                   params object (types only, ubus does not
+#                                   enforce this against real calls).
+#   luci.gitbackup call <method> -> reads exactly one line of compact JSON
+#                                   (the call's params) from stdin, prints
+#                                   exactly one JSON object on stdout, and
+#                                   always exits 0 -- ubus turns a nonzero
+#                                   exit into an RPC-level error with no
+#                                   body, which would break this ticket's
+#                                   own "ошибка тоже JSON, а не пустой
+#                                   ответ" requirement.
+#
+# `get_secret` does not exist anywhere below. `status` prints only
+# token_set (bool), never the token itself.
+#
+# GB_SHARE/GB_STATE_DIR/GB_BIN are the same override seam
+# usr/sbin/gitbackup and etc/init.d/gitbackup already use, so tests/run.sh
+# can point this at a tree, state directory and CLI binary that are not the
+# router's real ones; the router never sets any of them.
+
+set -u
+
+GB_SHARE="${GB_SHARE:-/usr/share/gitbackup}"
+GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
+GB_BIN="${GB_BIN:-/usr/sbin/gitbackup}"
+GB_SYSUPGRADE_CONF="${GB_SYSUPGRADE_CONF:-/etc/sysupgrade.conf}"
+GB_ROOT="${GB_ROOT:-}"
+
+# shellcheck disable=SC1091  # GB_SHARE is a runtime path, not resolvable statically
+. "$GB_SHARE/lib.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/device.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/auth.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/schedule.sh"
+# card.sh (ticket 09) may not exist on a system built before it landed --
+# same "command -v gb_card" tolerance usr/sbin/gitbackup's own cmd_run
+# already uses, not a new convention invented here.
+if [ -r "$GB_SHARE/card.sh" ]; then
+	# shellcheck disable=SC1091
+	. "$GB_SHARE/card.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# JSON param helpers -- jsonfilter, not jshn.sh: interfaces.md only promises
+# "jsonfilter есть, ubus есть", jshn.sh is a libubox implementation detail
+# this package's own DEPENDS never asked for, and the rest of gitbackup
+# already hand-rolls JSON output (lib.sh's gb_json_str/gb_json_esc) instead
+# of pulling in a second writer -- reusing that here keeps one JSON style
+# in the whole package instead of two.
+# ---------------------------------------------------------------------------
+
+# _gb_rpc_param <json-line> <jsonfilter-expr> -- empty string (not an error)
+# for a missing/wrong-type field: jsonfilter itself exits 1 and prints
+# nothing when the path does not resolve (confirmed live against this
+# project's own owlab image), which every caller below treats the same as
+# "field omitted".
+_gb_rpc_param() {
+	printf '%s' "$1" | jsonfilter -e "$2" 2>/dev/null
+}
+
+# _gb_rpc_param_list <json-line> <jsonfilter-array-expr> -- one element per
+# line (jsonfilter's own "@.x[*]" behavior, confirmed live), empty output
+# for a missing array.
+_gb_rpc_param_list() {
+	printf '%s' "$1" | jsonfilter -e "$2" 2>/dev/null
+}
+
+# _gb_rpc_error <reason> -- the one shape every failed method below prints:
+# a JSON object with a "reason" field, never an empty body and never a bare
+# exit code (ticket 10 acceptance criterion).
+_gb_rpc_error() {
+	printf '{ "reason": %s }\n' "$(gb_json_str "$1")"
+}
+
+# _gb_rpc_ok_msg <field> <text> -- "{ "<field>": "<text>" }", the shared
+# shape for the several methods that just wrap one piece of CLI text.
+_gb_rpc_text() {
+	printf '{ "%s": %s }\n' "$1" "$(gb_json_str "$2")"
+}
+
+# ---------------------------------------------------------------------------
+# Remote/branch resolution, shared by history and diff -- the two read
+# methods the CLI itself has no equivalent for (R163i: there is no clone on
+# flash at all, so History/diff work on demand through a scratch fetch
+# under /tmp, same "never touches flash" rule cmd_run's own WORK directory
+# follows). Sets GB_URL and _gb_rpc_branch; prints nothing, returns 1 with
+# _gb_rpc_err set on any failure so callers can turn that into a proper
+# error object instead of a shell abort (this file never gb_die's: rpcd
+# call handlers always have to print a JSON body and exit 0, see header).
+# ---------------------------------------------------------------------------
+_gb_rpc_resolve_remote() {
+	_gb_rpc_err=''
+	GB_URL=$(gb_uci_get gitbackup.origin.url)
+	if [ -z "$GB_URL" ]; then
+		_gb_rpc_err='gitbackup.origin.url is not configured'
+		return 1
+	fi
+	if ! gb_device_id >/dev/null 2>&1; then
+		_gb_rpc_err='device id could not be resolved (gitbackup.main.device_id)'
+		return 1
+	fi
+	_gb_rpc_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')") || {
+		_gb_rpc_err='gitbackup.origin.branch could not be expanded'
+		return 1
+	}
+	return 0
+}
+
+# _gb_rpc_branch_head -- prints the branch's tip sha (empty if the branch
+# does not exist yet, e.g. no backup has ever run), returns 1 on a real
+# network/auth failure. Thin wrapper around plain `git ls-remote` rather
+# than gitio.sh's gb_remote_head: that function hard-requires GB_URL to
+# already be set via `:?`, which is true here too, but pulling in the whole
+# of gitio.sh for one already-trivial `git ls-remote` would also drag in
+# gb_build_tree/gb_commit_push, both of which assume the run/restore
+# machinery's own GB_PREFIX/GB_PARENT contract that has no place here.
+_gb_rpc_branch_head() {
+	eval "$(gb_git_env)"
+	_gb_rpc_out=$(git ls-remote "$GB_URL" "refs/heads/$_gb_rpc_branch" 2>&1)
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -ne 0 ]; then
+		_gb_rpc_err="could not reach $GB_URL: $_gb_rpc_out"
+		return 1
+	fi
+	printf '%s\n' "$_gb_rpc_out" | awk 'NR==1 {print $1}'
+	return 0
+}
+
+# _gb_rpc_full_fetch <scratch-dir> -- fetches the FULL history of
+# _gb_rpc_branch (not gitio.sh's own --depth=1 --filter=blob:none: history
+# and diff both need real blob content across however many backups this
+# device has, which a blob-less shallow fetch cannot answer) into a fresh
+# repo at <scratch-dir>. Still exactly one branch, never the rest of the
+# repository -- "клона на флеше нет вовсе" is about flash, and this only
+# ever runs against a /tmp scratch directory that a caller removes when
+# done, same as cmd_run's own WORK.
+_gb_rpc_full_fetch() {
+	_gb_rpc_dir="$1"
+	git init -q "$_gb_rpc_dir" 2>/dev/null || {
+		_gb_rpc_err="could not create a scratch repository under /tmp"
+		return 1
+	}
+	git -C "$_gb_rpc_dir" remote add origin "$GB_URL" >/dev/null 2>&1
+	eval "$(gb_git_env)"
+	_gb_rpc_out=$(git -C "$_gb_rpc_dir" fetch -q origin "$_gb_rpc_branch" 2>&1)
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -ne 0 ]; then
+		_gb_rpc_err="could not fetch $_gb_rpc_branch from $GB_URL: $_gb_rpc_out"
+		return 1
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Method implementations, one gbrpc_<method> per ACL entry -- the case in
+# main() at the bottom names every one of these and no others, and
+# t_rpcd_acl_matches_plugin (tests/run.sh) checks the reverse direction, so
+# the two can never quietly drift apart.
+# ---------------------------------------------------------------------------
+
+# --- read tier ---------------------------------------------------------
+
+gbrpc_status() {
+	_gb_rpc_out=$("$GB_BIN" status 2>/dev/null)
+	if [ -n "$_gb_rpc_out" ]; then
+		printf '%s\n' "$_gb_rpc_out"
+	else
+		_gb_rpc_error 'gitbackup status produced no output'
+	fi
+}
+
+gbrpc_log() {
+	_gb_rpc_lines=$(_gb_rpc_param "$1" '@.lines')
+	case "$_gb_rpc_lines" in '' | *[!0-9]*) _gb_rpc_lines=200 ;; esac
+	_gb_rpc_text text "$("$GB_BIN" log "$_gb_rpc_lines" 2>/dev/null)"
+}
+
+gbrpc_pubkey() {
+	_gb_rpc_out=$("$GB_BIN" pubkey 2>&1)
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -eq 0 ]; then
+		_gb_rpc_text pubkey "$_gb_rpc_out"
+	else
+		_gb_rpc_error "$_gb_rpc_out"
+	fi
+}
+
+gbrpc_list_paths() {
+	_gb_rpc_paths=$(sysupgrade -l 2>/dev/null)
+	printf '{ "paths": ['
+	_gb_rpc_first=1
+	printf '%s\n' "$_gb_rpc_paths" | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
+		[ -n "$_gb_rpc_p" ] || continue
+		[ "$_gb_rpc_first" -eq 1 ] || printf ','
+		printf '%s' "$(gb_json_str "$_gb_rpc_p")"
+		_gb_rpc_first=0
+	done
+	printf '] }\n'
+}
+
+# gbrpc_validate_cron -- live validation for the Settings raw-cron field
+# (spec "живая валидацию в Settings"): reuses schedule.sh's own
+# gb_cron_valid/gb_cron_next rather than reimplementing either, so the
+# rpcd-facing answer and the crontab that gb_cron_apply actually writes can
+# never disagree about what is valid.
+gbrpc_validate_cron() {
+	_gb_rpc_expr=$(_gb_rpc_param "$1" '@.expr')
+	# gb_cron_valid prints its reason on stderr only on failure -- captured
+	# unconditionally here (empty when the expression is fine) so both
+	# branches below read from the one variable instead of calling it a
+	# third time.
+	_gb_rpc_why=$(gb_cron_valid "$_gb_rpc_expr" 2>&1 >/dev/null)
+	if gb_cron_valid "$_gb_rpc_expr" >/dev/null 2>&1; then
+		_gb_rpc_next=$(gb_cron_next "$_gb_rpc_expr" 2>/dev/null)
+		printf '{ "valid": true, "next": %s }\n' "$(gb_json_str "$_gb_rpc_next")"
+	else
+		printf '{ "valid": false, "reason": %s }\n' "$(gb_json_str "$_gb_rpc_why")"
+	fi
+}
+
+# gbrpc_history -- last N commits of this device's own branch: sha,
+# subject (which already starts with the backup's own date, spec G03.1, so
+# there is no separate "date" field to keep in sync with it) and the list
+# of /etc/config/*-and-everything-else paths that commit actually touched.
+# A tab splits sha/subject on stdout -- same "read the character back from
+# printf rather than typing it literally" convention lib.sh's own
+# gb_json_esc already uses for its tab/CR cases -- because a commit subject
+# is free-form operator-adjacent text (spec "Формат коммита") that must not
+# be able to smuggle in whatever delimiter this parsing depends on; the
+# subject format _gb_run_write_message actually generates never contains a
+# tab, only spaces and punctuation.
+gbrpc_history() {
+	_gb_rpc_resolve_remote || { _gb_rpc_error "$_gb_rpc_err"; return 0; }
+
+	_gb_rpc_limit=$(_gb_rpc_param "$1" '@.limit')
+	case "$_gb_rpc_limit" in '' | *[!0-9]*) _gb_rpc_limit=20 ;; esac
+
+	_gb_rpc_head=$(_gb_rpc_branch_head) || { _gb_rpc_error "$_gb_rpc_err"; return 0; }
+	if [ -z "$_gb_rpc_head" ]; then
+		printf '{ "branch": %s, "commits": [] }\n' "$(gb_json_str "$_gb_rpc_branch")"
+		return 0
+	fi
+
+	_gb_rpc_dir=$(mktemp -d "${TMPDIR:-/tmp}/gbrpc.XXXXXX") || {
+		_gb_rpc_error 'could not create a scratch directory under /tmp'
+		return 0
+	}
+	trap 'rm -rf "$_gb_rpc_dir"' EXIT INT TERM
+
+	_gb_rpc_full_fetch "$_gb_rpc_dir" || {
+		_gb_rpc_error "$_gb_rpc_err"
+		rm -rf "$_gb_rpc_dir"
+		trap - EXIT INT TERM
+		return 0
+	}
+
+	_gb_rpc_tab=$(printf '\t')
+	printf '{ "branch": %s, "commits": [' "$(gb_json_str "$_gb_rpc_branch")"
+	_gb_rpc_first=1
+	git -C "$_gb_rpc_dir" log -n "$_gb_rpc_limit" --format='%H%x09%s' FETCH_HEAD 2>/dev/null |
+		while IFS= read -r _gb_rpc_line || [ -n "$_gb_rpc_line" ]; do
+			_gb_rpc_sha="${_gb_rpc_line%%"$_gb_rpc_tab"*}"
+			_gb_rpc_subject="${_gb_rpc_line#*"$_gb_rpc_tab"}"
+			[ "$_gb_rpc_first" -eq 1 ] || printf ','
+			_gb_rpc_first=0
+			printf '{ "sha": %s, "subject": %s, "changed": [' \
+				"$(gb_json_str "$_gb_rpc_sha")" "$(gb_json_str "$_gb_rpc_subject")"
+			_gb_rpc_cfirst=1
+			# --root: without it, `diff-tree` prints nothing at all for a
+			# ROOT commit (no parent to diff against) -- confirmed live
+			# against this device's own first-ever backup commit, which
+			# otherwise showed "changed": [] despite adding every file it
+			# has.
+			git -C "$_gb_rpc_dir" diff-tree --no-commit-id --name-only -r --root "$_gb_rpc_sha" 2>/dev/null |
+				while IFS= read -r _gb_rpc_path || [ -n "$_gb_rpc_path" ]; do
+					[ -n "$_gb_rpc_path" ] || continue
+					[ "$_gb_rpc_cfirst" -eq 1 ] || printf ','
+					_gb_rpc_cfirst=0
+					printf '%s' "$(gb_json_str "$_gb_rpc_path")"
+				done
+			printf '] }'
+		done
+	printf '] }\n'
+
+	rm -rf "$_gb_rpc_dir"
+	trap - EXIT INT TERM
+}
+
+# gbrpc_diff -- plain `git diff <from> <to>` text, restricted implicitly to
+# this device's own branch (its tree only ever holds GB_PREFIX's own
+# content to begin with, per gb_build_tree) -- no separate path filter
+# needed on top of that.
+gbrpc_diff() {
+	_gb_rpc_resolve_remote || { _gb_rpc_error "$_gb_rpc_err"; return 0; }
+
+	_gb_rpc_from=$(_gb_rpc_param "$1" '@.from')
+	_gb_rpc_to=$(_gb_rpc_param "$1" '@.to')
+	if [ -z "$_gb_rpc_from" ] || [ -z "$_gb_rpc_to" ]; then
+		_gb_rpc_error 'both "from" and "to" commit shas are required'
+		return 0
+	fi
+
+	_gb_rpc_dir=$(mktemp -d "${TMPDIR:-/tmp}/gbrpc.XXXXXX") || {
+		_gb_rpc_error 'could not create a scratch directory under /tmp'
+		return 0
+	}
+	trap 'rm -rf "$_gb_rpc_dir"' EXIT INT TERM
+
+	_gb_rpc_full_fetch "$_gb_rpc_dir" || {
+		_gb_rpc_error "$_gb_rpc_err"
+		rm -rf "$_gb_rpc_dir"
+		trap - EXIT INT TERM
+		return 0
+	}
+
+	_gb_rpc_out=$(git -C "$_gb_rpc_dir" diff "$_gb_rpc_from" "$_gb_rpc_to" 2>&1)
+	_gb_rpc_rc=$?
+	rm -rf "$_gb_rpc_dir"
+	trap - EXIT INT TERM
+	if [ "$_gb_rpc_rc" -ne 0 ]; then
+		_gb_rpc_error "$_gb_rpc_out"
+		return 0
+	fi
+	_gb_rpc_text diff "$_gb_rpc_out"
+}
+
+# gbrpc_audit_paths -- G02: what changed on this router since the base
+# image but is NOT in the backup set. /overlay/upper is the standard
+# OpenWrt overlayfs upper layer (everything the running system has written
+# relative to the read-only squashfs lower layer); anything under it that
+# is neither hard-excluded (/etc/gitbackup/**, this package's own secrets)
+# nor already named by `sysupgrade -l` is exactly "changed and not backed
+# up".
+#
+# VERIFY: measured only that /overlay/upper does not exist inside the
+# owlab package-test container used to develop this file (a plain
+# extracted rootfs, never booted through OpenWrt's own fstab/mount_root) --
+# not confirmed against a real overlay mount on the owrt2512 stand. Falls
+# back to an empty list rather than erroring when the directory is absent,
+# so a router (or dev container) without a live overlay mount still gets a
+# valid, honestly-empty answer instead of a broken one.
+gbrpc_audit_paths() {
+	_gb_rpc_upper="${GB_ROOT}/overlay/upper"
+	if [ ! -d "$_gb_rpc_upper" ]; then
+		printf '{ "paths": [] }\n'
+		return 0
+	fi
+
+	_gb_rpc_backed=$(sysupgrade -l 2>/dev/null)
+
+	printf '{ "paths": ['
+	_gb_rpc_first=1
+	( cd "$_gb_rpc_upper" 2>/dev/null && find . \( -type f -o -type l \) ) |
+		while IFS= read -r _gb_rpc_rel || [ -n "$_gb_rpc_rel" ]; do
+			_gb_rpc_abs="/${_gb_rpc_rel#./}"
+			case "$_gb_rpc_abs" in
+				/etc/gitbackup | /etc/gitbackup/*) continue ;;
+			esac
+			printf '%s\n' "$_gb_rpc_backed" | grep -qxF "$_gb_rpc_abs" && continue
+			[ "$_gb_rpc_first" -eq 1 ] || printf ','
+			_gb_rpc_first=0
+			printf '%s' "$(gb_json_str "$_gb_rpc_abs")"
+		done
+	printf '] }\n'
+}
+
+# --- write tier ----------------------------------------------------------
+
+# gbrpc_run/gbrpc_test/gbrpc_restore all share one shape: the operation can
+# run past any sane ubus call timeout (network waits, `test`'s own
+# ConnectTimeout=15 twice over, `run`'s full collect/push cycle), so none
+# of them wait for the CLI to finish. Each backgrounds it, detached from
+# this script's own stdin/stdout/stderr (`</dev/null >/dev/null 2>&1 &`,
+# the same detach shape etc/init.d/gitbackup's own config_change debounce
+# timer already uses and that this project's tests have already proven
+# survives its parent exiting), and answers immediately with
+# `{ "started": true }`. The operator watches progress through `log`
+# (ticket 10 acceptance criterion: "результат забирается через log") --
+# every one of these already logs via gb_log under the shared "gitbackup"
+# syslog tag, so no new log format is needed here.
+gbrpc_run() {
+	"$GB_BIN" run --trigger luci </dev/null >/dev/null 2>&1 &
+	printf '{ "started": true }\n'
+}
+
+gbrpc_test() {
+	"$GB_BIN" test </dev/null >/dev/null 2>&1 &
+	printf '{ "started": true }\n'
+}
+
+gbrpc_keygen() {
+	_gb_rpc_force=$(_gb_rpc_param "$1" '@.force')
+	_gb_rpc_args=''
+	case "$_gb_rpc_force" in true | 1) _gb_rpc_args='--force' ;; esac
+	# shellcheck disable=SC2086  # $_gb_rpc_args is empty or exactly one flag token
+	_gb_rpc_out=$("$GB_BIN" keygen $_gb_rpc_args 2>&1)
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -eq 0 ]; then
+		printf '{ "ok": true, "message": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
+	else
+		printf '{ "ok": false, "reason": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
+	fi
+}
+
+# gbrpc_set_secret -- writes gitbackup.origin.token_file directly (there is
+# no CLI subcommand for this: the CLI never accepts a secret as an
+# argument, spec "Токен... никогда в argv", and a web form field is not
+# argv, but it is still not going anywhere near UCI -- R109, "/etc/config/*
+# входит в sysupgrade -l"). Never logs the value: gb_log calls below name
+# only the file path, exactly like gb_keygen's own logging does for the
+# key it writes.
+#
+# An empty value clears the secret rather than writing a lone newline: a
+# 1-byte file would still pass cmd_status's own `[ -s "$token_file" ]`
+# check and misreport token_set=true for a field the operator just cleared.
+gbrpc_set_secret() {
+	_gb_rpc_value=$(_gb_rpc_param "$1" '@.value')
+	_gb_rpc_file=$(gb_uci_get gitbackup.origin.token_file /etc/gitbackup/token)
+	if [ -z "$_gb_rpc_file" ]; then
+		_gb_rpc_error 'gitbackup.origin.token_file is empty'
+		return 0
+	fi
+
+	_gb_rpc_dir=$(dirname "$_gb_rpc_file")
+	mkdir -p "$_gb_rpc_dir" 2>/dev/null
+	chmod 0700 "$_gb_rpc_dir" 2>/dev/null
+
+	if [ -n "$_gb_rpc_value" ]; then
+		printf '%s\n' "$_gb_rpc_value" >"$_gb_rpc_file"
+	else
+		: >"$_gb_rpc_file"
+	fi
+	if ! chmod 0600 "$_gb_rpc_file" 2>/dev/null; then
+		_gb_rpc_error "could not set permissions on $_gb_rpc_file"
+		return 0
+	fi
+	gb_log notice "luci.gitbackup set_secret: wrote $_gb_rpc_file"
+
+	_gb_rpc_token_set=false
+	[ -s "$_gb_rpc_file" ] && _gb_rpc_token_set=true
+	printf '{ "ok": true, "token_set": %s }\n' "$_gb_rpc_token_set"
+}
+
+# gbrpc_set_paths -- writes /etc/sysupgrade.conf, one path per line. Same
+# blacklist the Paths view itself validates against (spec "Paths": "путь не
+# из чёрного списка /etc/gitbackup/**, /proc, /sys, /tmp") is re-checked
+# here, server-side, as a backstop -- the LuCI view (ticket 13) is not this
+# file's only caller, and a write straight to flash is not something to
+# trust a client's own JS validation for. Rejected entries are reported,
+# not silently dropped (spec: "отклоняются с объяснением, а не молча"),
+# but do not abort the whole write -- the remaining, valid paths are still
+# saved.
+gbrpc_set_paths() {
+	_gb_rpc_dir=$(dirname "$GB_SYSUPGRADE_CONF")
+	mkdir -p "$_gb_rpc_dir" 2>/dev/null
+
+	_gb_rpc_tmp="${GB_SYSUPGRADE_CONF}.newtmp.$$"
+	_gb_rpc_kept_f="${_gb_rpc_tmp}.kept"
+	_gb_rpc_rej_f="${_gb_rpc_tmp}.rej"
+	: >"$_gb_rpc_tmp"
+	: >"$_gb_rpc_kept_f"
+	: >"$_gb_rpc_rej_f"
+
+	# One ready-made JSON fragment per line in each scratch file --
+	# gb_json_str already escapes any real newline in its input (lib.sh),
+	# so a line-at-a-time read below can never split a value in half. This
+	# validation loop runs in its own subshell (the pipe from
+	# _gb_rpc_param_list), which is fine: it only ever writes to these two
+	# files, never to a variable this function reads back afterward.
+	_gb_rpc_param_list "$1" '@.paths[*]' | while IFS= read -r _gb_rpc_p || [ -n "$_gb_rpc_p" ]; do
+		[ -n "$_gb_rpc_p" ] || continue
+		_gb_rpc_reason=''
+		case "$_gb_rpc_p" in
+			/*) ;;
+			*) _gb_rpc_reason='not an absolute path' ;;
+		esac
+		if [ -z "$_gb_rpc_reason" ]; then
+			case "$_gb_rpc_p" in
+				/etc/gitbackup | /etc/gitbackup/*) _gb_rpc_reason='reserved for gitbackup itself' ;;
+				/proc | /proc/*) _gb_rpc_reason='not a real filesystem path' ;;
+				/sys | /sys/*) _gb_rpc_reason='not a real filesystem path' ;;
+				/tmp | /tmp/*) _gb_rpc_reason='cleared on every reboot' ;;
+			esac
+		fi
+		if [ -n "$_gb_rpc_reason" ]; then
+			printf '{ "path": %s, "reason": %s }\n' \
+				"$(gb_json_str "$_gb_rpc_p")" "$(gb_json_str "$_gb_rpc_reason")" >>"$_gb_rpc_rej_f"
+		else
+			printf '%s\n' "$_gb_rpc_p" >>"$_gb_rpc_tmp"
+			printf '%s\n' "$(gb_json_str "$_gb_rpc_p")" >>"$_gb_rpc_kept_f"
+		fi
+	done
+
+	mv "$_gb_rpc_tmp" "$GB_SYSUPGRADE_CONF"
+
+	printf '{ "ok": true, "written": ['
+	_gb_rpc_first=1
+	while IFS= read -r _gb_rpc_j || [ -n "$_gb_rpc_j" ]; do
+		[ -n "$_gb_rpc_j" ] || continue
+		[ "$_gb_rpc_first" -eq 1 ] || printf ','
+		_gb_rpc_first=0
+		printf '%s' "$_gb_rpc_j"
+	done <"$_gb_rpc_kept_f"
+	printf '], "rejected": ['
+	_gb_rpc_first=1
+	while IFS= read -r _gb_rpc_j || [ -n "$_gb_rpc_j" ]; do
+		[ -n "$_gb_rpc_j" ] || continue
+		[ "$_gb_rpc_first" -eq 1 ] || printf ','
+		_gb_rpc_first=0
+		printf '%s' "$_gb_rpc_j"
+	done <"$_gb_rpc_rej_f"
+	printf '] }\n'
+	rm -f "$_gb_rpc_kept_f" "$_gb_rpc_rej_f"
+}
+
+gbrpc_restore() {
+	_gb_rpc_device=$(_gb_rpc_param "$1" '@.device')
+	_gb_rpc_commit=$(_gb_rpc_param "$1" '@.commit')
+	_gb_rpc_dry=$(_gb_rpc_param "$1" '@.dry_run')
+	_gb_rpc_force=$(_gb_rpc_param "$1" '@.force')
+	_gb_rpc_pkgs=$(_gb_rpc_param "$1" '@.with_packages')
+
+	if [ -z "$_gb_rpc_device" ]; then
+		_gb_rpc_error 'device is required'
+		return 0
+	fi
+
+	set -- --device "$_gb_rpc_device" --yes
+	[ -n "$_gb_rpc_commit" ] && set -- "$@" --commit "$_gb_rpc_commit"
+	case "$_gb_rpc_dry" in true | 1) set -- "$@" --dry-run ;; esac
+	case "$_gb_rpc_force" in true | 1) set -- "$@" --force ;; esac
+	case "$_gb_rpc_pkgs" in true | 1) set -- "$@" --with-packages ;; esac
+
+	"$GB_BIN" restore "$@" </dev/null >/dev/null 2>&1 &
+	printf '{ "started": true }\n'
+}
+
+# gbrpc_card -- card.sh (ticket 09) may not exist yet on a system built
+# ahead of it landing; the same tolerance usr/sbin/gitbackup's own cmd_run
+# already applies, not a stub invented for this file only.
+gbrpc_card() {
+	if ! command -v gb_card >/dev/null 2>&1; then
+		_gb_rpc_error 'the recovery card generator is not installed on this system yet'
+		return 0
+	fi
+	_gb_rpc_file=$(mktemp "${TMPDIR:-/tmp}/gbrpc-card.XXXXXX") || {
+		_gb_rpc_error 'could not create a scratch file under /tmp'
+		return 0
+	}
+	if gb_card "$_gb_rpc_file" 2>/dev/null; then
+		_gb_rpc_text card "$(cat "$_gb_rpc_file")"
+	else
+		_gb_rpc_error 'the recovery card could not be generated, see the log'
+	fi
+	rm -f "$_gb_rpc_file"
+}
+
+# ---------------------------------------------------------------------------
+# rpcd entry point
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+	list)
+		cat <<'EOF'
+{
+	"status": {},
+	"log": { "lines": 0 },
+	"diff": { "from": "", "to": "" },
+	"pubkey": {},
+	"list_paths": {},
+	"history": { "limit": 0 },
+	"audit_paths": {},
+	"validate_cron": { "expr": "" },
+	"run": {},
+	"keygen": { "force": true },
+	"test": {},
+	"set_secret": { "value": "" },
+	"set_paths": { "paths": [] },
+	"restore": { "device": "", "commit": "", "dry_run": true, "force": true, "with_packages": true },
+	"card": {}
+}
+EOF
+		;;
+	call)
+		# `|| _gb_rpc_input='{}'` here (rather than `|| true`) would silently
+		# DISCARD a real, fully-read line: confirmed live against the actual
+		# rpcd daemon (not just a manual `echo ... | plugin call` test,
+		# which never reproduced this) -- rpcd's own call params arrive on
+		# stdin with NO trailing newline, so `read -r` reads the whole line
+		# correctly but still returns nonzero for hitting EOF instead of a
+		# newline. Every parameterized method (log/diff/history/
+		# validate_cron/set_secret/set_paths/restore) would otherwise always
+		# see "{}" and never its real arguments, while a hand-typed
+		# `printf '...\n' | ... call ...` test -- which DOES add a trailing
+		# newline -- would keep looking correct throughout development.
+		IFS= read -r _gb_rpc_input || true
+		[ -n "$_gb_rpc_input" ] || _gb_rpc_input='{}'
+		case "${2:-}" in
+			status) gbrpc_status ;;
+			log) gbrpc_log "$_gb_rpc_input" ;;
+			diff) gbrpc_diff "$_gb_rpc_input" ;;
+			pubkey) gbrpc_pubkey ;;
+			list_paths) gbrpc_list_paths ;;
+			history) gbrpc_history "$_gb_rpc_input" ;;
+			audit_paths) gbrpc_audit_paths ;;
+			validate_cron) gbrpc_validate_cron "$_gb_rpc_input" ;;
+			run) gbrpc_run ;;
+			keygen) gbrpc_keygen "$_gb_rpc_input" ;;
+			test) gbrpc_test ;;
+			set_secret) gbrpc_set_secret "$_gb_rpc_input" ;;
+			set_paths) gbrpc_set_paths "$_gb_rpc_input" ;;
+			restore) gbrpc_restore "$_gb_rpc_input" ;;
+			card) gbrpc_card ;;
+			*) _gb_rpc_error "unknown method '${2:-}'" ;;
+		esac
+		;;
+esac
+
+exit 0

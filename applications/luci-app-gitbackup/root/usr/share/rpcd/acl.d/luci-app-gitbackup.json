@@ -1,0 +1,34 @@
+{
+	"luci-app-gitbackup": {
+		"description": "Grant UCI and rpcd access for luci-app-gitbackup",
+		"read": {
+			"uci": ["gitbackup"],
+			"ubus": {
+				"luci.gitbackup": [
+					"status",
+					"log",
+					"diff",
+					"pubkey",
+					"list_paths",
+					"history",
+					"audit_paths",
+					"validate_cron"
+				]
+			}
+		},
+		"write": {
+			"uci": ["gitbackup"],
+			"ubus": {
+				"luci.gitbackup": [
+					"run",
+					"keygen",
+					"test",
+					"set_secret",
+					"set_paths",
+					"restore",
+					"card"
+				]
+			}
+		}
+	}
+}
