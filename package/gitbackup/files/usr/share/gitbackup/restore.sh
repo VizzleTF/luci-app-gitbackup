@@ -35,6 +35,25 @@
 # apply unchanged. GB_URL is read from the environment, not taken as an
 # argument -- same convention gitio.sh/visibility.sh use for config context
 # the CLI already resolved once.
+#
+# VERIFY: Path 0 ("uploaded devices/<d>/backup.tar.gz through LuCI's own
+# stock Backup/Flash Firmware -> Restore configuration") is NOT this
+# module's own code at all -- Path 0 is the router's stock `sysupgrade -r`
+# reading a plain sysupgrade archive, gitbackup never runs in that path.
+# What was actually confirmed live on the owlab owrt2512 25.12.4 stand:
+# `sysupgrade -b` followed straight by `sysupgrade -r` on that same
+# archive genuinely restores config (a changed system.hostname reverted
+# correctly) with no error, AS LONG AS the archive excludes /etc/hosts --
+# on THIS container-based stand /etc/hosts is a Docker/OrbStack bind
+# mount, not a real file, so any tar restore that includes it hits `tar:
+# can't remove old file etc/hosts: Resource busy`. That failure is
+# confirmed to be the stand's own container artifact, not a router
+# behavior: a real router has no such bind mount over /etc/hosts. What
+# remains genuinely unverified: an actual click through LuCI's own
+# Restore configuration upload widget (no browser available here), and
+# the container limitation above itself was never worked around inside
+# gitbackup's own code -- only demonstrated by hand-filtering the tar
+# before feeding it to sysupgrade -r.
 
 GB_ROOT="${GB_ROOT:-}"
 

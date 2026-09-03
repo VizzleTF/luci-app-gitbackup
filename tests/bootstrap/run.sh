@@ -208,12 +208,30 @@ t_bootstrap_dry_run_untouched() {
 }
 
 # --------------------------------------------------------------------------
+# --list's --token has no way into uclient-fetch except a literal argv word
+# (confirmed against uclient's own upstream source -- see the VERIFY comment
+# above gb_bs_list in bootstrap.sh itself). Not fixable without a new
+# dependency this script is not allowed to add, so the acceptance bar here
+# is that the limitation is actually told to whoever passes --token, not
+# silently accepted -- this guards the --help text that says so.
+# --------------------------------------------------------------------------
+
+t_bootstrap_help_warns_list_token_in_ps() {
+	out=$(sh "$bootstrap" --help 2>&1)
+	eq 'bootstrap.sh --help exits 0' '0' "$?"
+	# shellcheck disable=SC2016  # backtick is prose (a literal command name), not substitution
+	contains '--help documents that --list --token is visible in ps' \
+		'visible in `ps`' "$out"
+}
+
+# --------------------------------------------------------------------------
 run_test 'bootstrap: parses every flag, both "--f v" and "--f=v" forms' t_bootstrap_parses_all_flags
 run_test 'bootstrap: an unknown flag dies with a message naming it' t_bootstrap_unknown_flag_dies
 run_test 'bootstrap: gb_bs_host_of covers all four remote URL forms' t_bootstrap_host_of
 run_test 'bootstrap: --repo and --device are both required' t_bootstrap_requires_repo_and_device
 run_test 'bootstrap: exactly one of --token/--ssh-key is required' t_bootstrap_requires_exactly_one_credential
 run_test 'bootstrap: --dry-run touches nothing at all' t_bootstrap_dry_run_untouched
+run_test 'bootstrap: --help warns --list --token is visible in ps' t_bootstrap_help_warns_list_token_in_ps
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")

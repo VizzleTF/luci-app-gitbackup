@@ -115,6 +115,13 @@ Usage: bootstrap.sh --repo URL --device NAME [options]
   --device NAME       the device id to restore (required, unless --list)
   --commit SHA        restore this commit instead of the branch tip (default HEAD)
   --token PAT         personal access token for an https:// --repo
+                      WARNING with --list: uclient-fetch has no way to send
+                      an HTTP header except as a literal argv word, so for
+                      the few hundred ms of that one lookup the token is
+                      visible in `ps` to anyone else with shell access to
+                      this host at that moment (confirmed against uclient's
+                      own source; see the VERIFY comment above gb_bs_list).
+                      Not used this way for the actual restore below.
   --ssh-key PATH      path to an already-registered deploy private key, for an ssh --repo
   --branch NAME       override the device branch template (default device/{device})
   --with-packages     best-effort reinstall of the packages the backup recorded
@@ -369,6 +376,30 @@ gb_bs_list() {
 	esac
 	_gb_l_name="${_gb_l_name%.git}"
 
+	# VERIFY: token-in-argv, checked rather than assumed (interfaces.md:
+	# "Секреты: ... никогда в argv"). Confirmed against uclient's own
+	# upstream source (github.com/openwrt/uclient, commit
+	# daad21fa2c17cae54d37149bf27bb3dd78e50a3f -- exactly the
+	# PKG_SOURCE_VERSION OpenWrt 25.12's own package/libs/uclient Makefile
+	# pins) and against the --help of the binary actually installed on the
+	# owlab 25.12.4 stand: uclient-fetch's --header/--user/--password are
+	# plain getopt_long required_argument options (uclient-fetch.c,
+	# L_HEADER/L_USER/L_PASSWORD) with no env var, no config/netrc file, and
+	# no stdin form to feed them from instead. A token passed to this
+	# function has no route into uclient-fetch except as a literal
+	# `--header=Authorization: token ...` (or `PRIVATE-TOKEN: ...`) argv
+	# word, for the sub-second lifetime of this one read-only GET --
+	# visible in `ps`/`/proc/<pid>/cmdline` to anything else with shell
+	# access to this host at that exact moment. Rewriting --list to be
+	# anonymous-only was considered and rejected: the repositories it lists
+	# device branches for are, by this project's own purpose (a router's
+	# OWN backup repo), expected private, so an anonymous-only --list would
+	# just fail outright for the case it exists to serve. Documented here
+	# and in --help's own --token entry instead of silently accepted; the
+	# credential this script actually WRITES to disk (gb_bs_write_credential)
+	# and the one `gitbackup test`/`restore` use afterwards never take this
+	# path -- git's own askpass (auth.sh, ticket 04) is not uclient-fetch and
+	# is unaffected.
 	case "$_gb_l_host" in
 		github.com)
 			_gb_l_api="https://api.github.com/repos/$_gb_l_owner/$_gb_l_name/branches?per_page=100"

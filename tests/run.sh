@@ -2461,12 +2461,60 @@ restore_teardown() {
 	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_BOARD GB_URL GB_ROOT
 }
 
+# restore_manifest_entries <manifest.json> -- prints one entries[] object
+# per line, verbatim. Deliberately a fresh little parser, NOT a call into
+# restore.sh's own _gb_restore_each_entry: the ticket's own permissions
+# test below has to walk the manifest independently of the code under
+# test, or a bug shared by both readers (say, a field silently dropped)
+# would agree with itself and never turn red (executor.md: "утверждение,
+# которое считает ответ тем же способом, что и код, не может с ним не
+# согласиться"). Relies on the same one-object-per-line, no-nested-
+# brackets shape collect.sh writes and restore.sh's own reader already
+# assumes.
+restore_manifest_entries() {
+	_rme_in=0
+	while IFS= read -r _rme_line || [ -n "$_rme_line" ]; do
+		case "$_rme_line" in
+			'  "entries": ['*) _rme_in=1; continue ;;
+			'  ],') _rme_in=0; continue ;;
+		esac
+		[ "$_rme_in" -eq 1 ] || continue
+		_rme_obj="${_rme_line%,}"
+		_rme_obj="${_rme_obj#    }"
+		[ -n "$_rme_obj" ] && printf '%s\n' "$_rme_obj"
+	done <"$1"
+}
+
+# restore_field <object> <field> -- a quoted-string field's value out of
+# one manifest entry object (plain sed, independent of restore.sh's own
+# _gb_restore_json_str -- see restore_manifest_entries above for why).
+restore_field() {
+	printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\([^"]*\)".*/\1/p'
+}
+
+# restore_field_num <object> <field> -- an unquoted numeric field's value
+# (mode/uid/gid), or empty if the field is absent.
+restore_field_num() {
+	printf '%s' "$1" | sed -n 's/.*"'"$2"'":\([0-9][0-9]*\).*/\1/p'
+}
+
 # t_restore_permissions_symlinks_emptydirs -- the ticket's own headline
-# acceptance criterion. uid/gid in the fixture are this test's own (id -u/
-# -g): chown to a uid a non-root test runner does not own would fail for
-# reasons that have nothing to do with restore.sh's own correctness, so
-# the fidelity being tested is "does restore.sh apply exactly what the
-# manifest says", not "can this suite run as root".
+# acceptance criterion, taken literally: "восстановить и сравнить
+# stat -c '%a %u %g' по каждому пути с manifest" -- EVERY path in
+# entries[], walked programmatically via restore_manifest_entries/
+# restore_field* above, not four hand-picked assertions. A fixture with
+# only four entries still has to be walked rather than enumerated by
+# name, because the walk itself -- not this particular fixture size -- is
+# what has to keep catching a fifth path some future manifest adds.
+#
+# uid/gid in the fixture are this test's own (id -u/-g): chown to a uid a
+# non-root test runner does not own would fail for reasons that have
+# nothing to do with restore.sh's own correctness, so the fidelity being
+# tested here is "does restore.sh apply exactly what the manifest says",
+# not "can this suite run as root". A same-uid fixture cannot, by itself,
+# prove chown was ever actually called (a file this process creates is
+# already owned by this process) -- that is exactly what the separate
+# t_restore_chown_is_actually_called below exists to close.
 t_restore_permissions_symlinks_emptydirs() {
 	(
 		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
@@ -2474,20 +2522,25 @@ t_restore_permissions_symlinks_emptydirs() {
 		_rt_uid=$(id -u)
 		_rt_gid=$(id -g)
 
-		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config" \
+			"$work/restore-seed/devices/rt1/files/etc/dropbear"
 		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
 		printf 'root:!:19000:0:99999:7:::\n' >"$work/restore-seed/devices/rt1/files/etc/shadow"
+		printf 'fake-host-key\n' >"$work/restore-seed/devices/rt1/files/etc/dropbear/dropbear_rsa_host_key"
 		ln -s '/tmp/resolv.conf.d/resolv.conf.auto' "$work/restore-seed/devices/rt1/files/etc/resolv.conf"
 
 		_rt_sha_net=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
 		_rt_sha_shadow=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/shadow" | awk '{print $1}')
+		_rt_sha_key=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/dropbear/dropbear_rsa_host_key" | awk '{print $1}')
 
-		_rt_entries=$(printf '%s\n%s\n%s\n%s\n' \
+		_rt_entries=$(printf '%s\n%s\n%s\n%s\n%s\n' \
 			"$(restore_entry_file /etc/config/network 640 "$_rt_uid" "$_rt_gid" "$_rt_sha_net")" \
 			"$(restore_entry_file /etc/shadow 600 "$_rt_uid" "$_rt_gid" "$_rt_sha_shadow")" \
+			"$(restore_entry_file /etc/dropbear/dropbear_rsa_host_key 600 "$_rt_uid" "$_rt_gid" "$_rt_sha_key")" \
 			"$(restore_entry_symlink /etc/resolv.conf 777 "$_rt_uid" "$_rt_gid" /tmp/resolv.conf.d/resolv.conf.auto)" \
 			"$(restore_entry_dir /var/empty-thing 750 "$_rt_uid" "$_rt_gid")")
-		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		_rt_manifest="$work/restore-seed/devices/rt1/manifest.json"
+		restore_write_manifest "$_rt_manifest" "$_rt_entries" ''
 		restore_seed_push "$work/restore-bare.git" device/rt1
 		_rt_seed_commit=$(git -C "$work/restore-seed" rev-parse HEAD)
 
@@ -2505,28 +2558,138 @@ t_restore_permissions_symlinks_emptydirs() {
 		contains 'the closing message names the actual commit restored, not a symlink target the fix once clobbered it with' \
 			"restored rt1 from $_rt_seed_commit" "$out"
 
-		eq 'a regular file gets exactly the manifest mode/uid/gid' "640 $_rt_uid $_rt_gid" \
-			"$(stat -c '%a %u %g' "$work/restore-dest/etc/config/network")"
-		eq '/etc/shadow is restored 0600, not world-readable -- this is the whole point of the manifest' \
-			"600 $_rt_uid $_rt_gid" "$(stat -c '%a %u %g' "$work/restore-dest/etc/shadow")"
+		# The walk itself: a guard first (a broken parser silently
+		# iterating zero times would otherwise leave every check below
+		# vacuously green), then one mode/uid/gid comparison per entry
+		# plus a content check appropriate to its type.
+		eq 'the manifest walk below actually iterates over every entries[] item' \
+			'5' "$(restore_manifest_entries "$_rt_manifest" | wc -l | tr -d ' ')"
 
-		if [ -L "$work/restore-dest/etc/resolv.conf" ]; then
-			ok 'a symlink is restored as a symlink, not copied as file content'
-		else
-			no 'a symlink is restored as a symlink, not copied as file content' 'it is a regular file'
-		fi
-		eq 'and its target is preserved verbatim' '/tmp/resolv.conf.d/resolv.conf.auto' \
-			"$(readlink "$work/restore-dest/etc/resolv.conf")"
-		eq 'and its ownership matches the manifest (mode is not portable to assert for a symlink)' \
-			"$_rt_uid $_rt_gid" "$(stat -c '%u %g' "$work/restore-dest/etc/resolv.conf")"
+		restore_manifest_entries "$_rt_manifest" | while IFS= read -r _rt_obj; do
+			_rt_path=$(restore_field "$_rt_obj" path)
+			_rt_type=$(restore_field "$_rt_obj" type)
+			_rt_mode=$(restore_field_num "$_rt_obj" mode)
+			_rt_want_uid=$(restore_field_num "$_rt_obj" uid)
+			_rt_want_gid=$(restore_field_num "$_rt_obj" gid)
+			_rt_dest="$work/restore-dest$_rt_path"
 
-		if [ -d "$work/restore-dest/var/empty-thing" ]; then
-			ok 'the empty directory recorded in the manifest exists after restore'
-		else
-			no 'the empty directory recorded in the manifest exists after restore' 'missing'
-		fi
-		eq 'and it carries its own manifest mode/uid/gid' "750 $_rt_uid $_rt_gid" \
-			"$(stat -c '%a %u %g' "$work/restore-dest/var/empty-thing")"
+			# Mode is skipped for a symlink, same reason the fixture this
+			# replaced already noted: lstat's mode bits for a symlink are
+			# not portable (Linux always reports 0777 regardless of
+			# chmod, per restore.sh's own _gb_restore_perm_one comment;
+			# macOS's lstat instead reflects the creating process's
+			# umask) -- asserting it here would fail on this dev host for
+			# a platform difference, not a restore.sh bug. uid/gid are
+			# still real and checked on every type, mode included.
+			if [ "$_rt_type" = symlink ]; then
+				eq "manifest walk: $_rt_path -- stat -c '%u %g' matches uid/gid from manifest.json (mode not portable for a symlink)" \
+					"$_rt_want_uid $_rt_want_gid" \
+					"$(stat -c '%u %g' "$_rt_dest" 2>/dev/null)"
+			else
+				eq "manifest walk: $_rt_path -- stat -c '%a %u %g' matches mode/uid/gid from manifest.json" \
+					"$_rt_mode $_rt_want_uid $_rt_want_gid" \
+					"$(stat -c '%a %u %g' "$_rt_dest" 2>/dev/null)"
+			fi
+
+			case "$_rt_type" in
+				file)
+					_rt_want_sha=$(restore_field "$_rt_obj" sha256)
+					eq "manifest walk: $_rt_path -- restored content's sha256 matches manifest.json" \
+						"$_rt_want_sha" "$(sha256sum "$_rt_dest" 2>/dev/null | awk '{print $1}')"
+					;;
+				symlink)
+					if [ -L "$_rt_dest" ]; then
+						ok "manifest walk: $_rt_path -- restored as a symlink, not copied as file content"
+					else
+						no "manifest walk: $_rt_path -- restored as a symlink, not copied as file content" 'it is a regular file'
+					fi
+					_rt_want_target=$(restore_field "$_rt_obj" target)
+					eq "manifest walk: $_rt_path -- symlink target matches manifest.json verbatim" \
+						"$_rt_want_target" "$(readlink "$_rt_dest" 2>/dev/null)"
+					;;
+				dir)
+					if [ -d "$_rt_dest" ]; then
+						ok "manifest walk: $_rt_path -- directory exists after restore"
+					else
+						no "manifest walk: $_rt_path -- directory exists after restore" 'missing'
+					fi
+					;;
+			esac
+		done
+
+		restore_teardown
+	)
+}
+
+# t_restore_chown_is_actually_called -- Condition 2 of the dozapros for
+# this ticket: the walk above alone cannot go red if gb_restore's chown
+# calls are deleted outright, because its fixture's uid/gid are this test
+# runner's own (id -u/-g) -- a file this same process creates already has
+# that owner with no chown ever run. Confirmed by mutation: commenting
+# out both chown lines in _gb_restore_perm_one left the walk above fully
+# green.
+#
+# Fix: use a uid/gid that is NOT the current user (so a no-op restore
+# would visibly disagree with the manifest), and stub `chown` on PATH to
+# RECORD every invocation instead of running the real syscall -- an
+# unprivileged test runner cannot chown to an arbitrary uid for real
+# (that would fail on any non-root environment for a reason that has
+# nothing to do with restore.sh), but it can always prove the call
+# happened with the right arguments. Same "stub the exact tool, not the
+# module" method t_restore_overwrites_existing_destination already uses
+# for busybox cp's shape.
+t_restore_chown_is_actually_called() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		_rt_other_uid=$(($(id -u) + 1))
+		_rt_other_gid=$(($(id -g) + 1))
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		ln -s /tmp/target "$work/restore-seed/devices/rt1/files/etc/resolv.conf"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+
+		_rt_entries=$(printf '%s\n%s\n%s\n' \
+			"$(restore_entry_file /etc/config/network 640 "$_rt_other_uid" "$_rt_other_gid" "$_rt_sha")" \
+			"$(restore_entry_symlink /etc/resolv.conf 777 "$_rt_other_uid" "$_rt_other_gid" /tmp/target)" \
+			"$(restore_entry_dir /var/empty-thing 750 "$_rt_other_uid" "$_rt_other_gid")")
+		_rt_manifest="$work/restore-seed/devices/rt1/manifest.json"
+		restore_write_manifest "$_rt_manifest" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		_rt_chown_log="$work/chown-calls.log"
+		: >"$_rt_chown_log"
+		mkdir -p "$work/chown-stub"
+		cat >"$work/chown-stub/chown" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >>"$_rt_chown_log"
+exit 0
+STUB
+		chmod +x "$work/chown-stub/chown"
+
+		PATH="$work/chown-stub:$PATH" gb_restore rt1 '' --yes >/dev/null 2>&1
+		eq 'gb_restore exits 0 with chown stubbed to a recording no-op' '0' "$?"
+
+		restore_manifest_entries "$_rt_manifest" | while IFS= read -r _rt_obj; do
+			_rt_path=$(restore_field "$_rt_obj" path)
+			_rt_type=$(restore_field "$_rt_obj" type)
+			_rt_want_uid=$(restore_field_num "$_rt_obj" uid)
+			_rt_want_gid=$(restore_field_num "$_rt_obj" gid)
+			_rt_dest="$work/restore-dest$_rt_path"
+			if [ "$_rt_type" = symlink ]; then
+				_rt_want_call="-h $_rt_want_uid:$_rt_want_gid $_rt_dest"
+			else
+				_rt_want_call="$_rt_want_uid:$_rt_want_gid $_rt_dest"
+			fi
+			# Mutation check: delete gb_restore's chown call for this
+			# entry type (restore.sh, _gb_restore_perm_one) and this
+			# specific assertion turns red -- nothing else in the suite
+			# depends on the real ownership actually changing.
+			contains "chown was actually invoked for $_rt_path with the manifest's uid:gid" \
+				"$_rt_want_call" "$(cat "$_rt_chown_log")"
+		done
 
 		restore_teardown
 	)
@@ -4217,6 +4380,7 @@ run_test 'gitio.sh: commit-tree works with no git identity configured (owlab fin
 run_test 'gitio.sh: a shared branch preserves another device untouched' t_gitio_shared_branch_preserves_other_device
 run_test 'gitio.sh: non-fast-forward push is rejected, then retried once' t_gitio_commit_push_nonfastforward_then_retry
 run_test 'restore.sh: permissions/symlinks/empty dirs match the manifest' t_restore_permissions_symlinks_emptydirs
+run_test 'restore.sh: chown is actually invoked per manifest entry, not just coincidentally matching' t_restore_chown_is_actually_called
 run_test 'restore.sh: overwrites an existing destination against a busybox-shaped cp (owlab finding)' t_restore_overwrites_existing_destination
 run_test 'restore.sh: a sha256 mismatch stops before any write' t_restore_sha_mismatch_stops_before_write
 run_test 'restore.sh: board mismatch is refused, --force overrides it' t_restore_board_mismatch
