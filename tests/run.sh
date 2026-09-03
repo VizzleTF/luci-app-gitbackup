@@ -35,7 +35,7 @@ only="${1:-}"
 # A missing module has to stop the run here. Every test body is a subshell, and
 # a failed `.` inside one kills that subshell without asserting anything -- the
 # suite would report "0 failed" for code that does not exist.
-for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup"; do
+for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$share/restore.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup"; do
 	[ -r "$module" ] || { printf 'missing: %s\n' "$module" >&2; exit 1; }
 done
 
@@ -297,9 +297,11 @@ STUB
 
 cat >"$work/bin/jsonfilter" <<'STUB'
 #!/bin/sh
-# Test double for jsonfilter(1). Supports the single form the modules use --
-# `jsonfilter -e @.<field>` over a one-level object on stdin -- and, like the
-# real one, prints nothing and exits 0 when the field is absent.
+# Test double for jsonfilter(1). Supports the two forms the modules use --
+# `jsonfilter -e @.<field>` and, since restore.sh's own board check needs
+# release.target, one level of nesting `jsonfilter -e @.<parent>.<field>` --
+# over a stdin object, and, like the real one, prints nothing and exits 0
+# when the field (or its parent) is absent.
 [ "${1:-}" = "-e" ] || { echo "jsonfilter stub: expected -e, got '${1:-}'" >&2; exit 64; }
 expr="${2:-}"
 case "$expr" in
@@ -307,9 +309,17 @@ case "$expr" in
 	*) echo "jsonfilter stub: unsupported expression '$expr'" >&2; exit 64 ;;
 esac
 case "$field" in
-	*.*) echo "jsonfilter stub: nested expressions are not supported" >&2; exit 64 ;;
+	*.*.*) echo "jsonfilter stub: more than one level of nesting is not supported" >&2; exit 64 ;;
+	*.*)
+		parent="${field%%.*}"
+		child="${field#*.}"
+		sed -n 's/.*"'"$parent"'"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p' | \
+			sed -n 's/.*"'"$child"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+		;;
+	*)
+		sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+		;;
 esac
-sed -n 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
 STUB
 
 cat >"$work/bin/logger" <<'STUB'
@@ -372,16 +382,25 @@ cat >"$work/bin/stat" <<'STUB'
 # Test double for GNU/busybox stat(1), backed by the host's real stat(1).
 # collect.sh only ever calls `stat -c '%a %u %g' <path>` (no -L, i.e.
 # lstat semantics -- a symlink reports its own mode, never the target's).
-# macOS ships a BSD stat with different flags entirely, so this stub
-# translates on Darwin; elsewhere it defers straight to the real GNU stat,
-# found via the POSIX default PATH so it does not recurse into itself.
+# restore.sh's own tests (ticket 08) additionally use `stat -c '%u %g'`
+# alone -- a symlink's lstat MODE is not portable to assert (Linux always
+# reports 0777 for one regardless of chmod; macOS/BSD does not), but its
+# ownership is, so the permissions test checks that pair on its own for a
+# symlink and the full triple for files/dirs. macOS ships a BSD stat with
+# different flags entirely, so this stub translates on Darwin; elsewhere
+# it defers straight to the real GNU stat, found via the POSIX default
+# PATH so it does not recurse into itself.
 [ "${1:-}" = "-c" ] || { echo "stat stub: expected -c, got '${1:-}'" >&2; exit 64; }
 fmt="$2"; path="$3"
-[ "$fmt" = '%a %u %g' ] || { echo "stat stub: unsupported format '$fmt'" >&2; exit 64; }
+case "$fmt" in
+	'%a %u %g') bsd_fmt='%Lp %u %g' ;;
+	'%u %g') bsd_fmt='%u %g' ;;
+	*) echo "stat stub: unsupported format '$fmt'" >&2; exit 64 ;;
+esac
 if [ "$(uname -s)" = "Darwin" ]; then
-	/usr/bin/stat -f '%Lp %u %g' "$path"
+	/usr/bin/stat -f "$bsd_fmt" "$path"
 else
-	command -p stat -c '%a %u %g' "$path"
+	command -p stat -c "$fmt" "$path"
 fi
 STUB
 
@@ -2299,6 +2318,446 @@ t_gitio_commit_push_nonfastforward_then_retry() {
 }
 
 # --------------------------------------------------------------------------
+# restore.sh
+# --------------------------------------------------------------------------
+#
+# Tested against a REAL local bare git repository, same reasoning as
+# gitio.sh's own tests (interfaces.md: "Единственное исключение -- gitio.sh
+# и restore.sh, которые проверяются интеграционно на локальном
+# бэре-репозитории"). gb_remote_head/gb_fetch_meta -- and every plain `git`
+# call restore.sh makes directly -- go through the git stub's
+# GB_TEST_GIT_REAL=1 real-git passthrough with the same GB_TEST_GIT_REMOTE_URL/
+# GB_TEST_GIT_REMOTE_PATH swap t_run_integration_bare_repo already relies on,
+# so GB_URL can stay a schema-valid https://... string (gb_parse_url is
+# never involved here, but GB_URL is still what gb_remote_head/gb_fetch_meta
+# print into their own error messages) while every actual git operation
+# lands on a real local bare repo, no network anywhere.
+
+# restore_entry_file/dir/symlink/scrubbed -- one manifest.json array-item
+# object per call, the exact shape collect.sh's own _gb_collect_entry_*
+# functions write (field order does not matter to restore.sh's own
+# substring-based JSON readers, but matching it keeps a fixture readable
+# next to a real manifest).
+restore_entry_file() {
+	printf '{"path":"%s","type":"file","mode":%s,"uid":%s,"gid":%s,"sha256":"%s"}' "$1" "$2" "$3" "$4" "$5"
+}
+restore_entry_dir() {
+	printf '{"path":"%s","type":"dir","mode":%s,"uid":%s,"gid":%s}' "$1" "$2" "$3" "$4"
+}
+restore_entry_symlink() {
+	printf '{"path":"%s","type":"symlink","mode":%s,"uid":%s,"gid":%s,"target":"%s"}' "$1" "$2" "$3" "$4" "$5"
+}
+restore_scrubbed_entry() {
+	printf '{"path":"%s","option":"%s"}' "$1" "$2"
+}
+
+# restore_join_array <newline-separated-objects> -- 4-space-indented,
+# comma-joined, no trailing comma -- collect.sh's own array-body shape
+# (_gb_collect_join), reimplemented here rather than sourced: this is test
+# fixture code building input for restore.sh, not sharing collect.sh's
+# own private helper the way scrub.sh's header explains modules must not.
+restore_join_array() {
+	_rj_first=1
+	printf '%s\n' "$1" | while IFS= read -r _rj_l; do
+		[ -n "$_rj_l" ] || continue
+		if [ "$_rj_first" -eq 1 ]; then _rj_first=0; else printf ',\n'; fi
+		printf '    %s' "$_rj_l"
+	done
+	[ -z "$1" ] || printf '\n'
+}
+
+# restore_write_manifest <path> <entries> <scrubbed> -- entries/scrubbed
+# are newline-separated restore_entry_*/restore_scrubbed_entry() outputs
+# (either may be empty). Every top-level field besides entries/scrubbed is
+# a fixed placeholder: restore.sh never reads manifest.json's own
+# version/generated/hostname/device/openwrt/board fields (board comes from
+# the separate meta/board.json instead, checked independently).
+restore_write_manifest() {
+	{
+		printf '{\n  "version": "1",\n  "generated": "2026-01-01T00:00:00Z",\n'
+		printf '  "hostname": "seed",\n  "device": "rt1",\n  "openwrt": "25.12.4",\n  "board": "Test Board",\n'
+		printf '  "entries": [\n'
+		restore_join_array "$2"
+		printf '  ],\n  "scrubbed": [\n'
+		restore_join_array "$3"
+		printf '  ]\n}\n'
+	} >"$1"
+}
+
+# restore_seed_push <bare-repo> <branch> <prefix> -- commits and pushes
+# whatever is under $work/restore-seed/<prefix> as the sole commit on
+# <branch> of <bare-repo>, using PLAIN git (init/add/commit/push) -- this
+# is fixture setup, not the code under test, so it deliberately does not
+# reuse gitio.sh's own push-without-clone machinery. Requires
+# GB_TEST_GIT_REAL=1 already exported (the stub's real-git passthrough),
+# same as every call site below sets before calling this.
+restore_seed_push() {
+	_rsp_bare="$1"
+	_rsp_branch="$2"
+	git -C "$work/restore-seed" -c user.name=t -c user.email=t@t.test add -A >/dev/null 2>&1
+	git -C "$work/restore-seed" -c user.name=t -c user.email=t@t.test commit -q -m seed >/dev/null 2>&1
+	git -C "$work/restore-seed" push -q "$_rsp_bare" "HEAD:refs/heads/$_rsp_branch" >/dev/null 2>&1
+}
+
+# restore_setup -- common fixture: a fresh bare repo, a fresh seed working
+# tree, GB_URL/GB_ROOT/the git-stub swap all pointed at each other. Callers
+# populate $work/restore-seed/devices/rt1/{files,meta,manifest.json}
+# themselves (each test's own manifest is the point under test) and then
+# call restore_seed_push, then `gb_restore rt1 ...`.
+restore_setup() {
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+	rm -rf "$work/restore-bare.git" "$work/restore-seed" "$work/restore-dest"
+	git init --bare -q "$work/restore-bare.git"
+	git init -q "$work/restore-seed"
+	mkdir -p "$work/restore-seed/devices/rt1/files" "$work/restore-seed/devices/rt1/meta" "$work/restore-dest"
+	GB_URL='https://example.org/o/r.git'; export GB_URL
+	GB_TEST_GIT_REMOTE_URL="$GB_URL"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$work/restore-bare.git"; export GB_TEST_GIT_REMOTE_PATH
+	GB_ROOT="$work/restore-dest"; export GB_ROOT
+	GB_TEST_BOARD='{"model":"Test Board","release":{"target":"testarch/generic"}}'; export GB_TEST_BOARD
+	printf '{"model":"Test Board","release":{"target":"testarch/generic"}}\n' \
+		>"$work/restore-seed/devices/rt1/meta/board.json"
+	printf 'NAME="OpenWrt"\nVERSION_ID="25.12.4"\n' >"$work/restore-seed/devices/rt1/meta/os-release.txt"
+	fixture 'gitbackup.origin.branch=device/{device}' 'gitbackup.main.path_prefix=devices/{device}'
+}
+
+restore_teardown() {
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_BOARD GB_URL GB_ROOT
+}
+
+# t_restore_permissions_symlinks_emptydirs -- the ticket's own headline
+# acceptance criterion. uid/gid in the fixture are this test's own (id -u/
+# -g): chown to a uid a non-root test runner does not own would fail for
+# reasons that have nothing to do with restore.sh's own correctness, so
+# the fidelity being tested is "does restore.sh apply exactly what the
+# manifest says", not "can this suite run as root".
+t_restore_permissions_symlinks_emptydirs() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		_rt_uid=$(id -u)
+		_rt_gid=$(id -g)
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		printf 'root:!:19000:0:99999:7:::\n' >"$work/restore-seed/devices/rt1/files/etc/shadow"
+		ln -s '/tmp/resolv.conf.d/resolv.conf.auto' "$work/restore-seed/devices/rt1/files/etc/resolv.conf"
+
+		_rt_sha_net=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_sha_shadow=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/shadow" | awk '{print $1}')
+
+		_rt_entries=$(printf '%s\n%s\n%s\n%s\n' \
+			"$(restore_entry_file /etc/config/network 640 "$_rt_uid" "$_rt_gid" "$_rt_sha_net")" \
+			"$(restore_entry_file /etc/shadow 600 "$_rt_uid" "$_rt_gid" "$_rt_sha_shadow")" \
+			"$(restore_entry_symlink /etc/resolv.conf 777 "$_rt_uid" "$_rt_gid" /tmp/resolv.conf.d/resolv.conf.auto)" \
+			"$(restore_entry_dir /var/empty-thing 750 "$_rt_uid" "$_rt_gid")")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+		_rt_seed_commit=$(git -C "$work/restore-seed" rev-parse HEAD)
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'gb_restore exits 0' '0' "$?"
+
+		# Review finding: _gb_restore_perm_one's own symlink branch once
+		# reused gb_restore's outer "_gb_target" (the commit sha) as its
+		# own local variable name for the symlink's target string --
+		# clobbering it, since nothing in this codebase declares locals.
+		# A manifest with a symlink made the closing "restored ... from
+		# ..." message print the symlink's target instead of the commit.
+		# This fixture already has a symlink, so it is the right place to
+		# pin the fix.
+		contains 'the closing message names the actual commit restored, not a symlink target the fix once clobbered it with' \
+			"restored rt1 from $_rt_seed_commit" "$out"
+
+		eq 'a regular file gets exactly the manifest mode/uid/gid' "640 $_rt_uid $_rt_gid" \
+			"$(stat -c '%a %u %g' "$work/restore-dest/etc/config/network")"
+		eq '/etc/shadow is restored 0600, not world-readable -- this is the whole point of the manifest' \
+			"600 $_rt_uid $_rt_gid" "$(stat -c '%a %u %g' "$work/restore-dest/etc/shadow")"
+
+		if [ -L "$work/restore-dest/etc/resolv.conf" ]; then
+			ok 'a symlink is restored as a symlink, not copied as file content'
+		else
+			no 'a symlink is restored as a symlink, not copied as file content' 'it is a regular file'
+		fi
+		eq 'and its target is preserved verbatim' '/tmp/resolv.conf.d/resolv.conf.auto' \
+			"$(readlink "$work/restore-dest/etc/resolv.conf")"
+		eq 'and its ownership matches the manifest (mode is not portable to assert for a symlink)' \
+			"$_rt_uid $_rt_gid" "$(stat -c '%u %g' "$work/restore-dest/etc/resolv.conf")"
+
+		if [ -d "$work/restore-dest/var/empty-thing" ]; then
+			ok 'the empty directory recorded in the manifest exists after restore'
+		else
+			no 'the empty directory recorded in the manifest exists after restore' 'missing'
+		fi
+		eq 'and it carries its own manifest mode/uid/gid' "750 $_rt_uid $_rt_gid" \
+			"$(stat -c '%a %u %g' "$work/restore-dest/var/empty-thing")"
+
+		restore_teardown
+	)
+}
+
+# t_restore_overwrites_existing_destination -- owlab stand finding: busybox
+# cp (unlike GNU/BSD cp on a dev host) refuses an existing destination
+# outright ("File exists") unless given -f, which broke restoring over
+# ANY path that already exists on the router -- i.e. nearly everything,
+# found live restoring over /etc/hosts. A plain macOS/GNU `cp` cannot
+# reproduce this (it overwrites by default with no flag at all), so this
+# stubs `cp` to enforce busybox's own stricter rule for this one test,
+# the same technique t_have_net_busybox_shape already uses for D01.
+t_restore_overwrites_existing_destination() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'new content\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		mkdir -p "$work/restore-dest/etc/config"
+		printf 'stale content already on disk\n' >"$work/restore-dest/etc/config/network"
+
+		mkdir -p "$work/cp-busybox-shape"
+		cat >"$work/cp-busybox-shape/cp" <<'STUB'
+#!/bin/sh
+case " $* " in
+	*' -f '*) ;;
+	*) echo "cp: can't create destination: File exists" >&2; exit 1 ;;
+esac
+for a in "$@"; do
+	case "$a" in
+		-*) ;;
+		*) last="$a" ;;
+	esac
+done
+args=""
+for a in "$@"; do
+	case "$a" in
+		-*) ;;
+		*) args="$args $a" ;;
+	esac
+done
+# shellcheck disable=SC2086
+command -p cp $args
+STUB
+		chmod +x "$work/cp-busybox-shape/cp"
+
+		PATH="$work/cp-busybox-shape:$PATH" gb_restore rt1 '' --yes >"$work/restore-overwrite-out.txt" 2>&1
+		eq 'restoring over an existing file succeeds against a busybox-shaped cp (owlab finding)' \
+			'0' "$?"
+		eq 'and the stale content is actually replaced' 'new content' \
+			"$(cat "$work/restore-dest/etc/config/network")"
+
+		restore_teardown
+	)
+}
+
+# t_restore_sha_mismatch_stops_before_write -- a corrupted/tampered backup
+# must refuse outright, and refuse BEFORE touching GB_ROOT at all: the
+# destination is asserted to still not exist, not just that the command
+# exited non-zero.
+t_restore_sha_mismatch_stops_before_write() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 'deadbeef0000000000000000000000000000000000000000000000000000')
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'a sha256 mismatch is refused with exit 1' '1' "$?"
+		if [ -e "$work/restore-dest/etc/config/network" ]; then
+			no 'nothing was written to disk before the mismatch was caught' 'the file exists anyway'
+		else
+			ok 'nothing was written to disk before the mismatch was caught'
+		fi
+
+		restore_teardown
+	)
+}
+
+# t_restore_board_mismatch -- refused without --force, with an explanation
+# naming interfaces/wireless; proceeds and actually writes with --force.
+t_restore_board_mismatch() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		# The router this restore runs on: a different board entirely.
+		GB_TEST_BOARD='{"model":"Other Board","release":{"target":"otherarch/generic"}}'
+		export GB_TEST_BOARD
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'a board mismatch without --force is refused with exit 4' '4' "$?"
+		contains 'and the message explains why (interfaces/wireless will not match)' 'wireless' "$out"
+		if [ -e "$work/restore-dest/etc/config/network" ]; then
+			no 'nothing was written for the refused restore' 'the file exists anyway'
+		else
+			ok 'nothing was written for the refused restore'
+		fi
+
+		out2=$(gb_restore rt1 '' --yes --force 2>&1)
+		eq 'the same mismatch with --force exits 0' '0' "$?"
+		if [ -f "$work/restore-dest/etc/config/network" ]; then
+			ok 'and --force actually restores the file'
+		else
+			no 'and --force actually restores the file' 'missing'
+		fi
+
+		restore_teardown
+	)
+}
+
+# t_restore_os_release_major_mismatch_warns -- a major OpenWrt version gap
+# is a warning (logged), never a refusal -- restore still proceeds.
+t_restore_os_release_major_mismatch_warns() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		GB_TEST_LOG="$work/restore-log"; export GB_TEST_LOG
+		: >"$GB_TEST_LOG"
+		mkdir -p "$work/restore-dest/etc"
+		printf 'NAME="OpenWrt"\nVERSION_ID="25.12.4"\n' >"$work/restore-dest/etc/os-release"
+		printf 'NAME="OpenWrt"\nVERSION_ID="21.02.3"\n' >"$work/restore-seed/devices/rt1/meta/os-release.txt"
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'a major OpenWrt version gap does not refuse the restore' '0' "$?"
+		contains 'but it is logged as a warning' '21.02.3' "$(cat "$GB_TEST_LOG")"
+		if [ -f "$work/restore-dest/etc/config/network" ]; then
+			ok 'and the restore actually completed'
+		else
+			no 'and the restore actually completed' 'missing'
+		fi
+
+		unset GB_TEST_LOG
+		restore_teardown
+	)
+}
+
+# t_restore_scrubbed_list_printed -- a non-empty manifest.scrubbed must be
+# surfaced to the operator, since a redacted option's real value can only
+# ever be typed back in by hand (spec: "manifest.scrubbed != [] -- напечатать
+# список значений, которые надо ввести руками").
+t_restore_scrubbed_list_printed() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		_rt_scrubbed=$(restore_scrubbed_entry /etc/config/wireless 'wireless.@wifi-iface[0].key')
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" "$_rt_scrubbed"
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'exits 0 -- a scrubbed value is a to-do, not a failure' '0' "$?"
+		contains 'the redacted option is printed for the operator to re-enter by hand' \
+			'wireless.@wifi-iface[0].key' "$out"
+
+		restore_teardown
+	)
+}
+
+# t_restore_dry_run_untouched -- --dry-run describes the plan and touches
+# nothing: the destination directory must still be completely empty
+# afterward, not merely "the one file we happened to check is absent".
+t_restore_dry_run_untouched() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --dry-run 2>&1)
+		eq '--dry-run exits 0' '0' "$?"
+		contains 'and prints what would be written' '/etc/config/network' "$out"
+
+		_rt_left=$(find "$work/restore-dest" -mindepth 1 2>/dev/null | grep -c .)
+		eq '--dry-run leaves the destination completely untouched' '0' "$_rt_left"
+
+		restore_teardown
+	)
+}
+
+# t_restore_fetches_only_its_own_branch -- "тянуть данные минимально: своя
+# ветка ... полного клона не появляется". A second device's branch exists
+# on the same bare repo; restoring rt1 must leave the scratch repo with no
+# trace of rt2's branch at all, proving this fetched one ref, not `--all`.
+t_restore_fetches_only_its_own_branch() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		# A second device, its own unrelated branch on the same repo.
+		rm -rf "$work/restore-seed2"
+		git init -q "$work/restore-seed2"
+		mkdir -p "$work/restore-seed2/devices/rt2/files/etc"
+		printf 'unrelated rt2 content\n' >"$work/restore-seed2/devices/rt2/files/etc/other"
+		git -C "$work/restore-seed2" -c user.name=t -c user.email=t@t.test add -A >/dev/null 2>&1
+		git -C "$work/restore-seed2" -c user.name=t -c user.email=t@t.test commit -q -m seed2 >/dev/null 2>&1
+		git -C "$work/restore-seed2" push -q "$work/restore-bare.git" HEAD:refs/heads/device/rt2 >/dev/null 2>&1
+
+		# Not `out=$(gb_restore ...)`: that form would itself fork a
+		# subshell to run gb_restore in, and gb_restore's own EXIT trap
+		# would then fire the instant THAT subshell finishes -- i.e.
+		# immediately, before this line even returns control here, wiping
+		# the scratch repo away before it could be inspected below. A
+		# plain redirect keeps gb_restore running in the CURRENT (test
+		# body) subshell, so its trap only fires once this whole test
+		# function's own subshell exits, same as restore.sh's header
+		# comment describes.
+		gb_restore rt1 '' --yes >"$work/restore-fetch-out.txt" 2>&1
+		eq 'gb_restore exits 0' '0' "$?"
+
+		_rt_workdir=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'gitbackup-restore.*' 2>/dev/null | head -n 1)
+		if [ -n "$_rt_workdir" ] && [ -d "$_rt_workdir/repo" ]; then
+			_rt_refs=$(git -C "$_rt_workdir/repo" for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null)
+			contains 'the scratch repo fetched device/rt1' 'device/rt1' "$_rt_refs"
+			case "$_rt_refs" in
+				*device/rt2*) no 'and never fetched the other device'"'"'s branch' "found it: $_rt_refs" ;;
+				*) ok 'and never fetched the other device'"'"'s branch' ;;
+			esac
+		else
+			no 'the scratch repo could be inspected before its own cleanup trap fires' 'not found'
+		fi
+
+		restore_teardown
+	)
+}
+
+# --------------------------------------------------------------------------
 # schedule.sh
 # --------------------------------------------------------------------------
 
@@ -2569,7 +3028,7 @@ t_init_config_change_debounces() {
 		GB_BIN="$work/fake-gitbackup.sh"; export GB_BIN
 		cat >"$GB_BIN" <<'FAKE'
 #!/bin/sh
-printf 'ran %s\n' "$1" >>"$GB_RUN_LOG"
+printf 'ran %s\n' "$*" >>"$GB_RUN_LOG"
 FAKE
 		chmod +x "$GB_BIN"
 		fixture 'gitbackup.main.debounce=1'
@@ -2583,6 +3042,13 @@ FAKE
 		gb_runs=$(wc -l <"$GB_RUN_LOG" | tr -d ' ')
 		eq 'two config-change events inside the debounce window produce exactly one run' \
 			'1' "$gb_runs"
+		# Review finding: a config-change-triggered run must be identifiable
+		# as such in the commit message's own Trigger: field (_gb_run_write_message,
+		# usr/sbin/gitbackup) -- an un-flagged `run` here defaults to
+		# --trigger cron (cmd_run's own default), which would misreport a
+		# debounced config-change run as "Trigger: cron" in the pushed commit.
+		contains 'the debounced run is tagged --trigger procd, not left to default to cron' \
+			'--trigger procd' "$(cat "$GB_RUN_LOG")"
 
 		rm -f "$GB_STATE_DIR/debounce.pid"
 	)
@@ -3165,6 +3631,7 @@ usr/share/gitbackup/exclude.list
 usr/share/gitbackup/gitio.sh
 usr/share/gitbackup/lib.sh
 usr/share/gitbackup/remoteurl.sh
+usr/share/gitbackup/restore.sh
 usr/share/gitbackup/schedule.sh
 usr/share/gitbackup/scrub.list
 usr/share/gitbackup/scrub.sh
@@ -3246,6 +3713,14 @@ run_test 'gitio.sh: first commit on a new branch, no parent' t_gitio_first_commi
 run_test 'gitio.sh: commit-tree works with no git identity configured (owlab finding)' t_gitio_commit_push_no_global_git_identity
 run_test 'gitio.sh: a shared branch preserves another device untouched' t_gitio_shared_branch_preserves_other_device
 run_test 'gitio.sh: non-fast-forward push is rejected, then retried once' t_gitio_commit_push_nonfastforward_then_retry
+run_test 'restore.sh: permissions/symlinks/empty dirs match the manifest' t_restore_permissions_symlinks_emptydirs
+run_test 'restore.sh: overwrites an existing destination against a busybox-shaped cp (owlab finding)' t_restore_overwrites_existing_destination
+run_test 'restore.sh: a sha256 mismatch stops before any write' t_restore_sha_mismatch_stops_before_write
+run_test 'restore.sh: board mismatch is refused, --force overrides it' t_restore_board_mismatch
+run_test 'restore.sh: a major OpenWrt version gap warns, does not refuse' t_restore_os_release_major_mismatch_warns
+run_test 'restore.sh: a non-empty manifest.scrubbed is printed to the operator' t_restore_scrubbed_list_printed
+run_test 'restore.sh: --dry-run prints the plan and touches nothing' t_restore_dry_run_untouched
+run_test 'restore.sh: fetches only its own device branch, not the whole repo' t_restore_fetches_only_its_own_branch
 run_test 'schedule.sh: gb_preset_expr is deterministic per device' t_schedule_preset_expr
 run_test 'schedule.sh: gb_cron_valid on hand-picked examples' t_schedule_cron_valid_examples
 run_test 'schedule.sh: gb_cron_valid against tests/fixtures/cron.tsv' t_schedule_cron_valid_fixtures

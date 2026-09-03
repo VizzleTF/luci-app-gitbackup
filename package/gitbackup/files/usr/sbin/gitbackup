@@ -31,6 +31,8 @@ GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
 . "$GB_SHARE/scrub.sh"
 # shellcheck disable=SC1091
 . "$GB_SHARE/gitio.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/restore.sh"
 # card.sh does not exist yet (ticket 09, bootstrap): cmd_run's own RECOVERY.md
 # step below checks for gb_card with `command -v` before calling it rather
 # than sourcing a file that is not there yet -- "ничего не устанавливать
@@ -645,6 +647,44 @@ cmd_run() {
 	_gb_run_backup "$_gb_trigger"
 }
 
+# cmd_restore -- ticket 08, spec "Восстановление" (Path 2). Deliberately
+# does NOT go through gb_validate_config: that resolves GB_DEVICE via
+# gb_device_id, which a fresh/bare router (bootstrap's own Path 1 step 4,
+# or any router whose device_id config is not usable yet) cannot answer,
+# and the device being restored is an explicit --device argument here, not
+# this router's own resolved identity (restore.sh's own header explains
+# why gb_expand cannot be reused for it either). Only GB_URL actually has
+# to exist for a restore to mean anything.
+cmd_restore() {
+	_gb_r_device=''
+	_gb_r_commit=''
+	_gb_r_flags=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--device) shift; _gb_r_device="${1:-}"; shift ;;
+			--device=*) _gb_r_device="${1#--device=}"; shift ;;
+			--commit) shift; _gb_r_commit="${1:-}"; shift ;;
+			--commit=*) _gb_r_commit="${1#--commit=}"; shift ;;
+			--dry-run|--force|--yes|--with-packages) _gb_r_flags="$_gb_r_flags $1"; shift ;;
+			*) shift ;;
+		esac
+	done
+
+	# No explicit --device: fall back to this router's own resolved
+	# identity, the "restore my own last backup" shape -- bootstrap's own
+	# Path 1 always passes --device explicitly instead.
+	[ -n "$_gb_r_device" ] || _gb_r_device=$(gb_device_id) || exit $?
+
+	GB_URL=$(gb_uci_get gitbackup.origin.url)
+	[ -n "$GB_URL" ] || gb_die 2 'gitbackup.origin.url: empty, a repository url is required'
+
+	eval "$(gb_git_env)"
+
+	# shellcheck disable=SC2086  # word-splitting is the point: $_gb_r_flags is zero or more bare flag tokens
+	gb_restore "$_gb_r_device" "$_gb_r_commit" $_gb_r_flags
+	exit $?
+}
+
 # cmd_log [lines] -- A01: syslog is the log (lib.sh's own gb_log header
 # comment -- logread survives a reboot, a plain variable does not), so
 # `gitbackup log` is a thin, tag-filtered read of it. run's own gb_log
@@ -701,7 +741,10 @@ case "$cmd" in
 		# (same reasoning as status/keygen/pubkey above).
 		cmd_log "$@"
 		;;
-	collect|diff|paths|restore|card)
+	restore)
+		cmd_restore "$@"
+		;;
+	collect|diff|paths|card)
 		gb_validate_config
 		# Honest placeholders: exit 1 and say so, rather than a stub that
 		# pretends to have run. Each lands in its own ticket.

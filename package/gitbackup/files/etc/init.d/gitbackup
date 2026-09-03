@@ -111,7 +111,7 @@ config_change() {
 		kill -0 "$_gb_prev_pid" 2>/dev/null && kill "$_gb_prev_pid" 2>/dev/null
 	fi
 
-	( sleep "$_gb_debounce"; rm -f "$_gb_pidfile"; "$GB_BIN" run >/dev/null 2>&1 ) &
+	( sleep "$_gb_debounce"; rm -f "$_gb_pidfile"; "$GB_BIN" run --trigger procd >/dev/null 2>&1 ) &
 	echo $! >"$_gb_pidfile"
 }
 
