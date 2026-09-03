@@ -94,7 +94,22 @@ config_change() {
 	mkdir -p "$GB_STATE_DIR"
 	_gb_pidfile="$GB_STATE_DIR/debounce.pid"
 
-	[ -f "$_gb_pidfile" ] && kill "$(cat "$_gb_pidfile")" 2>/dev/null
+	# Review finding, ticket 06: killing the PID from the pidfile blind is
+	# fine right after this same router wrote it, but a long-uptime router
+	# can wrap PIDs, and by the time the NEXT config.change fires that same
+	# number may belong to an unrelated process this has no business
+	# signaling. `kill -0` (send no signal, just ask whether the PID
+	# exists) is the cheap half of that check -- it does not prove the PID
+	# is still OUR sleep, only that it is not free for the kernel to have
+	# reused by something else; reused PIDs are strictly the OS's own
+	# concern here. Deliberately `kill -0`, not a `/proc/<pid>` test: this
+	# file's own tests/run.sh unit test runs it on macOS, which has no
+	# /proc at all, while `kill -0` is the one portable primitive both that
+	# host and busybox ash on the router actually implement.
+	if [ -f "$_gb_pidfile" ]; then
+		_gb_prev_pid=$(cat "$_gb_pidfile")
+		kill -0 "$_gb_prev_pid" 2>/dev/null && kill "$_gb_prev_pid" 2>/dev/null
+	fi
 
 	( sleep "$_gb_debounce"; rm -f "$_gb_pidfile"; "$GB_BIN" run >/dev/null 2>&1 ) &
 	echo $! >"$_gb_pidfile"

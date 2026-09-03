@@ -111,11 +111,59 @@ gb_free_kb() {
 
 # gb_have_net <host> [port]
 #
-# True when a TCP connection opens. There is no curl in the base image and
-# busybox's `nc -z` is not built everywhere, so the probe is an ordinary
-# connect fed from /dev/null: nc exits as soon as the peer sees EOF, and its
-# status is the answer. A failure here is not an error -- `run` treats an
-# offline router as "skipped", so cron does not mail about the internet.
+# True when a TCP connection opens. There is no curl in the base image, and
+# -- D01, measured live on the owlab 25.12.4 stand -- this image's busybox
+# nc (v1.37.0) is not the usual BSD/GNU nc at all: `nc --help` prints
+# "Usage: nc [IPADDR PORT]" and nothing else. No `-w`, no `-z`, no flags of
+# any kind; `nc -w 5 host port` (this function's previous body) prints that
+# same usage banner and exits 1 for every host, reachable or not, which is
+# exactly the bug ticket 01 flagged as D01 and interfaces.md warned every
+# later module off relying on. The fix is simply never passing nc a flag it
+# does not have: `nc host port` alone is accepted, connects, and exits 0/1
+# correctly -- confirmed live for a real open port, a closed one (ECONNREFUSED)
+# and a bad hostname.
+#
+# The remaining problem a flag-free nc leaves is a *hang*: an address that
+# is filtered rather than refused (no RST, no reply at all) leaves a bare
+# `nc host port` blocked on the kernel's own TCP connect timeout, which is
+# well over a minute -- unacceptable for a check `run` is supposed to fail
+# out of quickly. There is no `timeout` applet either (confirmed: absent
+# from `busybox --list` and no separate binary on the stand), so the bound
+# is hand-rolled by POLLING, not by a second background "watchdog" job that
+# kills nc after 5s: an earlier version of this function did exactly that
+# (`( sleep 5; kill $ncpid ) & watchpid=$!; ...; kill $watchpid`), and it
+# leaked a process every time nc finished BEFORE the 5s elapsed (the common
+# case) -- found live on the owlab stand, not in any unit test: killing the
+# watchdog SUBSHELL does not kill the plain `sleep 5` still running inside
+# it, which is a separate child process with its own pid; that orphaned
+# sleep keeps running for whatever time was left, still holding every file
+# descriptor it inherited at the moment it was forked -- including, when
+# `run`'s own step 1 flock (fd 9 on /var/run/gitbackup.lock) was already
+# held at the time gb_have_net was called, the lock file itself. Confirmed
+# live: calling `run` twice back to back after a fast, successful
+# gb_have_net check left the SECOND call seeing the lock as still busy for
+# up to ~5s, purely from the first call's orphaned watchdog sleep -- despite
+# the first `run` process having already exited outright. Polling for nc's
+# own pid to disappear (`kill -0`, no signal sent, just an existence check)
+# needs no second process at all, so there is nothing left over to leak.
+# Measured live: an address that never answers (192.0.2.1, a TEST-NET-1
+# address routed nowhere) returns in ~5s instead of hanging; a real open
+# port and a real closed port both still return in well under a second.
 gb_have_net() {
-	nc -w 5 "$1" "${2:-443}" </dev/null >/dev/null 2>&1
+	_gb_hn_host="$1"
+	_gb_hn_port="${2:-443}"
+	nc "$_gb_hn_host" "$_gb_hn_port" </dev/null >/dev/null 2>&1 &
+	_gb_hn_pid=$!
+	_gb_hn_waited=0
+	while kill -0 "$_gb_hn_pid" 2>/dev/null; do
+		if [ "$_gb_hn_waited" -ge 5 ]; then
+			kill "$_gb_hn_pid" 2>/dev/null
+			wait "$_gb_hn_pid" 2>/dev/null
+			return 1
+		fi
+		sleep 1
+		_gb_hn_waited=$((_gb_hn_waited + 1))
+	done
+	wait "$_gb_hn_pid" 2>/dev/null
+	return $?
 }

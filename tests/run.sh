@@ -35,9 +35,18 @@ only="${1:-}"
 # A missing module has to stop the run here. Every test body is a subshell, and
 # a failed `.` inside one kills that subshell without asserting anything -- the
 # suite would report "0 failed" for code that does not exist.
-for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup"; do
+for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup"; do
 	[ -r "$module" ] || { printf 'missing: %s\n' "$module" >&2; exit 1; }
 done
+
+# gitio.sh and the deep half of `run` are tested against a REAL local git
+# repository, not a stub (interfaces.md: "Единственное исключение --
+# gitio.sh и restore.sh, которые проверяются интеграционно на локальном
+# bare-репозитории" -- there is no faithful way to fake object-database
+# plumbing). GB_TEST_REAL_GIT is captured here, before PATH gains the git
+# stub below, so that stub can delegate to it on request.
+GB_TEST_REAL_GIT=$(command -v git) || { printf 'git not found on PATH\n' >&2; exit 1; }
+export GB_TEST_REAL_GIT
 
 # --------------------------------------------------------------------------
 # stubs
@@ -326,8 +335,21 @@ cat >"$work/bin/sysupgrade" <<'STUB'
 # with the contents of GB_TEST_SYSUPGRADE_L, one path per line -- the fixed
 # list ticket 02's tests hand it, standing in for the real tool's own merge
 # of /etc/sysupgrade.conf, /lib/upgrade/keep.d/* and changed conffiles.
+#
+# `-b <file>` (ticket 07, `run`'s own archive step) writes a fixed,
+# obviously-fake placeholder to <file> -- its content does not matter to
+# anything under test, only whether/how often this stub was invoked, which
+# it records as one line per call to GB_TEST_SYSUPGRADE_B_LOG when that is
+# set (the seam t_gitio_archive_not_rebuilt_when_unchanged uses to prove
+# `run` skips this call on an unchanged manifest, not just that the file
+# happens to still be there).
 case "${1:-}" in
 	-l|--list-backup) ;;
+	-b)
+		[ -n "${GB_TEST_SYSUPGRADE_B_LOG:-}" ] && printf 'called %s\n' "$2" >>"$GB_TEST_SYSUPGRADE_B_LOG"
+		printf 'fake sysupgrade backup archive\n' >"$2"
+		exit 0
+		;;
 	*) echo "sysupgrade stub: unsupported argument '${1:-}'" >&2; exit 64 ;;
 esac
 cat "${GB_TEST_SYSUPGRADE_L:-/dev/null}"
@@ -419,10 +441,46 @@ STUB
 
 cat >"$work/bin/git" <<'STUB'
 #!/bin/sh
-# Test double for git(1), covering only `git ls-remote <url>` -- cmd_test's
-# one real-git call. GB_TEST_GIT_RC controls the exit code (default 0);
-# GB_TEST_GIT_ERR is written to stderr when it is non-zero, standing in for
-# git's own "fatal: ..." text that cmd_test folds into its error message.
+# Test double for git(1). Two entirely different jobs, picked by
+# GB_TEST_GIT_REAL:
+#
+#   GB_TEST_GIT_REAL=1 -- gitio.sh's own functions and the deep half of
+#     `run` need REAL git plumbing (hash-object/write-tree/commit-tree/
+#     push against a real object database) -- there is no faithful way to
+#     fake that, so this execs straight through to GB_TEST_REAL_GIT
+#     (captured before this stub went on PATH). GB_TEST_GIT_REMOTE_URL/
+#     GB_TEST_GIT_REMOTE_PATH, if both set, rewrite that one argument
+#     first: `run` needs GB_URL to be a schema-valid https://.../ssh://...
+#     string to pass gb_parse_url/gb_visibility_ok, but there is no real
+#     server anywhere in this test -- so the fixture's schema-valid URL is
+#     swapped for a real local bare-repo path at the last possible moment,
+#     the one git itself actually receives.
+#
+#   unset/0 -- the original, narrow double covering only `git ls-remote
+#     <url>` for cmd_test's one real-git call (ticket 04). GB_TEST_GIT_RC
+#     controls the exit code (default 0); GB_TEST_GIT_ERR is written to
+#     stderr when it is non-zero, standing in for git's own "fatal: ..."
+#     text cmd_test folds into its error message. Unchanged by this
+#     ticket -- gitio.sh's tests always set GB_TEST_GIT_REAL=1 instead of
+#     touching this branch.
+if [ "${GB_TEST_GIT_REAL:-0}" = 1 ]; then
+	if [ -n "${GB_TEST_GIT_REMOTE_URL:-}" ] && [ -n "${GB_TEST_GIT_REMOTE_PATH:-}" ]; then
+		_gb_oldifs="$IFS"
+		IFS='
+'
+		set -f
+		set -- $(for _gb_a in "$@"; do
+			if [ "$_gb_a" = "$GB_TEST_GIT_REMOTE_URL" ]; then
+				printf '%s\n' "$GB_TEST_GIT_REMOTE_PATH"
+			else
+				printf '%s\n' "$_gb_a"
+			fi
+		done)
+		set +f
+		IFS="$_gb_oldifs"
+	fi
+	exec "$GB_TEST_REAL_GIT" "$@"
+fi
 case "${1:-}" in
 	ls-remote) ;;
 	*) echo "git stub: unsupported subcommand '${1:-}'" >&2; exit 64 ;;
@@ -432,6 +490,46 @@ if [ "$rc" -ne 0 ]; then
 	printf '%s\n' "${GB_TEST_GIT_ERR:-git stub: authentication failed}" >&2
 fi
 exit "$rc"
+STUB
+
+cat >"$work/bin/df" <<'STUB'
+#!/bin/sh
+# Test double for df(1), used only through lib.sh's gb_free_kb ("df -Pk
+# <dir>", NR==2 $4). GB_TEST_DF_KB, when set, prints a synthetic Avail
+# column so cmd_run's space check (ticket 07, "недостаток места -> exit 1
+# с числами") can be exercised deterministically -- the real free space on
+# whatever machine runs this suite is not a number this test controls.
+# Unset (the default): straight through to the host's real df, same
+# translate-on-request shape as the stat/date stubs above.
+if [ -z "${GB_TEST_DF_KB:-}" ]; then
+	exec command -p df "$@"
+fi
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted-on\n'
+printf 'test 1 1 %s 1%% %s\n' "$GB_TEST_DF_KB" "${2:-/tmp}"
+STUB
+
+cat >"$work/bin/flock" <<'STUB'
+#!/bin/sh
+# Test double for busybox flock(1)'s FD form (`flock -n FD`). There is no
+# flock(1) on macOS at all, and the real locking semantics are the
+# kernel's job, not this suite's -- this only lets cmd_run's own branch on
+# flock's exit code be tested deterministically, via GB_TEST_FLOCK_LOCKED.
+# Unset (the default): the lock is free, same as a router that has never
+# run `run` twice at once.
+[ "${GB_TEST_FLOCK_LOCKED:-0}" = 1 ] && exit 1
+exit 0
+STUB
+
+cat >"$work/bin/logread" <<'STUB'
+#!/bin/sh
+# Test double for logread(1) (cmd_log, ticket 07). Only the one shape
+# cmd_log actually uses, `-e <pattern>`; answers out of GB_TEST_LOGREAD, a
+# fixture file of already-formatted log lines, filtered the same way the
+# real tool's own -e does (a plain substring/regexp match, not anchored).
+[ "${1:-}" = "-e" ] || { echo "logread stub: expected -e, got '${1:-}'" >&2; exit 64; }
+pattern="${2:-}"
+grep -e "$pattern" "${GB_TEST_LOGREAD:-/dev/null}" 2>/dev/null
+exit 0
 STUB
 
 cat >"$work/bin/date" <<'STUB'
@@ -617,6 +715,95 @@ time.sleep(3)
 			eq 'gb_have_net succeeds against an open port' '0' "$?"
 			kill "$listener_pid" 2>/dev/null
 			wait "$listener_pid" 2>/dev/null
+		fi
+	)
+}
+
+# t_have_net_busybox_shape -- D01 itself: the OLD body (`nc -w 5 host port`)
+# fails this test outright, because this image's real busybox nc (v1.37.0,
+# confirmed live on the owlab stand) is `nc [IPADDR PORT]` and nothing
+# else -- any flag at all makes it print its usage banner and exit 1. This
+# stub reproduces exactly that shape rather than a generic fake, so a
+# regression back to passing nc any flag turns this red for the right
+# reason.
+t_have_net_busybox_shape() {
+	(
+		. "$share/lib.sh"
+		# A dedicated directory, not $work/bin (already first on this whole
+		# suite's PATH): overwriting nc there would leak this fake nc into
+		# every test that runs afterward, including run's own network
+		# precheck further down this file -- shellcheck (SC2030/SC2031)
+		# flags exactly this shape of mistake for a bare `PATH=` assignment
+		# inside a subshell, which is what caught it here.
+		mkdir -p "$work/nc-busybox-shape"
+		cat >"$work/nc-busybox-shape/nc" <<'STUB'
+#!/bin/sh
+case "$1" in
+	-*) echo "usage: nc [IPADDR PORT]" >&2; exit 1 ;;
+esac
+[ "$#" -eq 2 ] || { echo "usage: nc [IPADDR PORT]" >&2; exit 1; }
+exit 0
+STUB
+		chmod +x "$work/nc-busybox-shape/nc"
+		PATH="$work/nc-busybox-shape:$PATH" gb_have_net 127.0.0.1 443
+		eq 'gb_have_net succeeds against a busybox nc that only accepts IPADDR PORT (D01)' '0' "$?"
+	)
+}
+
+# t_have_net_bounded_timeout -- a host that never answers at all (no RST,
+# no reply) must not hang gb_have_net for the kernel's own multi-minute
+# connect timeout. A stub nc that just sleeps stands in for that address;
+# gb_have_net's own 5s watchdog has to kill it well inside this test's
+# generous 8s ceiling.
+t_have_net_bounded_timeout() {
+	(
+		. "$share/lib.sh"
+		mkdir -p "$work/nc-hangs"
+		cat >"$work/nc-hangs/nc" <<'STUB'
+#!/bin/sh
+sleep 30
+STUB
+		chmod +x "$work/nc-hangs/nc"
+		_gb_start=$(date +%s)
+		PATH="$work/nc-hangs:$PATH" gb_have_net 10.255.255.1 443
+		_gb_rc=$?
+		_gb_elapsed=$(($(date +%s) - _gb_start))
+		if [ "$_gb_rc" -ne 0 ]; then
+			ok 'gb_have_net reports failure for a host that never answers'
+		else
+			no 'gb_have_net reports failure for a host that never answers' "got rc=$_gb_rc"
+		fi
+		if [ "$_gb_elapsed" -le 15 ]; then
+			ok 'gb_have_net returns within its own bound instead of hanging'
+		else
+			no 'gb_have_net returns within its own bound instead of hanging' "took ${_gb_elapsed}s"
+		fi
+	)
+}
+
+# t_have_net_no_leaked_watchdog -- found live on the owlab stand, not by
+# any unit test until this one: the previous implementation's watchdog was
+# `( sleep 5; kill $ncpid ) & watchpid=$!; ...; kill $watchpid` -- and
+# killing that SUBSHELL does not kill the plain `sleep 5` still running
+# inside it, a separate process that survives, orphaned, for whatever time
+# was left. Confirmed live: that orphaned sleep still held run's own
+# step-1 flock fd it had inherited, long after the `run` process that
+# opened it had already exited, making a SECOND `run` right after see the
+# lock as busy for no reason. `nc` finishing well before the 5s bound (a
+# real open port, or -- as here -- a refused connection, both near-
+# instant) is exactly the case that used to leak; this fixture never
+# spawns "sleep 5" anywhere else, so finding one running a moment later is
+# an unambiguous, specific signal of the leak, not a guess.
+t_have_net_no_leaked_watchdog() {
+	(
+		. "$share/lib.sh"
+		command -v pgrep >/dev/null 2>&1 || return 0
+		gb_have_net 127.0.0.1 1
+		sleep 0.3
+		if pgrep -f '^sleep 5$' >/dev/null 2>&1; then
+			no 'gb_have_net leaves no orphaned watchdog process behind' 'found a leftover "sleep 5" process'
+		else
+			ok 'gb_have_net leaves no orphaned watchdog process behind'
 		fi
 	)
 }
@@ -1342,6 +1529,41 @@ EOF
 	)
 }
 
+t_scrub_hard_exclude_pattern_survives_a_real_glob_match() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"; . "$share/scrub.sh"
+		scrub_fixture
+		# Found live on the owlab stand, where /etc/dropbear genuinely has
+		# host keys matching the real pattern: unquoted `set -- $_gb_pat`
+		# doesn't just trim the mandatory space after "#public:", it
+		# pathname-expands the pattern THEN AND THERE against the real
+		# filesystem root (an absolute pattern glob-expands against root
+		# regardless of cwd) -- so on a host where something happens to
+		# match, $_gb_pat silently became that real path instead of staying
+		# the literal pattern, and outdir/files was never even looked at
+		# under the intended name. Reproduced host-portably with /etc/passwd
+		# standing in for a real host key: any POSIX host running this
+		# suite has one, so a hard-exclude pattern of "/etc/pass*" is
+		# guaranteed to have something to wrongly expand into if the fix
+		# regresses.
+		GB_EXCLUDE_LIST="$work/exclude.list"; export GB_EXCLUDE_LIST
+		printf '#public: /etc/pass*\n' >"$GB_EXCLUDE_LIST"
+		mkdir -p "$work/froot/etc"
+		printf 'not-a-real-passwd-file\n' >"$work/froot/etc/passfile"
+		sysupgrade_list '/etc/passfile'
+		gb_collect "$work/out" >/dev/null 2>&1
+
+		gb_scrub "$work/out" >/dev/null
+
+		if [ -e "$work/out/files/etc/passfile" ]; then
+			no 'the pattern still matches inside outdir/files, not a real /etc/passwd it collided with' \
+				'still present'
+		else
+			ok 'the pattern still matches inside outdir/files, not a real /etc/passwd it collided with'
+		fi
+	)
+}
+
 t_scrub_hard_exclude_public() {
 	(
 		. "$share/lib.sh"; . "$share/collect.sh"; . "$share/scrub.sh"
@@ -1817,6 +2039,266 @@ t_askpass() {
 }
 
 # --------------------------------------------------------------------------
+# gitio.sh (ticket 07) -- tested against a REAL local git repository, not
+# stubs (interfaces.md: "gitio.sh и restore.sh ... проверяются
+# интеграционно на локальном bare-репозитории" -- there is no faithful way
+# to fake object-database plumbing). GB_TEST_GIT_REAL=1 makes the git stub
+# above exec straight through to the real git captured as GB_TEST_REAL_GIT.
+# --------------------------------------------------------------------------
+
+t_gitio_remote_head_no_branch() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-rh-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+
+		out=$(gb_remote_head 'device/rt1')
+		eq 'a reachable but branchless repository returns 0' '0' "$?"
+		eq 'and prints nothing (no parent yet)' '' "$out"
+	)
+}
+
+t_gitio_remote_head_unreachable() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-rh-no-such-repo.git"; export GB_URL
+		rm -rf "$GB_URL"
+
+		out=$(gb_remote_head 'device/rt1' 2>/dev/null)
+		eq 'a repository that does not exist at all returns 1' '1' "$?"
+		eq 'and prints nothing' '' "$out"
+	)
+}
+
+# t_gitio_first_commit_no_parent -- the first-ever backup for a device:
+# gb_build_tree with no GB_PARENT, gb_commit_push with an empty parent
+# (commit-tree's own root-commit form). Exercises both mode kinds
+# (100644, 120000 for a dangling symlink -- the one collect.sh's own
+# backup sets are full of, /etc/resolv.conf and friends) in the same tree.
+t_gitio_first_commit_no_parent() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-first-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+
+		_gt_repodir="$work/gitio-first-repo"
+		_gt_tree="$work/gitio-first-tree"
+		rm -rf "$_gt_repodir" "$_gt_tree"
+		mkdir -p "$_gt_tree/files/etc/config"
+		printf 'config network\n' >"$_gt_tree/files/etc/config/network"
+		ln -s /tmp/resolv.conf.d/resolv.conf.auto "$_gt_tree/files/etc/resolv.conf"
+		git init -q "$_gt_repodir"
+
+		unset GB_PARENT
+		GB_PREFIX='devices/rt1'; export GB_PREFIX
+		_gt_tree_sha=$(gb_build_tree "$_gt_repodir" "$_gt_tree")
+		if [ -n "$_gt_tree_sha" ]; then
+			ok 'gb_build_tree prints a tree SHA with no parent'
+		else
+			no 'gb_build_tree prints a tree SHA with no parent' 'empty'
+		fi
+
+		: >"$work/gitio-first-msg"
+		printf '2026-01-01 00:00 rt1: network\n' >"$work/gitio-first-msg"
+		_gt_commit=$(gb_commit_push "$_gt_repodir" "$_gt_tree_sha" '' "$work/gitio-first-msg" 'device/rt1')
+		eq 'gb_commit_push succeeds for a brand-new branch' '0' "$?"
+
+		_gt_seen=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt1/files/etc/config/network" 2>/dev/null)
+		eq 'the pushed commit carries the regular file at its prefixed path' 'config network' "$_gt_seen"
+
+		_gt_mode=$(git --git-dir="$GB_URL" ls-tree "$_gt_commit" devices/rt1/files/etc/resolv.conf | awk '{print $1}')
+		eq 'the dangling symlink is stored as mode 120000, not dereferenced' '120000' "$_gt_mode"
+
+		_gt_target=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt1/files/etc/resolv.conf" 2>/dev/null)
+		eq 'and its blob is the raw target text' '/tmp/resolv.conf.d/resolv.conf.auto' "$_gt_target"
+
+		unset GB_PREFIX
+	)
+}
+
+# t_gitio_commit_push_no_global_git_identity -- found live on the owlab
+# stand (not in any unit test, until this one): a freshly booted router
+# has no ~/.gitconfig and no [user] section anywhere at all, and
+# `commit-tree` refuses outright ("Author identity unknown ... Please
+# tell me who you are") rather than guess one -- every host-side test up
+# to that point had passed only because the DEVELOPMENT MACHINE'S OWN
+# global gitconfig was quietly supplying user.name/user.email. HOME
+# pointed at an empty directory plus GIT_CONFIG_NOSYSTEM=1 reproduces a
+# router's total absence of git identity configuration; gb_commit_push has
+# to work anyway (GIT_AUTHOR_*/GIT_COMMITTER_* set explicitly, not left to
+# git's fallback chain).
+t_gitio_commit_push_no_global_git_identity() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-noident-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+
+		_gt_repodir="$work/gitio-noident-repo"
+		_gt_tree="$work/gitio-noident-tree"
+		rm -rf "$_gt_repodir" "$_gt_tree"
+		mkdir -p "$_gt_tree/files/etc/config"
+		printf 'config network\n' >"$_gt_tree/files/etc/config/network"
+		git init -q "$_gt_repodir"
+
+		unset GB_PARENT
+		GB_PREFIX='devices/rt1'; export GB_PREFIX
+		_gt_tree_sha=$(gb_build_tree "$_gt_repodir" "$_gt_tree")
+
+		: >"$work/gitio-noident-msg"
+		printf '2026-01-01 00:00 rt1: network\n' >"$work/gitio-noident-msg"
+
+		mkdir -p "$work/gitio-noident-empty-home"
+		_gt_commit=$(HOME="$work/gitio-noident-empty-home" GIT_CONFIG_NOSYSTEM=1 \
+			gb_commit_push "$_gt_repodir" "$_gt_tree_sha" '' "$work/gitio-noident-msg" 'device/rt1')
+		eq 'gb_commit_push succeeds with no git identity configured anywhere' '0' "$?"
+		if [ -n "$_gt_commit" ]; then
+			ok 'and prints the commit SHA'
+		else
+			no 'and prints the commit SHA' 'empty'
+		fi
+
+		unset GB_PREFIX
+	)
+}
+
+# t_gitio_shared_branch_preserves_other_device -- spec step 11, a branch
+# with no {device} in it: seeding the index from the parent's full tree
+# before overlaying this device's own prefix must leave another device's
+# files untouched, and their blobs must never be fetched at all.
+t_gitio_shared_branch_preserves_other_device() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-shared-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+		# A plain local path never speaks the partial-clone protocol
+		# extension at all (confirmed live: it degrades straight to
+		# --depth=1 with a "filtering not recognized" warning, fetching
+		# every blob regardless of --filter=blob:none) -- allowFilter is
+		# what a real GitHub/GitLab/Forgejo server already has on, and is
+		# the only way this test can exercise the actual "blobs never
+		# fetched" codepath rather than always taking the degraded one.
+		git config --file "$GB_URL/config" uploadpack.allowFilter true
+
+		# Seed the shared branch directly (as if rt2 had already pushed).
+		_gt_seed="$work/gitio-shared-seed"
+		rm -rf "$_gt_seed"
+		git init -q "$_gt_seed"
+		git -C "$_gt_seed" config user.email a@b.c
+		git -C "$_gt_seed" config user.name t
+		mkdir -p "$_gt_seed/devices/rt2/files/etc/config"
+		printf 'rt2 network\n' >"$_gt_seed/devices/rt2/files/etc/config/network"
+		git -C "$_gt_seed" add -A
+		git -C "$_gt_seed" commit -q -m 'seed: rt2'
+		git -C "$_gt_seed" push -q "$GB_URL" HEAD:refs/heads/shared
+
+		_gt_repodir="$work/gitio-shared-repo"
+		_gt_tree="$work/gitio-shared-tree"
+		rm -rf "$_gt_repodir" "$_gt_tree"
+		mkdir -p "$_gt_tree/files/etc/config"
+		printf 'rt1 network\n' >"$_gt_tree/files/etc/config/network"
+
+		GB_PARENT=$(gb_remote_head shared)
+		[ -n "$GB_PARENT" ] || no 'the seeded shared branch has a parent to build on' 'empty'
+		export GB_PARENT
+		gb_fetch_meta shared "$_gt_repodir" >/dev/null 2>&1
+		eq 'gb_fetch_meta succeeds against the shared branch' '0' "$?"
+
+		# gb_fetch_meta's own --filter=blob:none: rt2's blob, which this
+		# device never touches, must never have been downloaded -- only
+		# trees, never someone else's content. `--batch-all-objects`
+		# enumerates only what is ALREADY physically present, so it cannot
+		# itself trigger the lazy fetch it is checking for -- unlike
+		# `cat-file -e <sha>` on a promisor repo, which (confirmed live)
+		# transparently fetches the object just to answer the existence
+		# check, silently invalidating the very thing it was asked to
+		# prove.
+		_gt_blob_count=$(git --git-dir="$_gt_repodir/.git" cat-file --batch-all-objects \
+			--batch-check='%(objecttype)' 2>/dev/null | grep -c '^blob$')
+		eq 'no blob was fetched by gb_fetch_meta, only the commit and its trees' '0' "$_gt_blob_count"
+
+		GB_PREFIX='devices/rt1'; export GB_PREFIX
+		_gt_tree_sha=$(gb_build_tree "$_gt_repodir" "$_gt_tree")
+		_gt_commit=$(GIT_DIR="$_gt_repodir/.git" git commit-tree "$_gt_tree_sha" -p "$GB_PARENT" -m 'rt1 backup')
+		git --git-dir="$_gt_repodir/.git" push -q "$GB_URL" "$_gt_commit:refs/heads/shared"
+
+		_gt_rt1=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt1/files/etc/config/network" 2>/dev/null)
+		eq 'this devices own file is present' 'rt1 network' "$_gt_rt1"
+		_gt_rt2=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt2/files/etc/config/network" 2>/dev/null)
+		eq 'and the OTHER devices file survives untouched' 'rt2 network' "$_gt_rt2"
+
+		unset GB_PARENT GB_PREFIX
+	)
+}
+
+# t_gitio_commit_push_nonfastforward_then_retry -- spec step 14. Builds a
+# commit on top of parent P0, then (simulating a second run of the same
+# router winning the race) pushes a DIFFERENT commit also on P0 first, so
+# the original push is genuinely stale when it is attempted -- not just
+# fed a wrong SHA by the test.
+t_gitio_commit_push_nonfastforward_then_retry() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-race-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+
+		_gt_seed="$work/gitio-race-seed"
+		rm -rf "$_gt_seed"
+		git init -q "$_gt_seed"
+		git -C "$_gt_seed" config user.email a@b.c
+		git -C "$_gt_seed" config user.name t
+		printf 'base\n' >"$_gt_seed/f"
+		git -C "$_gt_seed" add -A
+		git -C "$_gt_seed" commit -q -m base
+		git -C "$_gt_seed" push -q "$GB_URL" HEAD:refs/heads/device/rt1
+		_gt_p0=$(git -C "$_gt_seed" rev-parse HEAD)
+
+		_gt_repodir="$work/gitio-race-repo"
+		rm -rf "$_gt_repodir"
+		git init -q "$_gt_repodir"
+		GIT_DIR="$_gt_repodir/.git" git fetch -q --depth=1 "$GB_URL" device/rt1
+
+		# Our own commit, parented on P0.
+		: >"$work/gitio-race-msg"
+		printf 'ours\n' >"$work/gitio-race-msg"
+		_gt_tree=$(GIT_DIR="$_gt_repodir/.git" git rev-parse "$_gt_p0^{tree}")
+
+		# The competitor lands on the branch FIRST, also parented on P0 --
+		# now genuinely ahead of what our own push below still thinks the
+		# tip is.
+		git -C "$_gt_seed" push -q "$GB_URL" HEAD:refs/heads/device/rt1 --force 2>/dev/null
+		printf 'competitor\n' >"$_gt_seed/f"
+		git -C "$_gt_seed" commit -q -am competitor
+		git -C "$_gt_seed" push -q "$GB_URL" HEAD:refs/heads/device/rt1
+
+		_gt_commit=$(gb_commit_push "$_gt_repodir" "$_gt_tree" "$_gt_p0" "$work/gitio-race-msg" device/rt1)
+		eq 'a push against a parent the branch has moved past is rejected, not silently accepted' '2' "$?"
+		eq 'and nothing is printed on that rejection' '' "$_gt_commit"
+
+		# The retry: re-resolve the parent, rebuild on top of it, push again.
+		_gt_p1=$(gb_remote_head device/rt1)
+		GIT_DIR="$_gt_repodir/.git" git fetch -q --depth=1 "$GB_URL" device/rt1
+		_gt_commit2=$(gb_commit_push "$_gt_repodir" "$_gt_tree" "$_gt_p1" "$work/gitio-race-msg" device/rt1)
+		eq 'retrying once against the now-current parent succeeds' '0' "$?"
+		if [ -n "$_gt_commit2" ]; then
+			ok 'and prints the new commit SHA'
+		else
+			no 'and prints the new commit SHA' 'empty'
+		fi
+	)
+}
+
+# --------------------------------------------------------------------------
 # schedule.sh
 # --------------------------------------------------------------------------
 
@@ -2111,7 +2593,12 @@ FAKE
 # --------------------------------------------------------------------------
 
 cli() {
-	GB_SHARE="$share" GB_STATE_DIR="$work/state" sh "$files/usr/sbin/gitbackup" "$@"
+	# GB_LOCK_FILE (ticket 07, cmd_run's step 1): the router's own default
+	# is /var/run/gitbackup.lock, not writable by the non-root user this
+	# suite runs as -- every `run` test needs it redirected under $work,
+	# same as GB_SHARE/GB_STATE_DIR already are.
+	GB_SHARE="$share" GB_STATE_DIR="$work/state" GB_LOCK_FILE="$work/gitbackup.lock" \
+		sh "$files/usr/sbin/gitbackup" "$@"
 }
 
 t_cli_usage() {
@@ -2188,10 +2675,17 @@ t_cli_validation() {
 	cli run >/dev/null 2>&1
 	eq 'an empty custom device exits 2' '2' "$?"
 
+	# ticket 07: `run` is real now, not a stub -- a valid config takes it
+	# straight past gb_validate_config and into cmd_run's own step 3
+	# (network precheck). 127.0.0.1 with nothing listening is the same
+	# fast, offline, deterministic "unreachable" fixture t_cli_test_*
+	# already uses below; example.org would make this test's result depend
+	# on whether this host actually has internet access.
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		'gitbackup.origin.url=https://example.org/o/r.git'
-	cli run >/dev/null 2>&1
-	eq 'a valid configuration gets past validation to the stub' '1' "$?"
+		'gitbackup.origin.url=https://127.0.0.1:1/o/r.git'
+	out=$(cli run 2>&1)
+	eq 'a valid configuration gets past validation, into run itself' '0' "$?"
+	contains 'and run reports the network skip, not a leftover stub message' 'skipped' "$out"
 }
 
 t_cli_public_forces_scrub() {
@@ -2342,6 +2836,227 @@ t_cli_keygen_pubkey() {
 	unset GB_ETC_DIR
 }
 
+# gb_listener <port> -- a background TCP listener on 127.0.0.1:<port>, for
+# `run` tests that need gb_have_net's real connect to succeed with no real
+# git/HTTP protocol behind it. Sets GB_LISTENER_PID (or leaves it empty when
+# python3 is not installed, same skip-gracefully convention t_have_net's
+# open-port case already uses -- nc itself never needs the far end to
+# accept(), only for the TCP handshake to complete, so a bare listen() is
+# enough). NOT `pid=$(gb_listener ...)`: a command substitution runs this
+# function in a subshell, and the background job it starts dies the moment
+# that subshell exits to produce the substitution's output -- confirmed
+# live, `ps` on the "returned" PID immediately after shows it already gone.
+# Caller kills it (`kill "$GB_LISTENER_PID"; wait "$GB_LISTENER_PID"
+# 2>/dev/null`) once done.
+gb_listener() {
+	GB_LISTENER_PID=''
+	command -v python3 >/dev/null 2>&1 || return 0
+	_gl_port="$1"
+	# Actually accept()s and closes every connection, rather than just
+	# listen()ing and never draining the backlog: measured live on macOS,
+	# a listener that never accepts leaves the very first connect() to it
+	# stalling for ~10s before finally succeeding (some BSD-side delayed-
+	# ACK/backlog quirk this suite has no reason to depend on), where a
+	# real accept loop connects in single-digit milliseconds every time.
+	python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $_gl_port))
+s.listen(5)
+s.settimeout(30)
+end = time.time() + 30
+while time.time() < end:
+    try:
+        c, _ = s.accept()
+        c.close()
+    except socket.timeout:
+        break
+" &
+	GB_LISTENER_PID=$!
+}
+
+t_cli_run_flock_busy() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://127.0.0.1:1/o/r.git'
+	GB_TEST_FLOCK_LOCKED=1; export GB_TEST_FLOCK_LOCKED
+	out=$(cli run 2>&1)
+	eq 'a busy lock exits 0' '0' "$?"
+	contains 'and reports skipped, not an error' 'skipped' "$out"
+	unset GB_TEST_FLOCK_LOCKED
+}
+
+t_cli_run_space_check_fails() {
+	gb_listener 18491
+	_gl_pid="$GB_LISTENER_PID"
+	[ -n "$_gl_pid" ] || return 0
+	sleep 1
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://127.0.0.1:18491/o/r.git' \
+		'gitbackup.origin.acknowledged=1'
+	GB_TEST_DF_KB=100; export GB_TEST_DF_KB
+	out=$(cli run 2>&1)
+	eq 'not enough space in /tmp exits 1' '1' "$?"
+	contains 'and the message names how much is needed' 'need ~' "$out"
+	contains 'and how much is actually free' '100 KB free' "$out"
+	unset GB_TEST_DF_KB
+	kill "$_gl_pid" 2>/dev/null
+	wait "$_gl_pid" 2>/dev/null
+}
+
+# t_run_integration_bare_repo -- the ticket's own headline acceptance
+# criterion: a full `gitbackup run`, through the real CLI (flock, the
+# network precheck, the visibility gate, all of it), pushing to a REAL
+# local bare git repository three times over. First run creates the
+# branch; second run, nothing changed, makes no commit (idempotence);
+# third run, after a chmod-only edit git itself would never notice,
+# produces a new commit (manifest catches what git can't see) -- and along
+# the way checks the commit message format, the archive step, and that
+# the archive is not rebuilt on the no-op run.
+#
+# GB_URL has to be a schema-valid https://... (gb_parse_url/
+# gb_visibility_ok both die otherwise), so GB_TEST_GIT_REMOTE_URL/PATH
+# (the git stub, GB_TEST_GIT_REAL=1) transparently swap it for a real
+# local bare-repo path the moment git itself is invoked -- there is no
+# real server anywhere in this test. gb_have_net still needs a REAL open
+# port to connect to, which is what gb_listener is for.
+t_run_integration_bare_repo() {
+	gb_listener 18492
+	_gl_pid="$GB_LISTENER_PID"
+	[ -n "$_gl_pid" ] || return 0
+	sleep 1
+
+	collect_fixture
+	GB_DEVICE=rt1
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n\toption proto static\n' >"$work/froot/etc/config/network"
+	chmod 0600 "$work/froot/etc/config/network"
+	printf 'config defaults\n\toption input ACCEPT\n' >"$work/froot/etc/config/firewall"
+	chmod 0644 "$work/froot/etc/config/firewall"
+	sysupgrade_list '/etc/config/network' '/etc/config/firewall'
+	printf "DISTRIB_RELEASE='25.12.4'\nDISTRIB_REVISION='r99999-deadbeef'\n" >"$work/froot/etc/openwrt_release"
+
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+
+	_gt_bare="$work/run-integration-bare.git"
+	rm -rf "$_gt_bare"
+	git init --bare -q "$_gt_bare"
+
+	GB_TEST_GIT_REMOTE_URL='https://127.0.0.1:18492/o/r.git'; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_gt_bare"; export GB_TEST_GIT_REMOTE_PATH
+	GB_TEST_SYSUPGRADE_B_LOG="$work/sysupgrade-b.log"; export GB_TEST_SYSUPGRADE_B_LOG
+	: >"$GB_TEST_SYSUPGRADE_B_LOG"
+
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL" \
+		'gitbackup.origin.acknowledged=1' 'gitbackup.main.archive=1'
+
+	# Acceptance criterion: "на роутере после прогона нет ни одного файла
+	# репозитория" -- $WORK is always under /tmp (never flash/USB) and its
+	# own `trap 'rm -rf "$WORK"' EXIT` is what has to make it disappear the
+	# moment `run` finishes, successful push or not. Counted before/after
+	# rather than a fixed path: WORK's own mktemp name is only known
+	# inside the child process this test never sees directly.
+	_gt_tmp_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'gitbackup.*' 2>/dev/null | grep -c .)
+
+	# --- run 1: creates the branch ---
+	out1=$(cli run 2>&1)
+	eq 'run 1 exits 0' '0' "$?"
+	contains 'and reports a push, not a stub or a skip' 'pushed' "$out1"
+
+	_gt_tmp_after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'gitbackup.*' 2>/dev/null | grep -c .)
+	eq 'run leaves nothing behind under /tmp once it is done (trap cleanup)' \
+		"$_gt_tmp_before" "$_gt_tmp_after"
+
+	_gt_log1=$(git --git-dir="$_gt_bare" log --oneline device/rt1 2>/dev/null)
+	_gt_count1=$(printf '%s\n' "$_gt_log1" | grep -c .)
+	eq 'run 1 creates exactly one commit on device/rt1' '1' "$_gt_count1"
+
+	_gt_subject1=$(git --git-dir="$_gt_bare" log -1 --format=%s device/rt1)
+	case "$_gt_subject1" in
+		[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9]:[0-9][0-9]\ rt1:*)
+			ok 'the subject starts with the backup date and time, then the device'
+			;;
+		*)
+			no 'the subject starts with the backup date and time, then the device' "$_gt_subject1"
+			;;
+	esac
+	_gt_body1=$(git --git-dir="$_gt_bare" log -1 --format=%b device/rt1)
+	# Alphabetical (_gb_run_changed_configs's own `sort -u`), not collection
+	# order: firewall before network.
+	contains 'the body names what changed' 'Changed: /etc/config/firewall, /etc/config/network' "$_gt_body1"
+	contains 'and the trigger (default: cron, schedule.sh'"'"'s own crontab line never passes --trigger)' 'Trigger: cron' "$_gt_body1"
+	contains 'and the OpenWrt release/revision from /etc/openwrt_release' 'OpenWrt: 25.12.4 r99999-deadbeef' "$_gt_body1"
+	contains 'and the device name again' 'Device: rt1' "$_gt_body1"
+
+	_gt_archive1=$(git --git-dir="$_gt_bare" cat-file -p device/rt1:devices/rt1/backup.tar.gz 2>/dev/null)
+	if [ -n "$_gt_archive1" ]; then
+		ok 'option archive 1 puts backup.tar.gz next to the backup'
+	else
+		no 'option archive 1 puts backup.tar.gz next to the backup' 'missing'
+	fi
+	_gt_barchive_calls1=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
+	eq 'sysupgrade -b was called once, for run 1' '1' "$_gt_barchive_calls1"
+
+	# --- run 2: nothing changed ---
+	out2=$(cli run 2>&1)
+	eq 'run 2 exits 0' '0' "$?"
+	contains 'and reports no changes, not a second push' 'no changes' "$out2"
+
+	_gt_count2=$(git --git-dir="$_gt_bare" log --oneline device/rt1 | grep -c .)
+	eq 'run 2 adds no commit -- idempotence' "$_gt_count1" "$_gt_count2"
+	_gt_barchive_calls2=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
+	eq 'and sysupgrade -b was NOT called again -- the archive is not rebuilt when unchanged' \
+		"$_gt_barchive_calls1" "$_gt_barchive_calls2"
+
+	# --- run 3: a chmod-only edit git itself would never see ---
+	chmod 0644 "$work/froot/etc/config/network"
+	out3=$(cli run 2>&1)
+	eq 'run 3 exits 0' '0' "$?"
+	contains 'and reports a new push -- manifest caught the chmod' 'pushed' "$out3"
+
+	_gt_count3=$(git --git-dir="$_gt_bare" log --oneline device/rt1 | grep -c .)
+	eq 'run 3 adds exactly one more commit' '2' "$_gt_count3"
+	_gt_mode3=$(git --git-dir="$_gt_bare" ls-tree device/rt1 devices/rt1/files/etc/config/network 2>/dev/null | awk '{print $1}')
+	eq 'and the pushed tree now carries the new mode' '100644' "$_gt_mode3"
+	_gt_barchive_calls3=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
+	if [ "$_gt_barchive_calls3" -gt "$_gt_barchive_calls2" ]; then
+		ok 'and the archive IS rebuilt on this real change'
+	else
+		no 'and the archive IS rebuilt on this real change' "call count stayed at $_gt_barchive_calls3"
+	fi
+
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_SYSUPGRADE_B_LOG
+	kill "$_gl_pid" 2>/dev/null
+	wait "$_gl_pid" 2>/dev/null
+}
+
+# t_cli_log -- A01: `gitbackup log` has to show the timings `run` itself
+# writes to syslog for collect/compare/push, since gb_log (lib.sh) is
+# their only record once a run finishes (state.json holds only the LATEST
+# run, tmpfs, gone on reboot; the recent history A01 asks for is exactly
+# what syslog already keeps). No `run` here -- this just proves cmd_log's
+# own logread wiring (tag filter, -e gitbackup, line count) against a
+# fixture log that already looks like what run's own timing line produces.
+t_cli_log() {
+	GB_TEST_LOGREAD="$work/logread-fixture"
+	cat >"$GB_TEST_LOGREAD" <<'EOF'
+Mon Jan  1 00:00:00 2026 daemon.info dnsmasq[1]: unrelated noise
+Mon Jan  1 00:00:01 2026 daemon.notice gitbackup: gitbackup run: timings -- collect 3s, compare 1s, push 2s
+Mon Jan  1 00:00:02 2026 daemon.notice gitbackup: gitbackup run: pushed abc123 to device/rt1
+EOF
+	export GB_TEST_LOGREAD
+	out=$(cli log 2>&1)
+	eq 'log exits 0' '0' "$?"
+	contains 'and shows a run'"'"'s collect/compare/push timings' 'timings -- collect 3s, compare 1s, push 2s' "$out"
+	contains 'and its push result' 'pushed abc123' "$out"
+	case "$out" in
+		*'unrelated noise'*) no 'and filters to the gitbackup tag, not the whole syslog' "$out" ;;
+		*) ok 'and filters to the gitbackup tag, not the whole syslog' ;;
+	esac
+	unset GB_TEST_LOGREAD
+}
+
 # --------------------------------------------------------------------------
 # packaging
 # --------------------------------------------------------------------------
@@ -2426,6 +3141,41 @@ t_config_sections_match_code() {
 		'' "$missing"
 }
 
+# t_no_untracked_files_in_package_tree -- D02: three waves of executors
+# have each left working litter (*.bak, a files/tmp/ scratch directory)
+# under package/gitbackup/files/, which `$(CP) ./files/* $(1)/`
+# (Makefile) / `files: ./dist/root` (owfeed.yml) would ship straight into
+# the .apk with no packaging step to notice. The fix is an explicit
+# allow-list rather than a pattern-based ignore (a glob for "*.bak" would
+# not have caught a stray files/tmp/ directory, which is exactly one of
+# the three incidents) -- any new file has to be named here in the same
+# change that adds it, gitio.sh (this ticket) included.
+t_no_untracked_files_in_package_tree() {
+	_gb_allow="$work/allowed-package-files.txt"
+	cat >"$_gb_allow" <<'EOF'
+etc/config/gitbackup
+etc/init.d/gitbackup
+etc/uci-defaults/99-gitbackup
+usr/sbin/gitbackup
+usr/share/gitbackup/askpass.sh
+usr/share/gitbackup/auth.sh
+usr/share/gitbackup/collect.sh
+usr/share/gitbackup/device.sh
+usr/share/gitbackup/exclude.list
+usr/share/gitbackup/gitio.sh
+usr/share/gitbackup/lib.sh
+usr/share/gitbackup/remoteurl.sh
+usr/share/gitbackup/schedule.sh
+usr/share/gitbackup/scrub.list
+usr/share/gitbackup/scrub.sh
+usr/share/gitbackup/visibility.sh
+EOF
+	_gb_stray=$(cd "$files" && find . -type f | sed 's#^\./##' | while IFS= read -r _gb_f; do
+		grep -qxF "$_gb_f" "$_gb_allow" || printf '%s\n' "$_gb_f"
+	done)
+	eq 'every file under package/gitbackup/files/ is on the explicit whitelist' '' "$_gb_stray"
+}
+
 t_no_bashisms() {
 	found=''
 	for f in "$share"/*.sh "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup" \
@@ -2443,6 +3193,9 @@ run_test 'lib.sh: gb_uci_get' t_uci_get
 run_test 'lib.sh: gb_free_kb' t_free_kb
 run_test 'lib.sh: gb_die' t_die
 run_test 'lib.sh: gb_have_net' t_have_net
+run_test 'lib.sh: gb_have_net against a real busybox-shaped nc (D01)' t_have_net_busybox_shape
+run_test 'lib.sh: gb_have_net does not hang past its own bound' t_have_net_bounded_timeout
+run_test 'lib.sh: gb_have_net leaks no watchdog process (owlab finding)' t_have_net_no_leaked_watchdog
 run_test 'device.sh: hostname strategy' t_device_hostname
 run_test 'device.sh: stock hostname is refused' t_device_hostname_default
 run_test 'device.sh: custom strategy' t_device_custom
@@ -2469,6 +3222,8 @@ run_test 'scrub.sh: openconnect OTP password and inline PEM key' t_scrub_opencon
 run_test 'scrub.sh: mwan3 has nothing to redact and is left alone' t_scrub_mwan3_has_nothing_to_redact
 run_test 'scrub.sh: a missing option is never fabricated' t_scrub_option_not_present_is_left_alone
 run_test 'scrub.sh: an overlapping list scrub_option default is not double-recorded' t_scrub_dedupes_overlapping_patterns
+run_test 'scrub.sh: hard-exclude pattern is not hijacked by a real glob match' \
+	t_scrub_hard_exclude_pattern_survives_a_real_glob_match
 run_test 'scrub.sh: public hard-exclude removes files no redaction can save' t_scrub_hard_exclude_public
 run_test 'scrub.sh: private tree is full because gb_scrub is never called' t_scrub_private_tree_untouched_by_not_scrubbing
 run_test 'remoteurl.sh: valid URL forms parse' t_remoteurl_valid_forms
@@ -2485,6 +3240,12 @@ run_test 'auth.sh: gb_keygen' t_auth_keygen
 run_test 'auth.sh: gb_pubkey' t_auth_pubkey
 run_test 'auth.sh: gb_accept_hostkey' t_auth_accept_hostkey
 run_test 'askpass.sh: answers prompts with the token' t_askpass
+run_test 'gitio.sh: gb_remote_head on a branchless repository' t_gitio_remote_head_no_branch
+run_test 'gitio.sh: gb_remote_head against an unreachable repository' t_gitio_remote_head_unreachable
+run_test 'gitio.sh: first commit on a new branch, no parent' t_gitio_first_commit_no_parent
+run_test 'gitio.sh: commit-tree works with no git identity configured (owlab finding)' t_gitio_commit_push_no_global_git_identity
+run_test 'gitio.sh: a shared branch preserves another device untouched' t_gitio_shared_branch_preserves_other_device
+run_test 'gitio.sh: non-fast-forward push is rejected, then retried once' t_gitio_commit_push_nonfastforward_then_retry
 run_test 'schedule.sh: gb_preset_expr is deterministic per device' t_schedule_preset_expr
 run_test 'schedule.sh: gb_cron_valid on hand-picked examples' t_schedule_cron_valid_examples
 run_test 'schedule.sh: gb_cron_valid against tests/fixtures/cron.tsv' t_schedule_cron_valid_fixtures
@@ -2508,10 +3269,15 @@ run_test 'cli: test -- host key declined' t_cli_test_hostkey_declined
 run_test 'cli: test -- accepted host key and working remote' t_cli_test_ok
 run_test 'cli: test -- credentials rejected' t_cli_test_auth_rejected
 run_test 'cli: keygen and pubkey need no remote configuration' t_cli_keygen_pubkey
+run_test 'cli: run -- a busy lock is skipped, not an error' t_cli_run_flock_busy
+run_test 'cli: run -- not enough space in /tmp' t_cli_run_space_check_fails
+run_test 'run: integration on a real local bare repository (3 runs)' t_run_integration_bare_repo
+run_test 'cli: log shows run timings (A01)' t_cli_log
 run_test 'packaging: Makefile contract' t_makefile_contract
 run_test 'packaging: config sections match code' t_config_sections_match_code
 run_test 'packaging: owfeed.yml matches Makefile' t_owfeed_yml_matches_makefile
 run_test 'packaging: no bashisms' t_no_bashisms
+run_test 'packaging: no untracked files under package/gitbackup/files (D02)' t_no_untracked_files_in_package_tree
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")

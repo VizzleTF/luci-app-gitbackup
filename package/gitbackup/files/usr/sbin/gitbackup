@@ -25,6 +25,21 @@ GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
 . "$GB_SHARE/visibility.sh"
 # shellcheck disable=SC1091
 . "$GB_SHARE/auth.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/collect.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/scrub.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/gitio.sh"
+# card.sh does not exist yet (ticket 09, bootstrap): cmd_run's own RECOVERY.md
+# step below checks for gb_card with `command -v` before calling it rather
+# than sourcing a file that is not there yet -- "ничего не устанавливать
+# молча" cuts both ways, this does not invent card.sh's API in the meantime
+# either.
+if [ -r "$GB_SHARE/card.sh" ]; then
+	# shellcheck disable=SC1091
+	. "$GB_SHARE/card.sh"
+fi
 
 usage() {
 	cat <<'EOF'
@@ -264,6 +279,384 @@ _gb_test_classify() {
 	esac
 }
 
+# ---------------------------------------------------------------------------
+# run (ticket 07, spec "Как коммит попадает в репозиторий без клона")
+# ---------------------------------------------------------------------------
+#
+# The 15-step algorithm split across two functions: cmd_run does steps 1-6
+# (flock, the network precheck, the /tmp working directory and its trap,
+# the space check, the visibility gate) -- everything that needs GB_URL in
+# its real, schema-valid form (gb_parse_url, gb_visibility_ok both die on
+# anything else) and that ends in "skipped, exit 0" far more often than it
+# reaches git at all. _gb_run_backup does steps 7-15 (collect, compare,
+# build, commit, push, state) and reads GB_URL only as an opaque string
+# handed straight to `git` -- it never re-parses it -- which is what makes
+# it callable on its own, against a real local bare repository, for
+# gitio.sh's own tests (interfaces.md: gitio.sh is the one module tested
+# against a real repo, not stubs).
+
+# _gb_run_estimate_kb -- the size, in kilobytes, of everything
+# `sysupgrade -l` would collect, read directly off the filesystem with no
+# copy yet (spec step 5 has to run BEFORE gb_collect ever touches /tmp).
+# Symlinks are skipped (their own size is a few bytes and does not matter
+# to a x2-plus-headroom estimate); a path sysupgrade -l names that is no
+# longer there simply contributes 0, same as gb_collect's own tolerance
+# for that case.
+_gb_run_estimate_kb() {
+	sysupgrade -l 2>/dev/null | while IFS= read -r _gb_p || [ -n "$_gb_p" ]; do
+		[ -n "$_gb_p" ] || continue
+		[ -f "$_gb_p" ] || continue
+		wc -c <"$_gb_p" 2>/dev/null
+	done | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}'
+}
+
+# _gb_run_join_comma -- reads lines on stdin, prints them comma-and-space
+# joined on one line, empty input producing empty output. Used for both the
+# subject's short device-config list and the body's full path list.
+_gb_run_join_comma() {
+	_gb_rjc_first=1
+	while IFS= read -r _gb_rjc_l || [ -n "$_gb_rjc_l" ]; do
+		[ -n "$_gb_rjc_l" ] || continue
+		if [ "$_gb_rjc_first" -eq 1 ]; then _gb_rjc_first=0; else printf ', '; fi
+		printf '%s' "$_gb_rjc_l"
+	done
+}
+
+# _gb_run_changed_configs <old-manifest-or-missing> <new-manifest>
+#
+# Prints the basenames (one per line, sorted, deduped) of every
+# /etc/config/* path whose manifest entry line differs between the two
+# files -- added, removed, or changed in any field (content OR mode/uid/
+# gid, so a chmod-only edit still shows up here, same as it already does
+# in gb_manifest_equal's own broader "did anything change" verdict). No
+# comm(1) (confirmed absent from the 25.12.4 image) and no diff(1)
+# dependency: concatenating both files' matching lines and keeping only the
+# ones sort+uniq -u find exactly once is the same "differs between the two
+# sets" test using only applets already in DEPENDS.
+_gb_run_changed_configs() {
+	_gb_rcc_old="$1"
+	_gb_rcc_new="$2"
+	{
+		[ -r "$_gb_rcc_old" ] && grep '"path":"/etc/config/' "$_gb_rcc_old"
+		grep '"path":"/etc/config/' "$_gb_rcc_new"
+	} 2>/dev/null | sort | uniq -u | sed -n 's#.*"path":"/etc/config/\([^"]*\)".*#\1#p' | sort -u
+}
+
+# _gb_run_write_message <msgfile> <trigger> <changed-list> <changed-count>
+#
+# Spec "Формат коммита": subject starts with the backup's own UTC date and
+# time (G03: readable straight out of a commit list on the web, no need to
+# open the commit), then the short device name, then up to three changed
+# config names -- "and N more" past that. Body: Changed (full
+# /etc/config/* paths), Trigger (this run's --trigger), OpenWrt (release +
+# revision straight out of /etc/openwrt_release, parsed with parameter
+# expansion rather than a quoting-fragile sed regex -- the file's own
+# `KEY='value'` shape needs nothing more), Device.
+_gb_run_write_message() {
+	_gb_rwm_file="$1"
+	_gb_rwm_trigger="$2"
+	_gb_rwm_list="$3"
+	_gb_rwm_count="$4"
+
+	_gb_rwm_when=$(date -u +'%Y-%m-%d %H:%M')
+
+	_gb_rwm_short=$(printf '%s\n' "$_gb_rwm_list" | sed -n '1,3p' | _gb_run_join_comma)
+	[ -n "$_gb_rwm_short" ] || _gb_rwm_short='config'
+	if [ "$_gb_rwm_count" -gt 3 ]; then
+		_gb_rwm_short="$_gb_rwm_short and $((_gb_rwm_count - 3)) more"
+	fi
+
+	_gb_rwm_paths=$(printf '%s\n' "$_gb_rwm_list" | sed -n '/./ s#^#/etc/config/#p' | _gb_run_join_comma)
+	[ -n "$_gb_rwm_paths" ] || _gb_rwm_paths='(no /etc/config/* entry changed)'
+
+	_gb_rwm_release=''
+	_gb_rwm_revision=''
+	_gb_rwm_relfile="${GB_ROOT:-}/etc/openwrt_release"
+	if [ -r "$_gb_rwm_relfile" ]; then
+		while IFS='=' read -r _gb_rwm_k _gb_rwm_v || [ -n "$_gb_rwm_k" ]; do
+			_gb_rwm_v="${_gb_rwm_v#\'}"
+			_gb_rwm_v="${_gb_rwm_v%\'}"
+			case "$_gb_rwm_k" in
+				DISTRIB_RELEASE) _gb_rwm_release="$_gb_rwm_v" ;;
+				DISTRIB_REVISION) _gb_rwm_revision="$_gb_rwm_v" ;;
+			esac
+		done <"$_gb_rwm_relfile"
+	fi
+
+	{
+		printf '%s %s: %s\n' "$_gb_rwm_when" "$GB_DEVICE" "$_gb_rwm_short"
+		printf '\n'
+		printf 'Changed: %s\n' "$_gb_rwm_paths"
+		printf 'Trigger: %s\n' "$_gb_rwm_trigger"
+		printf 'OpenWrt: %s %s\n' "$_gb_rwm_release" "$_gb_rwm_revision"
+		printf 'Device: %s\n' "$GB_DEVICE"
+	} >"$_gb_rwm_file"
+}
+
+# _gb_run_write_state <result> <reason> <commit-or-empty> [<timings-json>]
+#
+# Two files, spec step 15: GB_STATE_DIR/last_run is the one cmd_status
+# already reads back verbatim as its own "last_run" JSON field (ticket 01)
+# -- just a quoted timestamp string, nothing richer. GB_STATE_DIR/state.json
+# is the fuller record the spec itself asks for (result, reason, branch,
+# commit, per-stage timings) for a future status/overview screen; both are
+# tmpfs (git is the source of truth, spec: "Состояние в
+# /var/run/gitbackup/state.json (tmpfs); git -- источник истины") and
+# neither is ever read back by this CLI itself.
+_gb_run_write_state() {
+	_gb_rws_result="$1"
+	_gb_rws_reason="$2"
+	_gb_rws_commit="${3:-}"
+	_gb_rws_timings="${4:-{\"collect_s\":0,\"compare_s\":0,\"push_s\":0}}"
+
+	mkdir -p "$GB_STATE_DIR" 2>/dev/null
+	_gb_rws_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	printf '%s\n' "$(gb_json_str "$_gb_rws_now")" >"$GB_STATE_DIR/last_run" 2>/dev/null
+	{
+		printf '{\n'
+		printf '  "generated": %s,\n' "$(gb_json_str "$_gb_rws_now")"
+		printf '  "result": %s,\n' "$(gb_json_str "$_gb_rws_result")"
+		printf '  "reason": %s,\n' "$(gb_json_str "$_gb_rws_reason")"
+		printf '  "branch": %s,\n' "$(gb_json_str "${_gb_branch:-}")"
+		printf '  "commit": %s,\n' "$(gb_json_str "$_gb_rws_commit")"
+		printf '  "timings": %s\n' "$_gb_rws_timings"
+		printf '}\n'
+	} >"$GB_STATE_DIR/state.json" 2>/dev/null
+}
+
+# _gb_run_backup <trigger> -- spec steps 7-15, see this section's own
+# header comment for why this is split out of cmd_run.
+_gb_run_backup() {
+	_gb_trigger="$1"
+
+	_gb_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')")
+	_gb_prefix=$(gb_expand "$(gb_uci_get gitbackup.main.path_prefix 'devices/{device}')")
+	# shellcheck disable=SC2034  # read by gb_build_tree (gitio.sh) as an environment seam, not used in this file
+	GB_PREFIX="$_gb_prefix"
+
+	_gb_outdir="$WORK/tree"
+	_gb_repodir="$WORK/repo"
+	# gb_fetch_meta (gitio.sh) also does this, but only runs at all when a
+	# parent already exists -- a brand-new branch's first-ever backup has
+	# no parent to fetch, and gb_build_tree/gb_commit_push both still need
+	# a real .git here to run their own plumbing against.
+	[ -d "$_gb_repodir/.git" ] || git init -q "$_gb_repodir" ||
+		gb_die 1 "gitbackup run: git init $_gb_repodir failed"
+
+	# Step 7: collect, then scrub in place if this run's effective
+	# visibility=public forced it on (usr/sbin/gitbackup's own
+	# _gb_effective_scrub already resolved GB_SCRUB once, before cmd_run).
+	_gb_t_collect_start=$(date +%s)
+	gb_collect "$_gb_outdir" || gb_die 1 'gitbackup run: gb_collect failed'
+	if [ "$(gb_json_bool "$GB_SCRUB")" = true ]; then
+		gb_scrub "$_gb_outdir" 2>/dev/null | while IFS= read -r _gb_sl || [ -n "$_gb_sl" ]; do
+			[ -n "$_gb_sl" ] && gb_log info "gitbackup run: scrubbed $_gb_sl"
+		done
+	fi
+	_gb_t_collect_end=$(date +%s)
+
+	# Steps 8-10: who is the parent, what did it look like, did anything
+	# actually change. GB_PARENT (environment) is gitio.sh's own seam for
+	# gb_build_tree, not a positional argument -- see gitio.sh's header.
+	_gb_t_compare_start=$(date +%s)
+	GB_PARENT=$(gb_remote_head "$_gb_branch")
+	_gb_head_rc=$?
+	[ "$_gb_head_rc" -eq 0 ] || gb_die 3 "gitbackup run: could not reach $GB_URL to resolve $_gb_branch"
+
+	_gb_old_manifest="$WORK/old_manifest.json"
+	_gb_changed=1
+	if [ -n "$GB_PARENT" ]; then
+		gb_fetch_meta "$_gb_branch" "$_gb_repodir" ||
+			gb_die 3 "gitbackup run: could not fetch $_gb_branch metadata from $GB_URL"
+		if git --git-dir="$_gb_repodir/.git" cat-file -p "$GB_PARENT:$_gb_prefix/manifest.json" \
+			>"$_gb_old_manifest" 2>/dev/null; then
+			if gb_manifest_equal "$_gb_old_manifest" "$(gb_manifest_path "$_gb_outdir")"; then
+				_gb_changed=0
+			fi
+		fi
+	fi
+	_gb_t_compare_end=$(date +%s)
+	_gb_t_collect_s=$((_gb_t_collect_end - _gb_t_collect_start))
+	_gb_t_compare_s=$((_gb_t_compare_end - _gb_t_compare_start))
+
+	if [ "$_gb_changed" -eq 0 ]; then
+		gb_log notice "gitbackup run: no changes since the last backup on $_gb_branch"
+		printf 'no changes\n'
+		_gb_run_write_state ok no-changes "$GB_PARENT" \
+			"{\"collect_s\":$_gb_t_collect_s,\"compare_s\":$_gb_t_compare_s,\"push_s\":0}"
+		gb_log notice "gitbackup run: timings -- collect ${_gb_t_collect_s}s, compare ${_gb_t_compare_s}s, push 0s"
+		exit 0
+	fi
+
+	# 11a: the archive, only now that there is definitely something to
+	# push (spec: sysupgrade -b's own gzip is not deterministic byte for
+	# byte, so building it before the compare above would commit a diff
+	# every single run even when nothing on the router changed).
+	if [ "$(gb_json_bool "$(gb_uci_get gitbackup.main.archive 1)")" = true ]; then
+		sysupgrade -b "$_gb_outdir/backup.tar.gz" >/dev/null 2>&1 ||
+			gb_log warning 'gitbackup run: sysupgrade -b failed, continuing without backup.tar.gz'
+	fi
+
+	# 11b: the recovery card -- only once card.sh (ticket 09) exists; see
+	# this file's own sourcing block for why it is optional today.
+	if command -v gb_card >/dev/null 2>&1; then
+		gb_card "$_gb_outdir/RECOVERY.md" 2>/dev/null
+	fi
+
+	_gb_changed_list=$(_gb_run_changed_configs "$_gb_old_manifest" "$(gb_manifest_path "$_gb_outdir")")
+	_gb_changed_count=$(printf '%s\n' "$_gb_changed_list" | grep -c .)
+	_gb_msgfile="$WORK/commit-message"
+	_gb_run_write_message "$_gb_msgfile" "$_gb_trigger" "$_gb_changed_list" "$_gb_changed_count"
+
+	# Steps 11/12/13/14: build the tree, commit, push, retry once on a
+	# non-fast-forward (spec step 14) by re-resolving the parent and
+	# rebuilding the tree on top of it -- gb_build_tree's own GB_PARENT
+	# seam means this collected backup set ($_gb_outdir, untouched since
+	# step 7) does not need to be re-collected for the retry, only the git
+	# plumbing around it does.
+	_gb_t_push_start=$(date +%s)
+	_gb_attempt=1
+	while :; do
+		_gb_tree=$(gb_build_tree "$_gb_repodir" "$_gb_outdir")
+		[ -n "$_gb_tree" ] || gb_die 1 'gitbackup run: gb_build_tree failed'
+
+		_gb_commit=$(gb_commit_push "$_gb_repodir" "$_gb_tree" "$GB_PARENT" "$_gb_msgfile" "$_gb_branch")
+		_gb_push_rc=$?
+		case "$_gb_push_rc" in
+			0) break ;;
+			2)
+				if [ "$_gb_attempt" -ge 2 ]; then
+					gb_die 1 "gitbackup run: $_gb_branch changed again during the retry, giving up (spec step 14: one retry only)"
+				fi
+				gb_log notice "gitbackup run: $_gb_branch moved under us, retrying once"
+				_gb_attempt=2
+				GB_PARENT=$(gb_remote_head "$_gb_branch")
+				_gb_head_rc=$?
+				[ "$_gb_head_rc" -eq 0 ] || gb_die 3 "gitbackup run: could not re-resolve $_gb_branch for the retry"
+				gb_fetch_meta "$_gb_branch" "$_gb_repodir" ||
+					gb_die 3 "gitbackup run: could not re-fetch $_gb_branch metadata for the retry"
+				;;
+			1) gb_die 1 'gitbackup run: gb_commit_push could not build the commit, see log' ;;
+			*) gb_die 3 'gitbackup run: push failed, see log' ;;
+		esac
+	done
+	_gb_t_push_end=$(date +%s)
+	_gb_t_push_s=$((_gb_t_push_end - _gb_t_push_start))
+
+	gb_log notice "gitbackup run: pushed $_gb_commit to $_gb_branch"
+	printf 'pushed %s to %s\n' "$_gb_commit" "$_gb_branch"
+	_gb_run_write_state ok pushed "$_gb_commit" \
+		"{\"collect_s\":$_gb_t_collect_s,\"compare_s\":$_gb_t_compare_s,\"push_s\":$_gb_t_push_s}"
+	gb_log notice "gitbackup run: timings -- collect ${_gb_t_collect_s}s, compare ${_gb_t_compare_s}s, push ${_gb_t_push_s}s"
+}
+
+# cmd_run [--trigger cron|manual|procd|luci] -- spec steps 1-6, then hands
+# off to _gb_run_backup for the rest. The default trigger, "cron", is what
+# schedule.sh's own crontab line actually invokes (`gitbackup run` with no
+# flag at all, ticket 06) -- an explicit --trigger is how the other three
+# callers (a human at the CLI, procd's config_change, the LuCI rpcd bridge)
+# say which one they are.
+cmd_run() {
+	_gb_trigger=cron
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--trigger)
+				shift
+				[ "$#" -gt 0 ] && { _gb_trigger="$1"; shift; }
+				;;
+			--trigger=*) _gb_trigger="${1#--trigger=}"; shift ;;
+			*) shift ;;
+		esac
+	done
+
+	# Step 1: flock, non-blocking. Busybox flock's FD form (`flock -n 9`
+	# against an fd opened by this same shell's own `exec`) -- confirmed on
+	# the owlab stand's busybox 1.37.0 (`flock [-sxun] FD | { FILE ... }`).
+	# Locked -> skipped, exit 0: cron must not mail about an overlap that
+	# resolved itself (brief, verbatim: "flock /var/run/gitbackup.lock,
+	# занято -> выход 0, skipped").
+	_gb_lockfile="${GB_LOCK_FILE:-/var/run/gitbackup.lock}"
+	mkdir -p "$(dirname "$_gb_lockfile")" 2>/dev/null
+	exec 9>"$_gb_lockfile" || gb_die 1 "gitbackup run: cannot open lock file $_gb_lockfile"
+	if ! flock -n 9; then
+		gb_log notice 'gitbackup run: another run already holds the lock, skipped'
+		printf 'skipped: another run is already in progress\n'
+		exit 0
+	fi
+
+	# Step 3: a bounded reachability probe before anything else touches
+	# disk. gb_have_net (lib.sh, D01) is the fixed implementation.
+	_gb_parsed=$(gb_parse_url "$GB_URL") ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+	# shellcheck disable=SC2086  # word-splitting is the point: five fields from one line
+	set -- $_gb_parsed
+	_gb_scheme="$1"
+	_gb_host="$2"
+	_gb_port="$3"
+	_gb_netport="$_gb_port"
+	if [ "$_gb_netport" = 0 ]; then
+		if [ "$_gb_scheme" = ssh ]; then _gb_netport=22; else _gb_netport=443; fi
+	fi
+	if ! gb_have_net "$_gb_host" "$_gb_netport"; then
+		gb_log notice "gitbackup run: $_gb_host:$_gb_netport unreachable, skipped"
+		printf 'skipped: %s is unreachable\n' "$_gb_host"
+		exit 0
+	fi
+
+	# Step 4: everything from here on lives under /tmp -- never flash,
+	# never USB ("качать репозиторий на роутер вообще нельзя") -- and is
+	# gone the moment this process ends: $WORK holds a full plaintext
+	# backup set and, briefly, credentials.
+	WORK=$(mktemp -d "${TMPDIR:-/tmp}/gitbackup.XXXXXX") ||
+		gb_die 1 'gitbackup run: cannot create a working directory under /tmp'
+	trap 'rm -rf "$WORK"' EXIT INT TERM
+
+	# Step 5: space, checked before anything is actually collected.
+	_gb_set_kb=$(_gb_run_estimate_kb)
+	_gb_need_kb=$((_gb_set_kb * 2 + 1024))
+	# The same directory $WORK was just created under, not a hardcoded
+	# "/tmp": they must agree, or a TMPDIR override (tests/run.sh's own
+	# seam, since /tmp itself is shared and not size-controllable in a
+	# unit test) would check one filesystem while actually writing to
+	# another.
+	_gb_free_kb=$(gb_free_kb "${TMPDIR:-/tmp}")
+	case "$_gb_free_kb" in '' | *[!0-9]*) _gb_free_kb=0 ;; esac
+	if [ "$_gb_free_kb" -lt "$_gb_need_kb" ]; then
+		gb_die 1 "gitbackup run: not enough space in /tmp -- need ~${_gb_need_kb} KB (backup set ~${_gb_set_kb} KB x2 + 1024 KB headroom), have ${_gb_free_kb} KB free; reduce the backup set (e.g. gitbackup.main.archive='0', or trim the sysupgrade path list) or free up /tmp"
+	fi
+
+	# Step 6: the visibility gate. Code 3 ("could not verify") is treated
+	# exactly like "no network" above -- skipped, not a hard failure, spec
+	# "Гейт видимости": "Сеть недоступна или API ответило 5xx -- прогон
+	# завершается skipped, а не «считаем приватным»". A confirmed-public
+	# repository (4) is the one outcome that is never silent.
+	gb_visibility_ok "$GB_URL"
+	case $? in
+		4) gb_die 4 "$GB_URL is publicly visible to an anonymous request; push refused" ;;
+		3)
+			gb_log notice "gitbackup run: could not verify whether $GB_URL is public, skipped"
+			printf 'skipped: could not verify repository visibility\n'
+			exit 0
+			;;
+	esac
+
+	eval "$(gb_git_env)"
+
+	_gb_run_backup "$_gb_trigger"
+}
+
+# cmd_log [lines] -- A01: syslog is the log (lib.sh's own gb_log header
+# comment -- logread survives a reboot, a plain variable does not), so
+# `gitbackup log` is a thin, tag-filtered read of it. run's own gb_log
+# calls above (collect/compare/push timings, skip/refuse reasons, retry
+# notices) are what actually show up here; this command adds no format of
+# its own to keep in sync with them.
+cmd_log() {
+	_gb_lines="${1:-50}"
+	case "$_gb_lines" in '' | *[!0-9]*) _gb_lines=50 ;; esac
+	logread -e gitbackup 2>/dev/null | tail -n "$_gb_lines"
+}
+
 [ "$#" -ge 1 ] || { usage; exit 0; }
 
 cmd="$1"
@@ -298,7 +691,17 @@ case "$cmd" in
 		gb_validate_config
 		cmd_test
 		;;
-	run|collect|diff|paths|restore|card|log)
+	run)
+		gb_validate_config
+		cmd_run "$@"
+		;;
+	log)
+		# No gb_validate_config: reading the log back is a diagnostic that
+		# has to work even on a router whose config is not fully set up yet
+		# (same reasoning as status/keygen/pubkey above).
+		cmd_log "$@"
+		;;
+	collect|diff|paths|restore|card)
 		gb_validate_config
 		# Honest placeholders: exit 1 and say so, rather than a stub that
 		# pretends to have run. Each lands in its own ticket.
