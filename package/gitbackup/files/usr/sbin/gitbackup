@@ -33,6 +33,8 @@ GB_STATE_DIR="${GB_STATE_DIR:-/var/run/gitbackup}"
 . "$GB_SHARE/gitio.sh"
 # shellcheck disable=SC1091
 . "$GB_SHARE/restore.sh"
+# shellcheck disable=SC1091
+. "$GB_SHARE/paths.sh"
 # card.sh does not exist yet (ticket 09, bootstrap): cmd_run's own RECOVERY.md
 # step below checks for gb_card with `command -v` before calling it rather
 # than sourcing a file that is not there yet -- "ничего не устанавливать
@@ -55,7 +57,7 @@ Commands:
   keygen     generate the SSH deploy key
   pubkey     print the deploy key's public key
   test       verify connectivity and remote configuration
-  paths      list the effective sysupgrade paths
+  paths      list|add|del -- edit /etc/sysupgrade.conf
   restore    restore configuration from a commit
   card       print a recovery card
   log        show recent gitbackup log entries
@@ -296,21 +298,6 @@ _gb_test_classify() {
 # it callable on its own, against a real local bare repository, for
 # gitio.sh's own tests (interfaces.md: gitio.sh is the one module tested
 # against a real repo, not stubs).
-
-# _gb_run_estimate_kb -- the size, in kilobytes, of everything
-# `sysupgrade -l` would collect, read directly off the filesystem with no
-# copy yet (spec step 5 has to run BEFORE gb_collect ever touches /tmp).
-# Symlinks are skipped (their own size is a few bytes and does not matter
-# to a x2-plus-headroom estimate); a path sysupgrade -l names that is no
-# longer there simply contributes 0, same as gb_collect's own tolerance
-# for that case.
-_gb_run_estimate_kb() {
-	sysupgrade -l 2>/dev/null | while IFS= read -r _gb_p || [ -n "$_gb_p" ]; do
-		[ -n "$_gb_p" ] || continue
-		[ -f "$_gb_p" ] || continue
-		wc -c <"$_gb_p" 2>/dev/null
-	done | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}'
-}
 
 # _gb_run_join_comma -- reads lines on stdin, prints them comma-and-space
 # joined on one line, empty input producing empty output. Used for both the
@@ -614,7 +601,10 @@ cmd_run() {
 	trap 'rm -rf "$WORK"' EXIT INT TERM
 
 	# Step 5: space, checked before anything is actually collected.
-	_gb_set_kb=$(_gb_run_estimate_kb)
+	# gb_paths_size_kb (paths.sh, ticket 17) -- shared with `gitbackup
+	# paths`'s own 2 MB warning so the two can never disagree about what
+	# "the size of the backup set" means.
+	_gb_set_kb=$(gb_paths_size_kb)
 	_gb_need_kb=$((_gb_set_kb * 2 + 1024))
 	# The same directory $WORK was just created under, not a hardcoded
 	# "/tmp": they must agree, or a TMPDIR override (tests/run.sh's own
@@ -685,6 +675,312 @@ cmd_restore() {
 	exit $?
 }
 
+# ---------------------------------------------------------------------------
+# collect (ticket 17) -- a thin wrapper over gb_collect (collect.sh), the
+# same function _gb_run_backup's own step 7 already calls. Exists so the
+# backup set and manifest.json can be inspected on demand -- a dry run of
+# `run`'s own first half, with nothing pushed and nothing scrubbed (scrub
+# is `run`'s own decision to make on a real push, not this command's).
+# ---------------------------------------------------------------------------
+cmd_collect() {
+	_gb_c_out=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--out) shift; _gb_c_out="${1:-}"; shift ;;
+			--out=*) _gb_c_out="${1#--out=}"; shift ;;
+			*) shift ;;
+		esac
+	done
+	[ -n "$_gb_c_out" ] || gb_die 2 'gitbackup collect: --out DIR is required'
+
+	mkdir -p "$_gb_c_out" || gb_die 1 "gitbackup collect: cannot create $_gb_c_out"
+	gb_collect "$_gb_c_out" || gb_die 1 'gitbackup collect: gb_collect failed'
+	printf 'collected backup set into %s\n' "$_gb_c_out"
+}
+
+# ---------------------------------------------------------------------------
+# diff (ticket 17, D03) -- current configuration vs. the last commit on
+# this device's own branch. The one rule this command exists to enforce:
+# the source of truth is manifest.json, field by field, NEVER `git status`
+# or a checkout -- git stores exactly three file modes (100644/100755/
+# 120000) and has no idea a 644->640 chmod on otherwise-identical content
+# ever happened, which is exactly the gap D03/ticket 17 was opened to
+# close (spec: "Источником решения обязан быть манифест... манифест ловит
+# смену прав, которую git не видит вовсе").
+#
+# Reuses exactly the fetch-the-parent's-manifest trick _gb_run_backup's
+# own steps 8-10 already use (gb_remote_head, then gb_fetch_meta's
+# blob:none partial fetch, then one lazy `git cat-file -p
+# <parent>:<prefix>/manifest.json`) -- never a clone, same rule the rest
+# of this file follows. No branch yet (first-ever backup) reads as
+# "everything currently collected is new", not an error.
+# ---------------------------------------------------------------------------
+
+# _gb_diff_each_entry <manifest> <callback> -- calls "<callback> <obj>"
+# once per entries[] item, unindented, trailing comma stripped -- same
+# one-object-per-line shape collect.sh's own gb_manifest_equal and
+# restore.sh's own _gb_restore_each_entry already rely on. A missing or
+# unreadable <manifest> (a brand-new branch has no old one) simply calls
+# the callback zero times rather than erroring -- both dump helpers below
+# handle "no entries" as "empty file", which is exactly what a fresh
+# device's first `diff` needs.
+_gb_diff_each_entry() {
+	_gb_de_manifest="$1"
+	_gb_de_cb="$2"
+	_gb_de_in=0
+	[ -r "$_gb_de_manifest" ] || return 0
+	while IFS= read -r _gb_de_line || [ -n "$_gb_de_line" ]; do
+		case "$_gb_de_line" in
+			'  "entries": ['*) _gb_de_in=1; continue ;;
+			'  ],') _gb_de_in=0; continue ;;
+		esac
+		[ "$_gb_de_in" -eq 1 ] || continue
+		_gb_de_obj="${_gb_de_line%,}"
+		_gb_de_obj="${_gb_de_obj#    }"
+		[ -n "$_gb_de_obj" ] || continue
+		"$_gb_de_cb" "$_gb_de_obj"
+	done <"$_gb_de_manifest"
+}
+
+# _gb_diff_json_str/_gb_diff_json_num <object> <field> -- same two small
+# readers restore.sh's own _gb_restore_json_str/_gb_restore_json_num
+# already are, reimplemented here rather than shared: both modules keep
+# their own private helpers by convention (scrub.sh's header comment),
+# every *.sh here ending up sourced into one process.
+_gb_diff_json_str() {
+	_gb_djs_obj="$1"
+	_gb_djs_field="$2"
+	case "$_gb_djs_obj" in
+		*'"'"$_gb_djs_field"'":"'*)
+			_gb_djs_v="${_gb_djs_obj#*\""$_gb_djs_field"\":\"}"
+			_gb_djs_v="${_gb_djs_v%%\"*}"
+			printf '%s' "$_gb_djs_v" | sed 's/\\"/"/g; s/\\\\/\\/g'
+			;;
+		*) printf '' ;;
+	esac
+}
+
+_gb_diff_json_num() {
+	_gb_djn_obj="$1"
+	_gb_djn_field="$2"
+	case "$_gb_djn_obj" in
+		*'"'"$_gb_djn_field"'":'*)
+			_gb_djn_v="${_gb_djn_obj#*\""$_gb_djn_field"\":}"
+			_gb_djn_v="${_gb_djn_v%%[,\}]*}"
+			printf '%s' "$_gb_djn_v"
+			;;
+		*) printf '' ;;
+	esac
+}
+
+# _gb_diff_dump_line/_gb_diff_dump <manifest> <outfile> -- writes one
+# "<path>\t<object>" line per entry to <outfile>, sorted by path. JSON
+# entries never carry a raw tab (paths are filesystem paths; gb_json_esc,
+# collect.sh's own writer, only ever escapes '"' and '\'), so splitting on
+# \t below is safe for every value this package's own manifests ever
+# produce.
+_gb_diff_dump_line() {
+	_gb_dd_obj="$1"
+	_gb_dd_path=$(_gb_diff_json_str "$_gb_dd_obj" path)
+	[ -n "$_gb_dd_path" ] && printf '%s\t%s\n' "$_gb_dd_path" "$_gb_dd_obj" >>"$_gb_dd_out"
+}
+#
+# Sorted via plain redirection into a SEPARATE temp file, never
+# `sort -o <outfile> <outfile>` -- confirmed live on the owlab 25.12.4
+# stand: this busybox `sort` treats `-o FILE` as a no-op and prints the
+# sorted result to STDOUT regardless (the file itself is left completely
+# untouched). `_gb_run_backup`'s own caller never redirects _gb_diff_dump's
+# stdout anywhere, so that sorted content leaked straight into `gitbackup
+# diff`'s own output, ahead of the real report -- measured directly: a
+# 37-entry manifest produced 74 lines, the first 37 being this leak. GNU/
+# BSD sort's own -o writes to the file as documented, which is why this
+# never showed up on the host.
+_gb_diff_dump() {
+	_gb_dd_out="$2"
+	: >"$_gb_dd_out"
+	_gb_diff_each_entry "$1" _gb_diff_dump_line
+	_gb_dd_sorted="${_gb_dd_out}.sorted.$$"
+	sort "$_gb_dd_out" >"$_gb_dd_sorted" 2>/dev/null
+	mv "$_gb_dd_sorted" "$_gb_dd_out"
+}
+
+# _gb_diff_describe_change <old-obj> <new-obj> <path> -- prints one "~"
+# line naming every field that actually differs between two entries with
+# the same path: type, mode, uid, gid, content (sha256, named rather than
+# shown -- a raw hash is not useful to a human reading this), and a
+# symlink's target. This is the line that makes a chmod-only edit visible
+# at all (spec's own headline example, and the one D03/ticket 17 exists to
+# fix) -- mode is compared exactly like every other field, not skipped as
+# "cosmetic".
+_gb_diff_describe_change() {
+	_gb_ddc_old="$1"
+	_gb_ddc_new="$2"
+	_gb_ddc_path="$3"
+	_gb_ddc_parts=''
+
+	_gb_ddc_ot=$(_gb_diff_json_str "$_gb_ddc_old" type)
+	_gb_ddc_nt=$(_gb_diff_json_str "$_gb_ddc_new" type)
+	[ "$_gb_ddc_ot" = "$_gb_ddc_nt" ] || _gb_ddc_parts="$_gb_ddc_parts type $_gb_ddc_ot->$_gb_ddc_nt;"
+
+	_gb_ddc_om=$(_gb_diff_json_num "$_gb_ddc_old" mode)
+	_gb_ddc_nm=$(_gb_diff_json_num "$_gb_ddc_new" mode)
+	[ "$_gb_ddc_om" = "$_gb_ddc_nm" ] || _gb_ddc_parts="$_gb_ddc_parts mode $_gb_ddc_om->$_gb_ddc_nm;"
+
+	_gb_ddc_ou=$(_gb_diff_json_num "$_gb_ddc_old" uid)
+	_gb_ddc_nu=$(_gb_diff_json_num "$_gb_ddc_new" uid)
+	[ "$_gb_ddc_ou" = "$_gb_ddc_nu" ] || _gb_ddc_parts="$_gb_ddc_parts uid $_gb_ddc_ou->$_gb_ddc_nu;"
+
+	_gb_ddc_og=$(_gb_diff_json_num "$_gb_ddc_old" gid)
+	_gb_ddc_ng=$(_gb_diff_json_num "$_gb_ddc_new" gid)
+	[ "$_gb_ddc_og" = "$_gb_ddc_ng" ] || _gb_ddc_parts="$_gb_ddc_parts gid $_gb_ddc_og->$_gb_ddc_ng;"
+
+	_gb_ddc_osha=$(_gb_diff_json_str "$_gb_ddc_old" sha256)
+	_gb_ddc_nsha=$(_gb_diff_json_str "$_gb_ddc_new" sha256)
+	[ "$_gb_ddc_osha" = "$_gb_ddc_nsha" ] || _gb_ddc_parts="$_gb_ddc_parts content changed;"
+
+	_gb_ddc_otgt=$(_gb_diff_json_str "$_gb_ddc_old" target)
+	_gb_ddc_ntgt=$(_gb_diff_json_str "$_gb_ddc_new" target)
+	[ "$_gb_ddc_otgt" = "$_gb_ddc_ntgt" ] || _gb_ddc_parts="$_gb_ddc_parts symlink target $_gb_ddc_otgt->$_gb_ddc_ntgt;"
+
+	[ -n "$_gb_ddc_parts" ] && printf '~ %s:%s\n' "$_gb_ddc_path" "$_gb_ddc_parts"
+}
+
+# _gb_diff_compare <old.tsv> <new.tsv> -- the union of both files' own
+# paths (sorted, deduped), one exact-match awk lookup per side per path
+# (no `join`(1): interfaces.md's own DEPENDS never promises one, and this
+# suite's own host confirms it is not always there either) -- print
+# "added"/"removed" for a path on only one side, hand a path on both sides
+# to _gb_diff_describe_change, which prints nothing at all when every
+# field still matches. No output whatsoever means no differences, exactly
+# what "diff на неизменившейся системе печатает пустой результат" asks
+# for -- there is no separate "unchanged" branch to keep in sync with this
+# one.
+_gb_diff_compare() {
+	_gb_dc_old="$1"
+	_gb_dc_new="$2"
+	{ cut -f1 "$_gb_dc_old" 2>/dev/null; cut -f1 "$_gb_dc_new" 2>/dev/null; } | sort -u |
+		while IFS= read -r _gb_dc_p || [ -n "$_gb_dc_p" ]; do
+			[ -n "$_gb_dc_p" ] || continue
+			_gb_dc_o=$(awk -F'\t' -v p="$_gb_dc_p" '$1==p{print $2; exit}' "$_gb_dc_old" 2>/dev/null)
+			_gb_dc_n=$(awk -F'\t' -v p="$_gb_dc_p" '$1==p{print $2; exit}' "$_gb_dc_new" 2>/dev/null)
+			if [ -z "$_gb_dc_o" ] && [ -n "$_gb_dc_n" ]; then
+				printf '+ %s (%s)\n' "$_gb_dc_p" "$(_gb_diff_json_str "$_gb_dc_n" type)"
+			elif [ -n "$_gb_dc_o" ] && [ -z "$_gb_dc_n" ]; then
+				printf -- '- %s (%s)\n' "$_gb_dc_p" "$(_gb_diff_json_str "$_gb_dc_o" type)"
+			elif [ "$_gb_dc_o" != "$_gb_dc_n" ]; then
+				_gb_diff_describe_change "$_gb_dc_o" "$_gb_dc_n" "$_gb_dc_p"
+			fi
+		done
+}
+
+cmd_diff() {
+	_gb_d_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')")
+	_gb_d_prefix=$(gb_expand "$(gb_uci_get gitbackup.main.path_prefix 'devices/{device}')")
+
+	_gb_d_work=$(mktemp -d "${TMPDIR:-/tmp}/gitbackup-diff.XXXXXX") ||
+		gb_die 1 'gitbackup diff: cannot create a working directory under /tmp'
+	trap 'rm -rf "$_gb_d_work"' EXIT INT TERM
+
+	eval "$(gb_git_env)"
+
+	_gb_d_parent=$(gb_remote_head "$_gb_d_branch")
+	_gb_d_head_rc=$?
+	[ "$_gb_d_head_rc" -eq 0 ] || gb_die 3 "gitbackup diff: could not reach $GB_URL to resolve $_gb_d_branch"
+
+	_gb_d_outdir="$_gb_d_work/tree"
+	gb_collect "$_gb_d_outdir" || gb_die 1 'gitbackup diff: gb_collect failed'
+	if [ "$(gb_json_bool "$GB_SCRUB")" = true ]; then
+		# Same reasoning as _gb_run_backup's own scrub step: comparing an
+		# unscrubbed local tree against a manifest that was scrubbed before
+		# it was ever pushed would report every scrubbed field as "changed"
+		# on every single call.
+		gb_scrub "$_gb_d_outdir" >/dev/null 2>&1
+	fi
+
+	_gb_d_old_manifest="$_gb_d_work/old_manifest.json"
+	: >"$_gb_d_old_manifest"
+	if [ -n "$_gb_d_parent" ]; then
+		_gb_d_repodir="$_gb_d_work/repo"
+		gb_fetch_meta "$_gb_d_branch" "$_gb_d_repodir" ||
+			gb_die 3 "gitbackup diff: could not fetch $_gb_d_branch metadata from $GB_URL"
+		git --git-dir="$_gb_d_repodir/.git" cat-file -p "$_gb_d_parent:$_gb_d_prefix/manifest.json" \
+			>"$_gb_d_old_manifest" 2>/dev/null
+	fi
+
+	_gb_d_old_tsv="$_gb_d_work/old.tsv"
+	_gb_d_new_tsv="$_gb_d_work/new.tsv"
+	_gb_diff_dump "$_gb_d_old_manifest" "$_gb_d_old_tsv"
+	_gb_diff_dump "$(gb_manifest_path "$_gb_d_outdir")" "$_gb_d_new_tsv"
+
+	_gb_diff_compare "$_gb_d_old_tsv" "$_gb_d_new_tsv"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# paths (ticket 17, spec "LuCI -> Paths") -- list|add|del over
+# /etc/sysupgrade.conf, backed entirely by paths.sh (gb_paths_list/
+# gb_paths_add/gb_paths_del/gb_paths_size_kb/gb_paths_validate). Not
+# gated by gb_validate_config, unlike collect/diff/card above: managing
+# the extra-paths list has nothing to do with whether a remote is
+# configured yet, and a freshly installed router (no gitbackup.origin.url
+# at all) must still be able to use it -- gb_validate_config would refuse
+# that with exit 2 for a reason this command does not share.
+# ---------------------------------------------------------------------------
+cmd_paths() {
+	_gb_p_sub="${1:-list}"
+	[ "$#" -gt 0 ] && shift
+
+	case "$_gb_p_sub" in
+		list)
+			gb_paths_list
+			printf '# total: %s KB (effective sysupgrade set, sysupgrade -l)\n' "$(gb_paths_size_kb)"
+			;;
+		add)
+			_gb_p_path="${1:-}"
+			[ -n "$_gb_p_path" ] || gb_die 2 'gitbackup paths add: a path is required'
+			_gb_p_err=$(gb_paths_add "$_gb_p_path" 2>&1)
+			_gb_p_rc=$?
+			if [ "$_gb_p_rc" -eq 0 ]; then
+				printf 'added %s\n' "$_gb_p_path"
+			else
+				gb_die "$_gb_p_rc" "gitbackup paths add: $_gb_p_err"
+			fi
+			;;
+		del)
+			_gb_p_path="${1:-}"
+			[ -n "$_gb_p_path" ] || gb_die 2 'gitbackup paths del: a path is required'
+			gb_paths_del "$_gb_p_path"
+			printf 'removed %s\n' "$_gb_p_path"
+			;;
+		*)
+			gb_die 2 "gitbackup paths: unknown subcommand '$_gb_p_sub' (expected list, add or del)"
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# card (ticket 17) -- a thin wrapper over gb_card (card.sh, ticket 09).
+# gb_card itself never dies and always returns 0 (its own header comment);
+# the only failure this wrapper can actually report is card.sh not being
+# installed at all.
+# ---------------------------------------------------------------------------
+cmd_card() {
+	_gb_cd_out=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--out) shift; _gb_cd_out="${1:-}"; shift ;;
+			--out=*) _gb_cd_out="${1#--out=}"; shift ;;
+			*) shift ;;
+		esac
+	done
+	[ -n "$_gb_cd_out" ] || gb_die 2 'gitbackup card: --out FILE is required'
+	command -v gb_card >/dev/null 2>&1 ||
+		gb_die 1 'gitbackup card: the recovery card generator (card.sh) is not installed on this system'
+
+	gb_card "$_gb_cd_out"
+	printf 'wrote recovery card to %s\n' "$_gb_cd_out"
+}
+
 # cmd_log [lines] -- A01: syslog is the log (lib.sh's own gb_log header
 # comment -- logread survives a reboot, a plain variable does not), so
 # `gitbackup log` is a thin, tag-filtered read of it. run's own gb_log
@@ -744,11 +1040,17 @@ case "$cmd" in
 	restore)
 		cmd_restore "$@"
 		;;
-	collect|diff|paths|card)
+	collect|diff|card)
 		gb_validate_config
-		# Honest placeholders: exit 1 and say so, rather than a stub that
-		# pretends to have run. Each lands in its own ticket.
-		gb_die 1 "$cmd: not implemented yet"
+		case "$cmd" in
+			collect) cmd_collect "$@" ;;
+			diff) cmd_diff ;;
+			card) cmd_card "$@" ;;
+		esac
+		;;
+	paths)
+		# No gb_validate_config -- see cmd_paths's own header comment.
+		cmd_paths "$@"
 		;;
 	*)
 		usage >&2

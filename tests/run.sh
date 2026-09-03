@@ -35,7 +35,7 @@ only="${1:-}"
 # A missing module has to stop the run here. Every test body is a subshell, and
 # a failed `.` inside one kills that subshell without asserting anything -- the
 # suite would report "0 failed" for code that does not exist.
-for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$share/restore.sh" "$share/card.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup" "$files/usr/libexec/rpcd/luci.gitbackup"; do
+for module in "$share/lib.sh" "$share/device.sh" "$share/collect.sh" "$share/scrub.sh" "$share/remoteurl.sh" "$share/visibility.sh" "$share/auth.sh" "$share/askpass.sh" "$share/schedule.sh" "$share/gitio.sh" "$share/restore.sh" "$share/card.sh" "$share/paths.sh" "$files/usr/sbin/gitbackup" "$files/etc/init.d/gitbackup" "$files/usr/libexec/rpcd/luci.gitbackup"; do
 	[ -r "$module" ] || { printf 'missing: %s\n' "$module" >&2; exit 1; }
 done
 
@@ -545,6 +545,29 @@ if [ "$rc" -ne 0 ]; then
 	printf '%s\n' "${GB_TEST_GIT_ERR:-git stub: authentication failed}" >&2
 fi
 exit "$rc"
+STUB
+
+cat >"$work/bin/sort" <<'STUB'
+#!/bin/sh
+# Test double for the one busybox sort(1) quirk ticket 17's own diff work
+# actually hit live on the owlab 25.12.4 stand: `sort -o FILE FILE` (the
+# SAME path as both the -o target and the sole input) is a no-op for -o on
+# that busybox -- it sorts and prints to STDOUT same as no -o at all, and
+# leaves FILE completely untouched. GNU/BSD sort's own -o (this host)
+# writes to the file as documented, so nothing here ever exercised that
+# path without this stub -- confirmed by cmd_diff's own former
+# `sort -o "$_gb_dd_out" "$_gb_dd_out"` leaking 37 sorted lines straight
+# into `gitbackup diff`'s own stdout, ahead of the real report, the first
+# time this ran on real hardware. Reproduces exactly that one shape;
+# everything else (a plain sort, `sort -u`, `-o` with two DIFFERENT
+# files, ...) passes straight through to the host's own real sort(1),
+# same "translate on request, defer otherwise" convention the stat/df
+# stubs above already use.
+if [ "$#" -eq 3 ] && [ "$1" = "-o" ] && [ "$2" = "$3" ]; then
+	command -p sort "$2"
+	exit 0
+fi
+command -p sort "$@"
 STUB
 
 cat >"$work/bin/df" <<'STUB'
@@ -3201,6 +3224,104 @@ t_schedule_cron_apply_bad_cron_expr() {
 }
 
 # --------------------------------------------------------------------------
+# paths.sh (ticket 17, spec "LuCI -> Paths", "Проверенные факты 25.12.4 ->
+# sysupgrade")
+# --------------------------------------------------------------------------
+
+# paths_fixture -- a fake router filesystem under $work/paths-root and a
+# fresh GB_SYSUPGRADE_CONF under $work, pointed at by GB_ROOT/
+# GB_SYSUPGRADE_CONF -- gb_paths_validate's own existence check and
+# gb_paths_size_kb's own sysupgrade -l walk both go through GB_ROOT, same
+# seam collect.sh already uses, so a test never touches the real host
+# filesystem.
+paths_fixture() {
+	rm -rf "$work/paths-root"
+	mkdir -p "$work/paths-root/etc/config"
+	: >"$work/paths-root/etc/config/network"
+	GB_ROOT="$work/paths-root"; export GB_ROOT
+	GB_SYSUPGRADE_CONF="$work/paths-sysupgrade.conf"; export GB_SYSUPGRADE_CONF
+	rm -f "$GB_SYSUPGRADE_CONF"
+}
+
+t_paths_validate_blacklist() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		gb_paths_validate '/etc/gitbackup/token' 2>/dev/null
+		eq '/etc/gitbackup/** is refused for safety (exit 4)' '4' "$?"
+		gb_paths_validate '/proc/cpuinfo' 2>/dev/null
+		eq '/proc/* is refused for safety (exit 4)' '4' "$?"
+		gb_paths_validate '/sys/class' 2>/dev/null
+		eq '/sys/* is refused for safety (exit 4)' '4' "$?"
+		gb_paths_validate '/tmp/x' 2>/dev/null
+		eq '/tmp/* is refused for safety (exit 4)' '4' "$?"
+
+		_reason=$(gb_paths_validate '/etc/gitbackup/token' 2>&1)
+		eq 'and a reason is printed, not a silent refusal' '1' "$([ -n "$_reason" ] && echo 1 || echo 0)"
+	)
+}
+
+# t_paths_validate_space_and_missing -- the other half of "paths add
+# отклоняет несуществующий путь, путь с пробелом" (ticket 17): both are
+# plain bad-argument refusals (exit 2), distinct from the fixed-blacklist
+# refusals above (exit 4) -- gb_paths_validate's own return code is what a
+# caller uses to pick gb_die's exit status without reclassifying it.
+t_paths_validate_space_and_missing() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		gb_paths_validate '/etc/config/has space' 2>/dev/null
+		eq 'a path with a space is refused (exit 2 -- sysupgrade cannot support it)' '2' "$?"
+		gb_paths_validate '/etc/config/does-not-exist' 2>/dev/null
+		eq 'a nonexistent path is refused (exit 2)' '2' "$?"
+		gb_paths_validate 'relative/path' 2>/dev/null
+		eq 'a relative path is refused (exit 2)' '2' "$?"
+		gb_paths_validate '/etc/config/network' 2>/dev/null
+		eq 'an existing, absolute, unlisted path is accepted' '0' "$?"
+	)
+}
+
+t_paths_add_del_idempotent() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		gb_paths_add '/etc/config/network'
+		eq 'add succeeds' '0' "$?"
+		gb_paths_add '/etc/config/network'
+		eq 'adding the same path again is a no-op, not a duplicate' '0' "$?"
+		eq 'the file has exactly one line' '1' "$(grep -c . "$GB_SYSUPGRADE_CONF")"
+
+		gb_paths_add '/proc/cpuinfo' 2>/dev/null
+		eq 'a blacklisted add is refused' '4' "$?"
+		eq 'and never reaches the file' '0' "$(grep -c '/proc' "$GB_SYSUPGRADE_CONF")"
+
+		gb_paths_del '/etc/config/network'
+		eq 'del succeeds' '0' "$?"
+		eq 'the line is gone' '0' "$(grep -c . "$GB_SYSUPGRADE_CONF")"
+		gb_paths_del '/etc/config/network'
+		eq 'deleting an absent path again is a no-op, not an error' '0' "$?"
+	)
+}
+
+t_paths_list_and_size() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+		awk 'BEGIN{for(i=0;i<2048;i++)printf "a"}' >"$work/paths-root/etc/config/network"
+		printf '/etc/config/network\n' >"$GB_SYSUPGRADE_CONF"
+		GB_TEST_SYSUPGRADE_L="$work/paths-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+		printf '/etc/config/network\n' >"$GB_TEST_SYSUPGRADE_L"
+
+		eq 'gb_paths_list prints the raw sysupgrade.conf content' '/etc/config/network' "$(gb_paths_list)"
+		eq 'gb_paths_size_kb ceils a 2048-byte effective set to 2 KB' '2' "$(gb_paths_size_kb)"
+		unset GB_TEST_SYSUPGRADE_L
+	)
+}
+
+# --------------------------------------------------------------------------
 # etc/init.d/gitbackup
 # --------------------------------------------------------------------------
 
@@ -3272,12 +3393,15 @@ t_cli_usage() {
 	contains 'including the ones not written yet' 'restore' "$out"
 }
 
-t_cli_not_implemented() {
-	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		'gitbackup.origin.url=https://example.org/o/r.git'
-	out=$(cli collect 2>&1)
-	eq 'an unwritten subcommand exits 1' '1' "$?"
-	contains 'and says so instead of pretending' 'not implemented' "$out"
+# t_cli_unknown_command -- ticket 17 closed the last of R89's eleven
+# subcommands (collect/diff/paths/card, formerly "not implemented yet"
+# placeholders in this same dispatch's default case) -- what is left of
+# that branch is exactly what it always was underneath: a name that is
+# not a subcommand at all.
+t_cli_unknown_command() {
+	out=$(cli frobnicate 2>&1)
+	eq 'an unknown subcommand exits 1' '1' "$?"
+	contains 'and says so' "unknown command 'frobnicate'" "$out"
 }
 
 t_cli_status_json() {
@@ -3720,6 +3844,219 @@ EOF
 		*) ok 'and filters to the gitbackup tag, not the whole syslog' ;;
 	esac
 	unset GB_TEST_LOGREAD
+}
+
+# --------------------------------------------------------------------------
+# cli: collect, paths, card, diff (ticket 17)
+# --------------------------------------------------------------------------
+
+# t_cli_collect -- a thin wrapper over gb_collect, already proven correct
+# by collect.sh's own test section above; this only has to prove the CLI
+# actually reaches it and writes to the directory named on the command
+# line, and refuses without one (spec/ticket 17: "collect --out DIR --
+# обёртка над готовым gb_collect").
+t_cli_collect() {
+	collect_fixture
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+
+	out=$(cli collect --out "$work/cli-collect-out" 2>&1)
+	eq 'collect --out DIR exits 0' '0' "$?"
+	contains 'and reports where it wrote' "$work/cli-collect-out" "$out"
+	eq 'and a manifest.json actually exists there' '1' \
+		"$([ -r "$work/cli-collect-out/manifest.json" ] && echo 1 || echo 0)"
+	contains 'and the file itself was copied into files/' 'config interface lan' \
+		"$(cat "$work/cli-collect-out/files/etc/config/network" 2>/dev/null)"
+
+	out=$(cli collect 2>&1)
+	eq 'collect with no --out is refused, exit 2' '2' "$?"
+}
+
+# t_cli_card -- a thin wrapper over gb_card (card.sh, ticket 09), already
+# proven correct by card.sh's own test section below; this only has to
+# prove the CLI writes gb_card's output to the named file and refuses
+# without one.
+t_cli_card() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+
+	out=$(cli card --out "$work/cli-card-out.md" 2>&1)
+	eq 'card --out FILE exits 0' '0' "$?"
+	contains 'and reports where it wrote' "$work/cli-card-out.md" "$out"
+	_gb_card_text=$(cat "$work/cli-card-out.md" 2>/dev/null)
+	contains 'the card names the device' 'rt1' "$_gb_card_text"
+	contains 'and is gb_card'\''s own document, not a stub' 'gitbackup recovery card' "$_gb_card_text"
+
+	out=$(cli card 2>&1)
+	eq 'card with no --out is refused, exit 2' '2' "$?"
+}
+
+# t_cli_paths_list_add_del -- ticket 17's own acceptance criteria for
+# `paths`: works with no remote configured at all (unlike collect/diff/
+# card above, `paths` is NOT gated by gb_validate_config -- see cmd_paths's
+# own header comment), list prints the real file plus a size line, add/del
+# actually edit /etc/sysupgrade.conf, and the blacklist/space/missing-path
+# refusals every carry a reason and the right exit code.
+t_cli_paths_list_add_del() {
+	rm -rf "$work/cli-paths-root"
+	mkdir -p "$work/cli-paths-root/etc/config"
+	: >"$work/cli-paths-root/etc/config/dhcp"
+	GB_ROOT="$work/cli-paths-root"; export GB_ROOT
+	GB_SYSUPGRADE_CONF="$work/cli-sysupgrade.conf"; export GB_SYSUPGRADE_CONF
+	rm -f "$GB_SYSUPGRADE_CONF"
+	GB_TEST_SYSUPGRADE_L="$work/cli-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+	: >"$GB_TEST_SYSUPGRADE_L"
+	fixture
+
+	out=$(cli paths add /etc/config/dhcp 2>&1)
+	eq 'paths add on a fresh install (no origin.url at all) exits 0' '0' "$?"
+	contains 'and confirms' 'added /etc/config/dhcp' "$out"
+
+	out=$(cli paths list 2>&1)
+	contains 'paths list prints the file content' '/etc/config/dhcp' "$out"
+	contains 'and a total-size line for the UI'\''s 2 MB warning' 'total:' "$out"
+
+	out=$(cli paths add /proc/cpuinfo 2>&1)
+	eq 'paths add on the fixed blacklist exits 4' '4' "$?"
+	contains 'with an explanation, not silently' 'not a real filesystem path' "$out"
+
+	out=$(cli paths add '/etc/config/has space' 2>&1)
+	eq 'paths add with a space in the path exits 2 (sysupgrade cannot support it)' '2' "$?"
+
+	out=$(cli paths add /etc/config/does-not-exist 2>&1)
+	eq 'paths add for a nonexistent path exits 2' '2' "$?"
+
+	out=$(cli paths del /etc/config/dhcp 2>&1)
+	eq 'paths del exits 0' '0' "$?"
+	out=$(cli paths list 2>&1)
+	case "$out" in
+		*'/etc/config/dhcp'*) no 'the path is actually gone from sysupgrade.conf, not just reported removed' "still present: [$out]" ;;
+		*) ok 'the path is actually gone from sysupgrade.conf, not just reported removed' ;;
+	esac
+
+	unset GB_ROOT GB_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
+}
+
+# diff_seed_push <bare-repo> <branch> <tree-dir> -- commits <tree-dir>'s
+# own content under devices/rt1/ as the sole commit on <branch>, with
+# plain git (fixture setup, not the code under test -- same reasoning
+# restore_seed_push's own header comment already gives). <tree-dir> is
+# expected to be gb_collect's own real output, never a hand-typed
+# manifest -- cmd_diff's field-by-field comparison has to be checked
+# against exactly what collect.sh actually writes.
+diff_seed_push() {
+	_dsp_bare="$1"
+	_dsp_branch="$2"
+	_dsp_tree="$3"
+	rm -rf "$work/diff-seed-co"
+	git init -q "$work/diff-seed-co"
+	mkdir -p "$work/diff-seed-co/devices/rt1"
+	cp -R "$_dsp_tree/." "$work/diff-seed-co/devices/rt1/"
+	git -C "$work/diff-seed-co" -c user.name=t -c user.email=t@t.test add -A >/dev/null 2>&1
+	git -C "$work/diff-seed-co" -c user.name=t -c user.email=t@t.test commit -q -m seed >/dev/null 2>&1
+	git -C "$work/diff-seed-co" push -q "$_dsp_bare" "HEAD:refs/heads/$_dsp_branch" >/dev/null 2>&1
+}
+
+# diff_setup -- collect_fixture's own fake router filesystem plus a fresh
+# real local bare repository. cmd_diff's own gb_validate_config never
+# parses GB_URL (unlike cmd_run/cmd_test's gb_parse_url/gb_visibility_ok),
+# so a plain filesystem path is already a valid gitbackup.origin.url here
+# -- no GB_TEST_GIT_REMOTE_URL/PATH swap needed, unlike
+# t_run_integration_bare_repo. Sets $_diff_bare for the calling test.
+diff_setup() {
+	collect_fixture
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+	_diff_bare="$work/diff-bare.git"
+	rm -rf "$_diff_bare"
+	git init --bare -q "$_diff_bare"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$_diff_bare" 'gitbackup.origin.branch=device/{device}' \
+		'gitbackup.main.path_prefix=devices/{device}'
+}
+
+diff_teardown() {
+	unset GB_TEST_GIT_REAL
+}
+
+# t_cli_diff_no_prior_backup -- the branch does not exist yet (first-ever
+# backup): everything currently collected reads as new, not an error.
+t_cli_diff_no_prior_backup() {
+	diff_setup
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+
+	out=$(cli diff 2>&1)
+	eq 'diff with no backup pushed yet exits 0' '0' "$?"
+	contains 'and reports the current config as entirely new' '+ /etc/config/network (file)' "$out"
+
+	diff_teardown
+}
+
+# t_cli_diff_unchanged_is_empty -- ticket 17's own acceptance criterion:
+# "diff на неизменившейся системе печатает пустой результат и выходит 0".
+t_cli_diff_unchanged_is_empty() {
+	diff_setup
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	chmod 0644 "$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+
+	(
+		. "$share/lib.sh"; . "$share/device.sh"; . "$share/collect.sh"
+		GB_DEVICE=rt1
+		gb_collect "$work/diff-seed-tree"
+	)
+	diff_seed_push "$_diff_bare" device/rt1 "$work/diff-seed-tree"
+
+	out=$(cli diff 2>&1)
+	eq 'diff on an unchanged system exits 0' '0' "$?"
+	eq 'and prints nothing at all' '' "$out"
+
+	diff_teardown
+}
+
+# t_cli_diff_catches_permission_and_membership_changes -- ticket 17's own
+# headline acceptance criterion (D03): a chmod-only edit is invisible to
+# git (same blob, same tree entry mode class -- 100644 either way) but
+# MUST show up here, because the source of truth is manifest.json's own
+# mode field, never `git status`/a checkout. Bundled with an added and a
+# removed file in the same run so all three shapes (`+`/`-`/`~`) are
+# proven against one real backup-set comparison instead of three
+# redundant fixtures.
+t_cli_diff_catches_permission_and_membership_changes() {
+	diff_setup
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	chmod 0644 "$work/froot/etc/config/network"
+	printf 'config dhcp lan\n' >"$work/froot/etc/config/dhcp"
+	chmod 0644 "$work/froot/etc/config/dhcp"
+	sysupgrade_list '/etc/config/network' '/etc/config/dhcp'
+
+	(
+		. "$share/lib.sh"; . "$share/device.sh"; . "$share/collect.sh"
+		GB_DEVICE=rt1
+		gb_collect "$work/diff-seed-tree"
+	)
+	diff_seed_push "$_diff_bare" device/rt1 "$work/diff-seed-tree"
+
+	# Now: chmod network (git-invisible), remove dhcp, add wireless.
+	chmod 0600 "$work/froot/etc/config/network"
+	rm -f "$work/froot/etc/config/dhcp"
+	printf 'config wifi-device radio0\n' >"$work/froot/etc/config/wireless"
+	sysupgrade_list '/etc/config/network' '/etc/config/wireless'
+
+	out=$(cli diff 2>&1)
+	eq 'diff exits 0 even though real differences were found' '0' "$?"
+	contains 'a chmod-only edit git itself never sees is caught via the manifest'\''s own mode field' \
+		'mode 644->600' "$out"
+	contains 'a removed path is reported' '- /etc/config/dhcp (file)' "$out"
+	contains 'an added path is reported' '+ /etc/config/wireless (file)' "$out"
+
+	diff_teardown
 }
 
 # --------------------------------------------------------------------------
@@ -4295,6 +4632,7 @@ usr/share/gitbackup/device.sh
 usr/share/gitbackup/exclude.list
 usr/share/gitbackup/gitio.sh
 usr/share/gitbackup/lib.sh
+usr/share/gitbackup/paths.sh
 usr/share/gitbackup/remoteurl.sh
 usr/share/gitbackup/restore.sh
 usr/share/gitbackup/schedule.sh
@@ -4394,10 +4732,14 @@ run_test 'schedule.sh: gb_cron_valid against tests/fixtures/cron.tsv' t_schedule
 run_test 'schedule.sh: gb_cron_next' t_schedule_cron_next
 run_test 'schedule.sh: gb_cron_apply is idempotent and off removes the line' t_schedule_cron_apply_idempotent
 run_test 'schedule.sh: gb_cron_apply on an unrunnable cron_expr' t_schedule_cron_apply_bad_cron_expr
+run_test 'paths.sh: gb_paths_validate against the fixed blacklist' t_paths_validate_blacklist
+run_test 'paths.sh: gb_paths_validate on a space and a nonexistent path' t_paths_validate_space_and_missing
+run_test 'paths.sh: gb_paths_add/gb_paths_del are idempotent' t_paths_add_del_idempotent
+run_test 'paths.sh: gb_paths_list and gb_paths_size_kb' t_paths_list_and_size
 run_test 'init.d/gitbackup: backed-up package list from sysupgrade -l' t_init_backed_up_packages
 run_test 'init.d/gitbackup: config_change debounces a burst into one run' t_init_config_change_debounces
 run_test 'cli: usage' t_cli_usage
-run_test 'cli: unwritten subcommands' t_cli_not_implemented
+run_test 'cli: unknown subcommand' t_cli_unknown_command
 run_test 'cli: status json' t_cli_status_json
 run_test 'cli: status on the default config' t_cli_status_default_config
 run_test 'cli: configuration validation' t_cli_validation
@@ -4415,6 +4757,12 @@ run_test 'cli: run -- a busy lock is skipped, not an error' t_cli_run_flock_busy
 run_test 'cli: run -- not enough space in /tmp' t_cli_run_space_check_fails
 run_test 'run: integration on a real local bare repository (3 runs)' t_run_integration_bare_repo
 run_test 'cli: log shows run timings (A01)' t_cli_log
+run_test 'cli: collect --out DIR' t_cli_collect
+run_test 'cli: card --out FILE' t_cli_card
+run_test 'cli: paths list/add/del' t_cli_paths_list_add_del
+run_test 'cli: diff -- no prior backup shows everything as new' t_cli_diff_no_prior_backup
+run_test 'cli: diff -- unchanged system prints nothing' t_cli_diff_unchanged_is_empty
+run_test 'cli: diff -- catches a chmod git cannot see, plus added/removed paths (D03)' t_cli_diff_catches_permission_and_membership_changes
 run_test 'card.sh: https remote recommends --token, not --ssh-key' t_card_https_token_flag
 run_test 'card.sh: ssh remote recommends --ssh-key, web link coerced to https' t_card_ssh_key_flag
 run_test 'card.sh: never leaks the token or deploy key onto the card' t_card_no_secret

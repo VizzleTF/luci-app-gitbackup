@@ -1,0 +1,156 @@
+# shellcheck shell=sh
+#
+# gitbackup -- Paths: the /etc/sysupgrade.conf editor (ticket 17, spec
+# "Paths", "Сбор и manifest.json", "Проверенные факты 25.12.4 -> sysupgrade").
+#
+# The whole point (spec, verbatim): "Расширение списка -- редактирование
+# /etc/sysupgrade.conf, а не отдельный UCI-список. То, что пользователь
+# добавил ради бэкапа, автоматически переживёт реальный sysupgrade." This
+# module owns that file, its blacklist, and the effective-set size
+# estimate; usr/sbin/gitbackup's `paths` subcommand is its only caller
+# today, but nothing here assumes that -- a future rpcd method could call
+# these same functions instead of re-deriving the blacklist a second time.
+#
+# GB_SYSUPGRADE_CONF overrides the file this module reads/writes (default
+# /etc/sysupgrade.conf) -- the same override name
+# usr/libexec/rpcd/luci.gitbackup's own gbrpc_set_paths already uses for
+# the identical file. GB_ROOT overrides the filesystem root existence
+# checks resolve against, same convention collect.sh/restore.sh already
+# use, so tests can point this at a fixture tree instead of the host
+# filesystem.
+#
+# Depends on lib.sh (gb_log) already being sourced by the caller, same
+# convention every sibling module here uses. Sourced, never executed:
+# nothing here runs at load time -- both variable defaults below are cheap
+# parameter expansions, not commands.
+
+GB_SYSUPGRADE_CONF="${GB_SYSUPGRADE_CONF:-/etc/sysupgrade.conf}"
+GB_ROOT="${GB_ROOT:-}"
+
+# gb_paths_list -- the raw content of GB_SYSUPGRADE_CONF, one line per
+# call. This is deliberately NOT sysupgrade -l's own wider effective set
+# (spec: that is GB_SYSUPGRADE_CONF union /lib/upgrade/keep.d/* union
+# changed conffiles) -- a package's own paths editor has nothing to add or
+# remove from the other two sources, so listing them here would be lines
+# `paths del` could never actually delete. gb_paths_size_kb below is the
+# one place the wider effective set matters.
+gb_paths_list() {
+	[ -r "$GB_SYSUPGRADE_CONF" ] && cat "$GB_SYSUPGRADE_CONF"
+	return 0
+}
+
+# gb_paths_size_kb -- kilobytes of everything `sysupgrade -l` would
+# actually collect (the full effective set: GB_SYSUPGRADE_CONF union
+# keep.d union changed conffiles -- the union sysupgrade itself computes,
+# not just this file's own lines), read straight off the filesystem with
+# no copy made. Moved here from usr/sbin/gitbackup's own former
+# _gb_run_estimate_kb (ticket 07) so `run`'s pre-flight space check and
+# `paths`'s own 2 MB warning threshold (spec "LuCI -> Paths": "Счётчик
+# суммарного размера набора с предупреждением на 2 MB") can never quietly
+# disagree about what "the size of the backup set" means. Symlinks are
+# skipped (their own size is a few bytes and does not matter to either
+# caller's headroom math); a path sysupgrade -l names that is no longer
+# there contributes 0, same tolerance gb_collect already has for that
+# case.
+gb_paths_size_kb() {
+	sysupgrade -l 2>/dev/null | while IFS= read -r _gb_pkb_p || [ -n "$_gb_pkb_p" ]; do
+		[ -n "$_gb_pkb_p" ] || continue
+		[ -f "$GB_ROOT$_gb_pkb_p" ] || continue
+		wc -c <"$GB_ROOT$_gb_pkb_p" 2>/dev/null
+	done | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}'
+}
+
+# gb_paths_validate <path>
+#
+# 0 when <path> may be added to GB_SYSUPGRADE_CONF; on refusal, prints one
+# human-readable reason to stderr and returns a code from this package's
+# own shared contract (interfaces.md "Коды выхода") -- 2 for a plain bad
+# argument (not absolute, contains a space, does not exist), 4 for a
+# refusal on safety grounds (the fixed blacklist) -- so a caller can pass
+# the return value straight to gb_die without having to reclassify it.
+#
+# Checked in the order a human would want to hear about it: absolute
+# first (everything below assumes that), then the one syntactic limit
+# `sysupgrade -l`'s own `find` invocation imposes (spec "Проверенные
+# факты 25.12.4 -> sysupgrade": "пути с пробелами не поддерживаются
+# конструктивно"), then the fixed blacklist (never configurable -- ticket
+# 17's own brief: "запрет на /etc/gitbackup/**, /proc, /sys, /tmp"), and
+# only last whether the path actually exists -- there is no point telling
+# an operator their entry is missing from disk before telling them it was
+# never going to be accepted at all.
+gb_paths_validate() {
+	_gb_pv_path="$1"
+
+	case "$_gb_pv_path" in
+		/*) ;;
+		*)
+			printf '%s: not an absolute path\n' "$_gb_pv_path" >&2
+			return 2
+			;;
+	esac
+
+	case "$_gb_pv_path" in
+		*' '*)
+			printf '%s: contains a space -- sysupgrade.conf lines become find(1) arguments and cannot quote one\n' "$_gb_pv_path" >&2
+			return 2
+			;;
+	esac
+
+	case "$_gb_pv_path" in
+		/etc/gitbackup | /etc/gitbackup/*)
+			printf '%s: reserved for gitbackup itself\n' "$_gb_pv_path" >&2
+			return 4
+			;;
+		/proc | /proc/*)
+			printf '%s: not a real filesystem path\n' "$_gb_pv_path" >&2
+			return 4
+			;;
+		/sys | /sys/*)
+			printf '%s: not a real filesystem path\n' "$_gb_pv_path" >&2
+			return 4
+			;;
+		/tmp | /tmp/*)
+			printf '%s: cleared on every reboot\n' "$_gb_pv_path" >&2
+			return 4
+			;;
+	esac
+
+	# -e alone misses a dangling symlink (lstat vs stat) -- and this
+	# backup set is full of legitimate ones, /etc/resolv.conf being the
+	# standard example (collect.sh's own R24.1 comment) -- so -L is
+	# checked too before refusing.
+	if [ ! -e "$GB_ROOT$_gb_pv_path" ] && [ ! -L "$GB_ROOT$_gb_pv_path" ]; then
+		printf '%s: no such file or directory\n' "$_gb_pv_path" >&2
+		return 2
+	fi
+
+	return 0
+}
+
+# gb_paths_add <path> -- appends <path> to GB_SYSUPGRADE_CONF unless
+# gb_paths_validate refuses it (its own reason already on stderr by then,
+# its return code propagated unchanged) or it is already there verbatim
+# (idempotent: spec/ticket 17 "add/del правят именно его, идемпотентно" --
+# running add twice must not duplicate the line).
+gb_paths_add() {
+	_gb_pa_path="$1"
+	gb_paths_validate "$_gb_pa_path" || return $?
+
+	if [ -r "$GB_SYSUPGRADE_CONF" ] && grep -qxF "$_gb_pa_path" "$GB_SYSUPGRADE_CONF" 2>/dev/null; then
+		return 0
+	fi
+	mkdir -p "$(dirname "$GB_SYSUPGRADE_CONF")" 2>/dev/null
+	printf '%s\n' "$_gb_pa_path" >>"$GB_SYSUPGRADE_CONF"
+}
+
+# gb_paths_del <path> -- removes every line equal to <path>, verbatim.
+# Silently succeeds when it was not there to begin with -- same
+# idempotence gb_paths_add already provides, in the other direction.
+gb_paths_del() {
+	_gb_pd_path="$1"
+	[ -r "$GB_SYSUPGRADE_CONF" ] || return 0
+
+	_gb_pd_tmp="${GB_SYSUPGRADE_CONF}.tmp.$$"
+	grep -vxF "$_gb_pd_path" "$GB_SYSUPGRADE_CONF" >"$_gb_pd_tmp" 2>/dev/null
+	mv "$_gb_pd_tmp" "$GB_SYSUPGRADE_CONF"
+}
