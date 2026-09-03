@@ -340,6 +340,38 @@ gbrpc_diff() {
 	_gb_rpc_text diff "$_gb_rpc_out"
 }
 
+# gbrpc_config_diff -- "has the LIVE config drifted from the last commit",
+# which the two-sha `diff` above cannot answer (that one compares two
+# already-committed shas, ticket 14/R124 History). This wraps `gitbackup
+# diff` (usr/sbin/gitbackup's cmd_diff, ticket 17) instead: it re-collects
+# the current backup set and compares its manifest against the manifest of
+# the last commit pushed to this device's own branch, field by field --
+# catching a chmod/chown that `git diff`/`git status` never sees at all
+# (same blob, same tree entry mode class). No params; `gitbackup diff`
+# itself resolves the branch/prefix from UCI exactly like `run` does.
+#
+# `gitbackup diff` prints nothing at all when there is no difference (its
+# own documented contract) and returns 0 either way once the comparison
+# ran; a nonzero exit only ever means it could not even get as far as
+# comparing (gb_die: bad config, exit 2; unreachable remote, exit 3) --
+# turned into the same { "reason": ... } shape every other method here
+# uses, never a bare exit code, so the overview indicator can tell "no
+# drift" apart from "could not check" instead of defaulting either one to
+# "all saved".
+gbrpc_config_diff() {
+	_gb_rpc_out=$("$GB_BIN" diff 2>&1)
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -ne 0 ]; then
+		_gb_rpc_error "$_gb_rpc_out"
+		return 0
+	fi
+	if [ -n "$_gb_rpc_out" ]; then
+		printf '{ "differs": true, "text": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
+	else
+		printf '{ "differs": false, "text": "" }\n'
+	fi
+}
+
 # gbrpc_audit_paths -- G02: what changed on this router since the base
 # image but is NOT in the backup set. /overlay/upper is the standard
 # OpenWrt overlayfs upper layer (everything the running system has written
@@ -582,6 +614,7 @@ case "${1:-}" in
 	"status": {},
 	"log": { "lines": 0 },
 	"diff": { "from": "", "to": "" },
+	"config_diff": {},
 	"pubkey": {},
 	"list_paths": {},
 	"history": { "limit": 0 },
@@ -615,6 +648,7 @@ EOF
 			status) gbrpc_status ;;
 			log) gbrpc_log "$_gb_rpc_input" ;;
 			diff) gbrpc_diff "$_gb_rpc_input" ;;
+			config_diff) gbrpc_config_diff ;;
 			pubkey) gbrpc_pubkey ;;
 			list_paths) gbrpc_list_paths ;;
 			history) gbrpc_history "$_gb_rpc_input" ;;

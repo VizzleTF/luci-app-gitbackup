@@ -18,11 +18,16 @@
 
 // ---------------------------------------------------------------------
 // rpcd bindings -- every object/method/param name below is copied from
-// root/usr/share/rpcd/acl.d/luci-app-gitbackup.json (ticket 10, not
-// modified here) and from usr/libexec/rpcd/luci.gitbackup's own gbrpc_*
-// handlers (package/gitbackup, also out of this ticket's zone). Nothing
-// invented: `history`, `log`, `run`, `test` and `card` are exactly the
-// four read methods and one of the two write methods this view uses.
+// root/usr/share/rpcd/acl.d/luci-app-gitbackup.json and from
+// usr/libexec/rpcd/luci.gitbackup's own gbrpc_* handlers (package/
+// gitbackup). Nothing invented: `history`, `log`, `run`, `test`, `card`
+// and `config_diff` are exactly the read methods and one of the two
+// write methods this view uses. `config_diff` (gbrpc_config_diff) is a
+// thin JSON wrapper around `gitbackup diff` (usr/sbin/gitbackup's own
+// cmd_diff) -- it re-collects the current backup set and compares its
+// manifest against the last commit's, field by field, so it catches a
+// chmod/chown `git status`/`git diff` never sees at all (same blob, same
+// tree entry mode class either way).
 // ---------------------------------------------------------------------
 
 var callStatus = rpc.declare({
@@ -40,6 +45,11 @@ var callHistory = rpc.declare({
 	object: 'luci.gitbackup',
 	method: 'history',
 	params: [ 'limit' ]
+});
+
+var callConfigDiff = rpc.declare({
+	object: 'luci.gitbackup',
+	method: 'config_diff'
 });
 
 var callValidateCron = rpc.declare({
@@ -155,20 +165,23 @@ function gbCommitUrl(parsed, provider, sha) {
 }
 
 // ---------------------------------------------------------------------
-// Log classification -- both "результат последнего прогона" and the
-// "конфигурация разошлась с последним коммитом" indicator are read out of
-// the same `log` text (usr/sbin/gitbackup's cmd_log, a tag-filtered
-// `logread`), not out of a dedicated field: no rpcd method returns a
-// live "current manifest differs from HEAD" verdict (that would need a
-// fresh, non-destructive `collect` run on the router, which neither the
-// CLI -- `collect`/`diff` are still "not implemented yet" placeholders,
-// confirmed by reading usr/sbin/gitbackup's own dispatch -- nor the rpcd
-// plugin expose). What every completed `run` DOES leave behind is one of
-// a small, fixed set of gb_log lines (usr/sbin/gitbackup, cmd_run/
-// _gb_run_backup), so this reads the most recent one instead of
-// fabricating a precision the backend cannot provide. "synced: true"
-// means exactly "the config matched the last commit AS OF that
-// completed run" -- not a live, still-current guarantee.
+// Log classification -- "результат последнего прогона" (what the last
+// completed `run` actually did: pushed, found nothing new, was blocked,
+// skipped, failed) is read out of the `log` text (usr/sbin/gitbackup's
+// cmd_log, a tag-filtered `logread`), not out of a dedicated field: what
+// every completed `run` leaves behind is one of a small, fixed set of
+// gb_log lines (usr/sbin/gitbackup, cmd_run/_gb_run_backup), so this
+// reads the most recent one instead of inventing a structured result the
+// backend does not produce.
+//
+// This is deliberately NOT how the live "has the config drifted from the
+// last commit" indicator is computed any more -- that one used to be
+// approximated from this same log line (a completed run's outcome, as of
+// whenever that run finished) for lack of anything better, which could
+// not reflect a single change made on the router afterward. It now comes
+// from a dedicated, always-current check instead: see
+// gbConfigDiffView/refreshConfigDiff below, backed by the config_diff
+// rpcd method.
 // ---------------------------------------------------------------------
 
 function gbClassifyLog(text) {
@@ -389,6 +402,38 @@ function gbHistoryView(historyRes, remoteUrl, provider) {
 	};
 }
 
+// gbConfigDiffView <res> -- pure view-model for the config_diff rpcd
+// answer (`{ differs: bool, text: ... }` on success, `{ reason: ... }` on
+// failure -- gbrpc_config_diff, package/gitbackup). Unlike gbClassifyLog
+// above, a missing/failed answer must NOT read as "all saved": that would
+// misreport "could not check" as the one state operators most need to
+// trust (spec: "если метод недоступен или упал, индикатор обязан честно
+// сказать «не удалось проверить»"), so both "the call itself rejected"
+// (res === null, this view's own L.resolveDefault fallback) and "the
+// method ran but answered an error object" (res.reason) share the same
+// "could not check" branch below, rendered with the neutral/warn dot,
+// never the ok one.
+function gbConfigDiffView(res) {
+	if (!res || typeof res.differs !== 'boolean')
+		return {
+			text: (res && res.reason) ?
+				_('Could not check: %s').format(res.reason) :
+				_('Could not check whether the configuration has changed.'),
+			dotClass: 'gitbackup-dot gitbackup-dot-warn'
+		};
+
+	if (res.differs)
+		return {
+			text: _('The configuration has changed since the last commit.'),
+			dotClass: 'gitbackup-dot gitbackup-dot-warn'
+		};
+
+	return {
+		text: _('The configuration matches the last commit.'),
+		dotClass: 'gitbackup-dot gitbackup-dot-ok'
+	};
+}
+
 function gbRenderBanner(text) {
 	return E('div', { 'class': 'gitbackup-banner' }, [ E('p', {}, text) ]);
 }
@@ -539,6 +584,15 @@ return view.extend({
 						E('span', { 'id': 'gitbackup-run-text' }, sv.resultText)
 					]),
 					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-run-hint' }, sv.resultHint)
+				]),
+				E('div', { 'class': 'gitbackup-card' }, [
+					E('div', { 'class': 'gitbackup-card-title' }, _('Configuration')),
+					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-configdiff-result' }, [
+						E('span', { 'class': 'gitbackup-dot', 'id': 'gitbackup-configdiff-dot' }),
+						E('span', { 'id': 'gitbackup-configdiff-text' }, _('Checking…'))
+					]),
+					E('div', { 'class': 'gitbackup-card-hint' },
+						_('Compared against the last commit right now, not just the last run.'))
 				])
 			]),
 
@@ -590,6 +644,18 @@ return view.extend({
 		// waits on.
 		self.refreshHistory();
 
+		// Same reasoning as refreshHistory() just above, and NOT folded
+		// into refreshStatus()'s own 5s poll either: config_diff
+		// (gbrpc_config_diff) re-collects the whole backup set and talks
+		// to the remote to fetch the last commit's manifest, the same
+		// "can take several seconds against a real remote" cost this
+		// view's own commit-history fetch already has to dodge -- polling
+		// that every 5 seconds would hammer both the router's flash and
+		// the remote for no reason. Refreshed here once the page is
+		// already on screen, and again after a run/test this view itself
+		// triggered finishes (pollLiveLog below).
+		self.refreshConfigDiff();
+
 		return view;
 	},
 
@@ -624,6 +690,20 @@ return view.extend({
 
 		return L.resolveDefault(callHistory(1), null).then(function(res) {
 			self.applyHistoryDom(gbHistoryView(res || {}, self._remoteUrl, self._provider));
+		});
+	},
+
+	// L.resolveDefault's own `null` fallback (a rejected call: rpcd
+	// unreachable, ACL denial, ...) and gbrpc_config_diff's own
+	// `{ "reason": ... }` error object (a reachable failure: bad config,
+	// unreachable remote) both have to land on gbConfigDiffView's "could
+	// not check" branch, never silently on "all saved" -- see that
+	// function's own comment.
+	refreshConfigDiff: function() {
+		var self = this;
+
+		return L.resolveDefault(callConfigDiff(), null).then(function(res) {
+			self.applyConfigDiffDom(gbConfigDiffView(res));
 		});
 	},
 
@@ -676,6 +756,17 @@ return view.extend({
 		}
 
 		timeEl.textContent = hv.timeText;
+	},
+
+	applyConfigDiffDom: function(cv) {
+		var textEl = document.getElementById('gitbackup-configdiff-text');
+		var dotEl = document.getElementById('gitbackup-configdiff-dot');
+
+		if (textEl)
+			textEl.textContent = cv.text;
+
+		if (dotEl)
+			dotEl.className = cv.dotClass;
 	},
 
 	setBusy: function(busy) {
@@ -762,6 +853,7 @@ return view.extend({
 				self.setBusy(false);
 				self.refreshStatus();
 				self.refreshHistory();
+				self.refreshConfigDiff();
 			}
 		}, function() {
 			// A single failed poll must not spin forever either.

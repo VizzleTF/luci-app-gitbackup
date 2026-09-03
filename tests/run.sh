@@ -4059,6 +4059,76 @@ t_cli_diff_catches_permission_and_membership_changes() {
 	diff_teardown
 }
 
+# t_rpcd_config_diff_unchanged -- the new read-tier method (config_diff)
+# answers "has the live config drifted from the last commit", which the
+# existing rpcd `diff` (two already-committed shas, ticket 14/R124) cannot:
+# it wraps `gitbackup diff` (ticket 17), which compares the CURRENT
+# manifest against the last pushed one, not `git status`/`git diff`. An
+# unchanged system must answer differs: false.
+t_rpcd_config_diff_unchanged() {
+	diff_setup
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	chmod 0644 "$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+
+	(
+		. "$share/lib.sh"; . "$share/device.sh"; . "$share/collect.sh"
+		GB_DEVICE=rt1
+		gb_collect "$work/diff-seed-tree"
+	)
+	diff_seed_push "$_diff_bare" device/rt1 "$work/diff-seed-tree"
+
+	out=$(rpcd_call config_diff)
+	assert_json 'config_diff (unchanged) is valid JSON' "$out"
+	contains 'an unchanged system answers differs: false' '"differs": false' "$out"
+
+	diff_teardown
+}
+
+# t_rpcd_config_diff_catches_chmod -- D03's own headline case, reachable
+# through rpcd: a chmod-only edit is invisible to `git diff` (same blob,
+# same tree entry mode class -- 100644 either way) but MUST flip differs
+# to true, because the source of truth is manifest.json's own mode field,
+# never git. This is exactly the case the overview indicator has to catch
+# that a git-status-based check never could.
+t_rpcd_config_diff_catches_chmod() {
+	diff_setup
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n' >"$work/froot/etc/config/network"
+	chmod 0644 "$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+
+	(
+		. "$share/lib.sh"; . "$share/device.sh"; . "$share/collect.sh"
+		GB_DEVICE=rt1
+		gb_collect "$work/diff-seed-tree"
+	)
+	diff_seed_push "$_diff_bare" device/rt1 "$work/diff-seed-tree"
+
+	chmod 0600 "$work/froot/etc/config/network"
+
+	out=$(rpcd_call config_diff)
+	assert_json 'config_diff (chmod-only) is valid JSON' "$out"
+	contains 'a chmod git cannot see still flips differs to true' '"differs": true' "$out"
+	contains 'and the text names the mode change' 'mode 644->600' "$out"
+
+	diff_teardown
+}
+
+# t_rpcd_config_diff_unreachable_remote -- gb_die exits nonzero (gitbackup's
+# own exit codes 2/3 for config/network failures); config_diff must turn
+# that into a { "reason": ... } object like every other rpcd method here,
+# never a bare nonzero exit rpcd would otherwise turn into an empty body --
+# this is what lets the overview indicator say "could not verify" instead
+# of silently defaulting to "all saved".
+t_rpcd_config_diff_unreachable_remote() {
+	fixture 'gitbackup.origin.url='
+	out=$(rpcd_call config_diff)
+	assert_json 'config_diff with no remote configured is still valid JSON' "$out"
+	contains 'and explains why, via "reason"' '"reason"' "$out"
+}
+
 # --------------------------------------------------------------------------
 # card.sh (ticket 09, spec "Recovery card и RECOVERY.md")
 # --------------------------------------------------------------------------
@@ -4780,6 +4850,9 @@ run_test 'rpcd: run/test/restore return immediately, not after a timeout' t_rpcd
 run_test 'rpcd: history and diff against a real bare repository' t_rpcd_history_and_diff
 run_test 'rpcd: history on a branch with no backup yet' t_rpcd_history_no_backup_yet
 run_test 'rpcd: history with no remote configured' t_rpcd_history_unconfigured
+run_test 'rpcd: config_diff -- unchanged system answers differs: false' t_rpcd_config_diff_unchanged
+run_test 'rpcd: config_diff -- catches a chmod git diff cannot see (D03)' t_rpcd_config_diff_catches_chmod
+run_test 'rpcd: config_diff -- no remote configured answers a reason' t_rpcd_config_diff_unreachable_remote
 run_test 'packaging: Makefile contract' t_makefile_contract
 run_test 'packaging: config sections match code' t_config_sections_match_code
 run_test 'packaging: owfeed.yml matches Makefile' t_owfeed_yml_matches_makefile

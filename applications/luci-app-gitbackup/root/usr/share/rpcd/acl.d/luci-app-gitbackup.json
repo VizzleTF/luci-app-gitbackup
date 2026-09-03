@@ -8,6 +8,7 @@
 					"status",
 					"log",
 					"diff",
+					"config_diff",
 					"pubkey",
 					"list_paths",
 					"history",
