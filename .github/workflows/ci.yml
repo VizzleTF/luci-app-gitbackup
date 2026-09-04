@@ -50,7 +50,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: sh tools/find-shell-files.sh | xargs shellcheck -s sh
+      # A PINNED shellcheck, not the runner image's. Findings differ between
+      # shellcheck releases -- this repository's first CI run was red on two
+      # checks a 0.11.0 developer machine reports none of -- so a gate held to
+      # whatever ubuntu-latest ships changes meaning without anyone editing it.
+      # tools/shellcheck-gate.sh downloads the pinned release, verifies its
+      # sha256 and runs it over the derived file list.
+      - run: sh tools/shellcheck-gate.sh
 
   # ------------------------------------------------------------------
   # POSIX sh unit tests -- both suites. tests/run.sh covers
@@ -293,7 +299,14 @@ jobs:
         with:
           version: v0.5.3
           releases: '25.12.4'
-          install: dist/noarch/gitbackup-*.apk dist/noarch/luci-app-gitbackup-*.apk
+          # ONE GLOB PER LINE. owlab's own action.yml says so, and the two
+          # patterns used to sit on one line separated by a space: owlab read
+          # that as a single pattern, matched nothing, and failed with
+          # "matched no files" -- the first CI run of this repository was red
+          # on exactly that.
+          install: |
+            dist/noarch/gitbackup-*.apk
+            dist/noarch/luci-app-gitbackup-*.apk
           # `gitbackup status` -- valid JSON on an unconfigured router (spec:
           # status is soft-validated and always answers, ticket 01). The two
           # `http 200` lines are the LuCI pages this app actually ships,
