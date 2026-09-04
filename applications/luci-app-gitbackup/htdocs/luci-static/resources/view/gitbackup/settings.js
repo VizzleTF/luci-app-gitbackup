@@ -56,6 +56,20 @@ var callTest = rpc.declare({
 	method: 'test'
 });
 
+// callHostkey([fingerprint]) -- ticket 20. With no argument, shows the
+// remote's SSH host key fingerprint without recording it (gbrpc_hostkey ->
+// `gitbackup hostkey show`). With the exact fingerprint text `hostkey show`
+// printed, accepts and records it (`gitbackup hostkey accept`) -- this is
+// the only way this view can ever get an SSH host key trusted at all:
+// `callTest` above backgrounds `gitbackup test` with stdin `</dev/null` by
+// construction (gbrpc_test, out of this ticket's zone), so its interactive
+// accept-or-decline prompt can never be answered from here.
+var callHostkey = rpc.declare({
+	object: 'luci.gitbackup',
+	method: 'hostkey',
+	params: [ 'fingerprint' ]
+});
+
 var callLog = rpc.declare({
 	object: 'luci.gitbackup',
 	method: 'log',
@@ -413,6 +427,16 @@ function gbClassifyTestLog(text) {
 		if (line.indexOf('host key was not accepted') !== -1)
 			return { kind: 'auth', message: _('The SSH host key was not accepted.') };
 
+		// Ticket 20: cmd_test's own third outcome for gb_accept_hostkey --
+		// there was no interactive input to ask for confirmation at all
+		// (this view's own "Test connection" always runs `test` with no
+		// stdin, gbrpc_test's own shape), distinct from BOTH "was not
+		// accepted" (a real, typed decline) and "could not be obtained"
+		// (unreachable). This is the one outcome that has a next step this
+		// view can actually offer -- see showHostkeyPrompt below.
+		if (line.indexOf('host key needs confirmation') !== -1)
+			return { kind: 'hostkey_pending', message: _('The SSH host key has not been confirmed yet -- see its fingerprint below and accept it once to continue.') };
+
 		if (line.indexOf('host key could not be obtained') !== -1)
 			return { kind: 'network', message: _('Could not reach the remote to obtain its SSH host key -- check the URL and connectivity.') };
 	}
@@ -432,6 +456,7 @@ var GB_TEST_TERMINAL_RE = new RegExp(
 		'cannot reach ',
 		'authentication to .* failed',
 		'host key was not accepted',
+		'host key needs confirmation',
 		'host key could not be obtained'
 	].join('|')
 );
@@ -690,6 +715,14 @@ return view.extend({
 					}, _('Test connection'))
 				]),
 				E('div', { 'id': 'gitbackup-test-result', 'class': 'gitbackup-test-result' }),
+				// Ticket 20 -- the web-only host key accept flow. Hidden
+				// until "Test connection" hits gbClassifyTestLog's own
+				// 'hostkey_pending' outcome (see pollTestLog below), which
+				// is the only case that has anything for this box to show:
+				// gitbackup test's own interactive prompt never reaches
+				// this rpcd-backed view at all (gbrpc_test's stdin is
+				// `</dev/null` by construction).
+				E('div', { 'id': 'gitbackup-hostkey-prompt', 'class': 'gitbackup-box', 'hidden': true }),
 				E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-test-log', 'hidden': true }, '')
 			]);
 			return wrap;
@@ -1031,6 +1064,7 @@ return view.extend({
 			btn.disabled = true;
 		if (resultEl)
 			resultEl.textContent = _('Testing…');
+		self.hideHostkeyPrompt();
 
 		return self.startTestLog().then(function() {
 			return callTest();
@@ -1111,11 +1145,20 @@ return view.extend({
 			}
 
 			if (finished) {
+				var cls = gbClassifyTestLog(text);
 				self.stopTestLog();
 				if (btn)
 					btn.disabled = false;
 				if (resultEl)
-					resultEl.textContent = gbClassifyTestLog(text).message;
+					resultEl.textContent = cls.message;
+				// Ticket 20: the one outcome with an actual next step this
+				// view can offer -- see showHostkeyPrompt below. Every
+				// other outcome (including a plain success) makes sure any
+				// stale prompt from an earlier attempt is gone.
+				if (cls.kind === 'hostkey_pending')
+					self.showHostkeyPrompt();
+				else
+					self.hideHostkeyPrompt();
 			} else if (self._testLogIdle >= 30 || self._testLogTicks >= 150) {
 				self.stopTestLog();
 				if (btn)
@@ -1130,6 +1173,115 @@ return view.extend({
 				if (document.getElementById('gitbackup-btn-test'))
 					document.getElementById('gitbackup-btn-test').disabled = false;
 			}
+		});
+	},
+
+	// showHostkeyPrompt/hideHostkeyPrompt/handleAcceptHostkey -- ticket 20's
+	// web-only path for accepting an SSH host key. pollTestLog above calls
+	// showHostkeyPrompt the moment a test run reports the new
+	// 'hostkey_pending' outcome; this is the only piece of the flow that
+	// ever talks to callHostkey with no argument (fetch and show, write
+	// nothing) versus with one (accept exactly what was shown).
+	//
+	// The fingerprint text itself is never put in the DOM as markup --
+	// gitbackup-log's own <pre> with a single text-node child, the same
+	// "content goes in through E()/textContent, innerHTML exists nowhere
+	// in this project" rule history.js's diff viewer already follows
+	// (out of this ticket's zone, read before writing this) -- this is
+	// server-reported text (an SSH fingerprint), not markup, but the rule
+	// is followed unconditionally rather than re-litigated per call site.
+	showHostkeyPrompt: function() {
+		var self = this;
+		var wrap = document.getElementById('gitbackup-hostkey-prompt');
+
+		if (!wrap)
+			return;
+
+		wrap.hidden = false;
+		while (wrap.firstChild)
+			wrap.removeChild(wrap.firstChild);
+		wrap.appendChild(E('p', {}, _('Fetching the remote’s SSH host key…')));
+
+		return callHostkey().then(function(res) {
+			while (wrap.firstChild)
+				wrap.removeChild(wrap.firstChild);
+
+			if (!res || res.trusted === true) {
+				// Already trusted by the time this ran (e.g. accepted from
+				// another tab, or a prior "test" already recorded it) --
+				// nothing left for this box to ask about.
+				wrap.hidden = true;
+				return;
+			}
+
+			if (!res.fingerprint) {
+				wrap.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
+					_('Could not obtain the host key: %s').format((res && res.reason) || _('unknown error'))));
+				return;
+			}
+
+			self._hostkeyFingerprint = res.fingerprint;
+			wrap.appendChild(E('p', {}, _('The remote presented this SSH host key fingerprint. Verify it out of band if you can, then accept it once to continue -- this only has to be done the first time.')));
+			wrap.appendChild(E('pre', { 'class': 'gitbackup-log' }, res.fingerprint));
+			wrap.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
+				E('button', {
+					'class': 'cbi-button cbi-button-positive',
+					'click': ui.createHandlerFn(self, 'handleAcceptHostkey')
+				}, _('Accept and remember this host key'))
+			]));
+		}, function(e) {
+			while (wrap.firstChild)
+				wrap.removeChild(wrap.firstChild);
+			wrap.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
+				_('Could not obtain the host key: %s').format(e.message)));
+		});
+	},
+
+	hideHostkeyPrompt: function() {
+		var wrap = document.getElementById('gitbackup-hostkey-prompt');
+
+		if (!wrap)
+			return;
+
+		wrap.hidden = true;
+		while (wrap.firstChild)
+			wrap.removeChild(wrap.firstChild);
+	},
+
+	// handleAcceptHostkey -- sends back EXACTLY the fingerprint text
+	// showHostkeyPrompt received and cached on `self._hostkeyFingerprint`,
+	// never a value re-read from anywhere else: gb_hostkey_accept (auth.sh,
+	// out of this ticket's zone) only ever commits a fingerprint that
+	// matches what its own gb_hostkey_show call cached, so sending
+	// anything other than that same text back is refused server-side
+	// (exit 4) rather than silently trusting a different key.
+	handleAcceptHostkey: function(ev) {
+		var self = this;
+		var fp = self._hostkeyFingerprint;
+		var btn = ev.target;
+
+		if (!fp)
+			return;
+
+		btn.disabled = true;
+
+		return callHostkey(fp).then(function(res) {
+			var resultEl;
+
+			if (!res || res.ok !== true) {
+				ui.addNotification(null, E('p', {},
+					_('Could not accept the host key: %s').format((res && res.reason) || _('unknown error'))), 'error');
+				btn.disabled = false;
+				return;
+			}
+
+			self.hideHostkeyPrompt();
+			resultEl = document.getElementById('gitbackup-test-result');
+			if (resultEl)
+				resultEl.textContent = _('Host key accepted. Click “Test connection” again to verify the rest.');
+		}, function(e) {
+			ui.addNotification(null, E('p', {}, _('Could not accept the host key: %s').format(e.message)), 'error');
+			btn.disabled = false;
 		});
 	}
 });

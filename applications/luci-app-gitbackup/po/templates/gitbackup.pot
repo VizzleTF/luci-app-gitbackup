@@ -1,7 +1,7 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:665
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:690
 msgid ""
 "\"Auto\" detects github.com/gitlab.com/bitbucket.org/codeberg.org by "
 "hostname and treats anything else as generic (self-hosted, unknown API). Set "
@@ -9,17 +9,17 @@ msgid ""
 "that provider's deploy-key link instead of the generic instructions."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:655
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:680
 msgid ""
 "\"{device}\" is replaced with the resolved device identifier -- the default "
 "gives every device its own branch on a shared repository."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:302
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:304
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:306
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:308
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:310
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:316
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:318
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:320
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:322
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:324
 msgid "%s field is not a valid value, range, step or list of them in \"%s\""
 msgstr ""
 
@@ -70,9 +70,13 @@ msgstr ""
 msgid "/absolute/path/to/a/file/or/directory"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:661
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:832
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:686
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:865
 msgid "API token"
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1230
+msgid "Accept and remember this host key"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/paths.js:232
@@ -83,11 +87,11 @@ msgstr ""
 msgid "Add path"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:734
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:767
 msgid "Add the key to the repository"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:782
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:815
 msgid "Add the key to the server"
 msgstr ""
 
@@ -95,13 +99,13 @@ msgstr ""
 msgid "Also covered automatically"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:528
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:553
 msgid ""
 "Also write a backup.tar.gz next to the working tree on every run, for a "
 "quick local copy in addition to the git history."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:876
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:909
 msgid "Anyone with the URL will be able to read every backup ever pushed."
 msgstr ""
 
@@ -109,15 +113,15 @@ msgstr ""
 msgid "Audit: changed on this router, but not backed up"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:659
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:684
 msgid "Authentication"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:666
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:691
 msgid "Auto-detect"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:547
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:572
 msgid "Back up on config change"
 msgstr ""
 
@@ -125,7 +129,7 @@ msgstr ""
 msgid "Backup now"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:756
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:789
 msgid ""
 "Before saving the key on the provider, tick \"Allow write access\" (or the "
 "equivalent) -- without it the key can read the repository but every push "
@@ -138,17 +142,17 @@ msgid ""
 "last push was refused."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:402
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:416
 msgid ""
 "Blocked: this repository is publicly visible to an anonymous request. Push "
 "is refused until it is made private, or the remote is changed."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:535
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:560
 msgid "Board model"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:654
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:679
 msgid "Branch"
 msgstr ""
 
@@ -187,7 +191,7 @@ msgstr ""
 msgid "Configuration"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:516
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:541
 msgid ""
 "Configuration for the whole gitbackup package. Saving reloads the schedule "
 "and, if the repository is public, forces config scrubbing on -- see the "
@@ -202,11 +206,11 @@ msgstr ""
 msgid "Confirm restore"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:399
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:413
 msgid "Connected -- the remote is reachable and the credentials work."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:679
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:704
 msgid "Connection test"
 msgstr ""
 
@@ -218,12 +222,17 @@ msgstr ""
 msgid "Continue"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1007
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1040
 msgid "Copied."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:462
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:487
 msgid "Copy"
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1273
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1283
+msgid "Could not accept the host key: %s"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:421
@@ -234,13 +243,13 @@ msgstr ""
 msgid "Could not check: %s"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1008
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1041
 msgid ""
 "Could not copy automatically -- select the text above and copy it by hand."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:975
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:988
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1008
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1021
 msgid "Could not generate a deploy key: %s"
 msgstr ""
 
@@ -257,7 +266,12 @@ msgstr ""
 msgid "Could not load the diff: %s"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:408
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1219
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1236
+msgid "Could not obtain the host key: %s"
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:422
 msgid ""
 "Could not reach the remote -- check the URL, DNS and internet connectivity."
 msgstr ""
@@ -266,7 +280,7 @@ msgstr ""
 msgid "Could not reach the remote repository."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:417
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:441
 msgid ""
 "Could not reach the remote to obtain its SSH host key -- check the URL and "
 "connectivity."
@@ -285,12 +299,12 @@ msgid "Could not start a backup run: %s"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:895
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1039
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1073
 msgid "Could not start a connection test."
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:899
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1045
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1079
 msgid "Could not start a connection test: %s"
 msgstr ""
 
@@ -302,21 +316,21 @@ msgstr ""
 msgid "Could not start the restore: %s"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:405
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:419
 msgid ""
 "Could not verify whether the repository is public -- the network or the "
 "provider's API was unreachable. Try again once connectivity is confirmed."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:567
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:592
 msgid "Cron expression"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:850
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:883
 msgid "Custom CA certificate path"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:563
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:588
 msgid "Custom cron expression"
 msgstr ""
 
@@ -324,15 +338,15 @@ msgstr ""
 msgid "Custom cron: %s"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:538
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:563
 msgid "Custom device name"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:534
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:559
 msgid "Custom name (set below)"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:561
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:586
 msgid "Daily, once in a randomized night window"
 msgstr ""
 
@@ -340,19 +354,19 @@ msgstr ""
 msgid "Daily, once in a randomized night window (00:00-05:59), per device"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:551
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:576
 msgid "Debounce (seconds)"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:700
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:733
 msgid "Deploy key"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:813
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:846
 msgid "Deploy key path"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:531
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:556
 msgid "Device identifier"
 msgstr ""
 
@@ -380,7 +394,7 @@ msgid "Download recovery card"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:373
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:524
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:549
 msgid "Enabled"
 msgstr ""
 
@@ -388,7 +402,7 @@ msgstr ""
 msgid "Enter a path first."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:770
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:803
 msgid ""
 "Enter a valid repository URL above to get a direct link to the provider’s "
 "deploy-key page."
@@ -409,7 +423,11 @@ msgstr ""
 msgid "Fetching diff from the remote…"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:568
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1203
+msgid "Fetching the remote’s SSH host key…"
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:593
 msgid ""
 "Five fields: minute hour day-of-month month day-of-week. Validated live "
 "against exactly the grammar busybox crond on this router understands -- it "
@@ -417,21 +435,21 @@ msgid ""
 "any line shorter than five fields."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:926
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:959
 msgid ""
 "Forced on automatically whenever \"Repository visibility\" above is set to "
 "Public -- this checkbox only matters while it is still Private."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:521
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:546
 msgid "General"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:475
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:500
 msgid "Generate deploy key"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:671
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:696
 msgid "Generic (self-hosted, unknown API)"
 msgstr ""
 
@@ -447,40 +465,44 @@ msgstr ""
 msgid "Git Backup - Paths"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:515
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:540
 msgid "Git Backup - Settings"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:669
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:694
 msgid "Gitea / Forgejo"
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1281
+msgid "Host key accepted. Click “Test connection” again to verify the rest."
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:295
 msgid "Hourly (minute chosen per device to avoid a fleet-wide stampede)"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:560
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:585
 msgid "Hourly (minute chosen per device)"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:552
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:577
 msgid ""
 "How long to wait after the last detected config change before actually "
 "starting a run -- a burst of edits in the UI collapses into one commit "
 "instead of one per change."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:532
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:557
 msgid ""
 "How this router names itself in the repository -- its own branch and path "
 "prefix are built from this."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:885
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:918
 msgid "I accept the risk and confirm this repository is actually private"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:527
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:552
 msgid "Keep a local archive"
 msgstr ""
 
@@ -504,7 +526,7 @@ msgstr ""
 msgid "Loading…"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:591
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:616
 msgid "Next run: %s UTC"
 msgstr ""
 
@@ -524,7 +546,7 @@ msgstr ""
 msgid "No completed run recorded yet."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:470
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:495
 msgid "No deploy key has been generated on this router yet."
 msgstr ""
 
@@ -544,7 +566,7 @@ msgid ""
 "anything on disk."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1124
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1167
 msgid "No result after a while -- check the log below or the syslog by hand."
 msgstr ""
 
@@ -576,44 +598,44 @@ msgid ""
 "that nothing has changed."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:559
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:584
 msgid "Off -- manual backups only"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:651
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:676
 msgid ""
 "One of: git@host:owner/repo.git, ssh://[user@]host[:port]/owner/repo.git, or "
 "https://host[:port]/owner/repo.git."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:851
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:884
 msgid ""
 "Only needed for an https remote behind a private certificate authority. "
 "Leave empty to use the system’s own trust store."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:766
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:799
 msgid "Open the repository’s deploy-key page"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:608
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:911
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:944
 msgid "PPPoE credentials"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:542
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:567
 msgid "Path prefix"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:856
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:889
 msgid "Private"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:664
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:689
 msgid "Provider"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:857
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:890
 msgid "Public"
 msgstr ""
 
@@ -621,11 +643,11 @@ msgstr ""
 msgid "Pushed a new commit on the last run."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:466
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:491
 msgid "Regenerate key"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:647
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:672
 msgid "Remote"
 msgstr ""
 
@@ -633,7 +655,7 @@ msgstr ""
 msgid "Remove"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:650
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:675
 msgid "Repository URL"
 msgstr ""
 
@@ -641,7 +663,7 @@ msgstr ""
 msgid "Repository URL is not set. Set it on the Settings tab."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:855
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:888
 msgid "Repository visibility"
 msgstr ""
 
@@ -663,7 +685,7 @@ msgstr ""
 msgid "Restore finished."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:881
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:914
 msgid ""
 "Restoring from a public branch will therefore be incomplete: scrubbed values "
 "are gone from the backup entirely and have to be re-entered by hand after a "
@@ -674,17 +696,17 @@ msgstr ""
 msgid "Restoring the backup from %s (%s) will write the following files:"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:660
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:685
 msgid "SSH deploy key"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:877
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:910
 msgid ""
 "Saving this forces config scrubbing on (Security section below): the "
 "following are stripped from every config file before it is committed --"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:558
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:583
 msgid "Schedule"
 msgstr ""
 
@@ -694,15 +716,15 @@ msgid ""
 "busybox crontab line. Fix it on the Settings tab."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:925
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:958
 msgid "Scrub secrets before committing"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:928
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:961
 msgid "Scrub these UCI options"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:922
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:955
 msgid "Security"
 msgstr ""
 
@@ -722,20 +744,26 @@ msgstr ""
 msgid "Status"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:533
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:558
 msgid "System hostname"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:623
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:690
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:715
 msgid "Test connection"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1033
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1066
 msgid "Testing…"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:414
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:438
+msgid ""
+"The SSH host key has not been confirmed yet -- see its fingerprint below and "
+"accept it once to continue."
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:428
 msgid "The SSH host key was not accepted."
 msgstr ""
 
@@ -760,7 +788,7 @@ msgid ""
 "encryption in this tool:"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:565
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:590
 msgid ""
 "The hourly/daily/weekly presets deliberately do not all fire at the same "
 "wall-clock time: the minute (and, for daily/weekly, the hour) is derived "
@@ -775,7 +803,7 @@ msgid ""
 "exactly what a backup changed, or \"Restore\" to roll this router back to it."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:866
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:899
 msgid ""
 "The remote is expected to be private. Before every push, this is checked "
 "anonymously against the provider’s API (no token needed for the check "
@@ -784,7 +812,14 @@ msgid ""
 "scrubbing stays off unless something else requires it."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:411
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1224
+msgid ""
+"The remote presented this SSH host key fingerprint. Verify it out of band if "
+"you can, then accept it once to continue -- this only has to be done the "
+"first time."
+msgstr ""
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:425
 msgid ""
 "The remote was reached, but authentication failed -- check the deploy key or "
 "the token."
@@ -826,13 +861,13 @@ msgid ""
 "this device."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:898
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:931
 msgid ""
 "This provider cannot be checked automatically -- tick the box above to "
 "confirm the repository is private before saving."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:807
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:840
 msgid ""
 "This provider has no API to link to a settings page. On %s, append the "
 "public key above to the \"git\" user’s ~/.ssh/authorized_keys, ideally "
@@ -840,14 +875,14 @@ msgid ""
 "operations, e.g.:"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:904
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:937
 msgid ""
 "This provider’s visibility cannot be checked automatically (spec: \"generic "
 "— проверить нельзя ни при каких условиях\"). If this repository is actually "
 "public, everything below is exposed in plain text to anyone who can read it:"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:845
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:878
 msgid "Token file path"
 msgstr ""
 
@@ -855,7 +890,7 @@ msgstr ""
 msgid "Total size of the backup set: %d KB"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:525
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:550
 msgid ""
 "Turns the whole package on or off -- scheduled runs, the config-change "
 "trigger and manual \"Backup now\" all stay inert while this is unchecked."
@@ -865,18 +900,18 @@ msgstr ""
 msgid "Type this device's name (%s) to confirm restoring it."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:929
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:962
 msgid ""
 "UCI paths to blank out before every commit, e.g. \"wireless.@wifi-"
 "iface[*].key\". Applied with uci -c against a scratch copy of the config "
 "tree, never touching the router’s own live configuration."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:539
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:564
 msgid "Used only when \"Device identifier\" above is set to \"Custom name\"."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:592
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:617
 msgid "Valid, but the next run time could not be computed."
 msgstr ""
 
@@ -885,21 +920,21 @@ msgid "View diff"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:606
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:909
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:942
 msgid "WPA pre-shared keys (Wi-Fi passwords)"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:420
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:444
 msgid "Waiting for the test to finish…"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:548
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:573
 msgid ""
 "Watches every UCI config in the backup set and starts a run a short while "
 "after any of them changes, instead of waiting for the next scheduled run."
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:562
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:587
 msgid "Weekly, once in a randomized night window"
 msgstr ""
 
@@ -907,18 +942,18 @@ msgstr ""
 msgid "Weekly, once in a randomized night window, per device"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:543
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:568
 msgid ""
 "Where this device's files live inside the repository. \"{device}\" is "
 "replaced with the resolved device identifier."
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:607
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:910
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:943
 msgid "WireGuard private keys"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:297
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:311
 msgid ""
 "a cron expression needs exactly 5 fields (minute hour day-of-month month day-"
 "of-week), got %d in \"%s\""
@@ -928,18 +963,18 @@ msgstr ""
 msgid "and %d more"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:287
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:301
 msgid ""
 "busybox crond does not understand \"%s\" (no @-macro support on 25.12); use "
 "an explicit expression, e.g. \"0 3 * * *\" for once a day at 03:00"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:604
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:907
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:940
 msgid "dropbear private host keys"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:879
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:912
 msgid ""
 "every value listed under \"Scrub these UCI options\" below (Wi-Fi pre-shared "
 "keys by default)"
@@ -953,16 +988,18 @@ msgstr ""
 msgid "next: %s UTC"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:838
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:871
 msgid "paste a token to enable token authentication"
 msgstr ""
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:802
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:835
 msgid "the server"
 msgstr ""
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/history.js:501
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:913
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:975
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1008
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1219
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1273
 msgid "unknown error"
 msgstr ""

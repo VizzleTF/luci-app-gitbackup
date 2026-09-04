@@ -176,6 +176,58 @@ gb_pubkey() {
 	return 1
 }
 
+# _gb_auth_dial_hostkey <host> <port> <out-file>
+#
+# The dial step gb_accept_hostkey and gb_hostkey_show below both need,
+# factored out so there is exactly one place that knows how to fetch a raw
+# host key off the wire. There is no ssh-keyscan on this image without
+# pulling in the separate openssh-client-utils package (measured on the
+# 25.12.4 stand: `apk info -L openssh-client openssh-keygen` together
+# provide neither ssh-keyscan nor any equivalent) -- rather than growing
+# DEPENDS for one command, this reuses the `ssh` binary DEPENDS already
+# carries. The SSH protocol completes its host-key exchange before user
+# authentication even starts, so `ssh -o StrictHostKeyChecking=accept-new
+# -o BatchMode=yes` against a scratch, empty known_hosts file writes the
+# host's key into it regardless of whether the authentication that follows
+# succeeds -- verified live on the owlab stand: `ssh -o
+# UserKnownHostsFile=<scratch> -o StrictHostKeyChecking=accept-new -o
+# BatchMode=yes git@github.com exit` still populates <scratch> with
+# github.com's key even though the command itself exits 255 on "Permission
+# denied (publickey)" right after, because no key for github.com had
+# actually been added yet.
+#
+# Writes <out-file> and returns 0 when a key was obtained, or returns 2
+# with <out-file> removed when nothing could be obtained at all (host
+# unreachable, connection refused, DNS failure).
+_gb_auth_dial_hostkey() {
+	_gb_adh_host="$1"
+	_gb_adh_port="$2"
+	_gb_adh_out="$3"
+	rm -f "$_gb_adh_out"
+
+	# ConnectTimeout=15: same reasoning as gb_git_env's own copy of it -- a
+	# host that never answers at all, rather than actively refusing,
+	# otherwise leaves this hanging well past two minutes (measured live).
+	ssh -o UserKnownHostsFile="$_gb_adh_out" -o StrictHostKeyChecking=accept-new \
+		-o BatchMode=yes -o ConnectTimeout=15 -p "$_gb_adh_port" "git@$_gb_adh_host" exit >/dev/null 2>&1
+
+	if [ ! -s "$_gb_adh_out" ]; then
+		rm -f "$_gb_adh_out"
+		return 2
+	fi
+	return 0
+}
+
+# _gb_hostkey_pending_file -- fixed path under GB_ETC_DIR, never part of
+# known_hosts itself. Holds the raw known_hosts-format line(s) for the
+# LAST host key gb_hostkey_show fetched, and nothing else: gb_hostkey_accept
+# below commits exactly this file's bytes, never a fresh dial of its own
+# (see gb_hostkey_accept's own header comment for why that distinction is
+# the whole point of the two-step design).
+_gb_hostkey_pending_file() {
+	printf '%s/hostkey_pending' "$GB_ETC_DIR"
+}
+
 # gb_accept_hostkey <host> [port]
 #
 # Interactive, and only ever meant to be called from `gitbackup test`
@@ -184,26 +236,23 @@ gb_pubkey() {
 # stdin, and only on "yes" appends it to this package's own known_hosts
 # (GB_ETC_DIR/known_hosts) -- never the invoking user's ~/.ssh/known_hosts.
 #
-# There is no ssh-keyscan on this image without pulling in the separate
-# openssh-client-utils package (measured on the 25.12.4 stand: `apk info -L
-# openssh-client openssh-keygen` together provide neither ssh-keyscan nor
-# any equivalent) -- rather than growing DEPENDS for one command, this
-# reuses the `ssh` binary DEPENDS already carries. The SSH protocol
-# completes its host-key exchange before user authentication even starts,
-# so `ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes` against a
-# scratch, empty known_hosts file writes the host's key into it regardless
-# of whether the authentication that follows succeeds -- verified live on
-# the owlab stand: `ssh -o UserKnownHostsFile=<scratch> -o
-# StrictHostKeyChecking=accept-new -o BatchMode=yes git@github.com exit`
-# still populates <scratch> with github.com's key even though the command
-# itself exits 255 on "Permission denied (publickey)" right after, because
-# no key for github.com had actually been added yet.
-#
 # Returns 0 once the key is confirmed and recorded (or was already known --
 # see the ssh-keygen -F check below, which makes this safe to call
 # unconditionally from `gitbackup test` every time), 1 when the operator
-# declines, 2 when no host key could be obtained at all (host unreachable,
-# connection refused, DNS failure).
+# explicitly declines, 2 when no host key could be obtained at all (host
+# unreachable, connection refused, DNS failure), 3 when there was no way to
+# even ASK the operator (ticket 20: `read` hit EOF -- no controlling
+# terminal at all, e.g. rpcd's own `gitbackup test </dev/null`). 3 used to
+# be indistinguishable from 1 here: the old code fed `read`'s result
+# straight into the `case` below without ever looking at `read`'s own exit
+# status, so an EOF -- which busybox ash's `read` reports as a nonzero
+# return with `_gb_ans` left empty -- fell into the same "not y" branch a
+# real, typed "no" does, logging "declined by the operator" for an operator
+# who was never actually asked. Reported live against a real GitHub deploy
+# key on a real router: `gitbackup test` run from `gbrpc_test` (stdin
+# `</dev/null` by construction, ticket 20) always produced that exact
+# false accusation, and offered no way to accept the key from the web at
+# all -- gb_hostkey_show/gb_hostkey_accept below are that way.
 gb_accept_hostkey() {
 	_gb_host="$1"
 	_gb_port="${2:-22}"
@@ -223,35 +272,129 @@ gb_accept_hostkey() {
 	fi
 
 	_gb_scratch=$(mktemp "${TMPDIR:-/tmp}/gitbackup-hostkey.XXXXXX") || return 2
-	rm -f "$_gb_scratch"
-
-	# ConnectTimeout=15: same reasoning as gb_git_env's own copy of it -- a
-	# host that never answers at all, rather than actively refusing,
-	# otherwise leaves this hanging well past two minutes (measured live).
-	ssh -o UserKnownHostsFile="$_gb_scratch" -o StrictHostKeyChecking=accept-new \
-		-o BatchMode=yes -o ConnectTimeout=15 -p "$_gb_port" "git@$_gb_host" exit >/dev/null 2>&1
-
-	if [ ! -s "$_gb_scratch" ]; then
-		rm -f "$_gb_scratch"
+	if ! _gb_auth_dial_hostkey "$_gb_host" "$_gb_port" "$_gb_scratch"; then
 		gb_log err "gb_accept_hostkey: could not reach $_gb_host:$_gb_port to obtain its host key"
 		return 2
 	fi
 
 	_gb_fp=$(ssh-keygen -lf "$_gb_scratch" 2>/dev/null)
 	printf 'Host key for %s:%s --\n  %s\nAccept and remember it? [y/N] ' "$_gb_host" "$_gb_port" "$_gb_fp" >&2
-	IFS= read -r _gb_ans
-	case "$_gb_ans" in
-		y|Y|yes|YES) ;;
-		*)
-			rm -f "$_gb_scratch"
-			gb_log notice "gb_accept_hostkey: $_gb_host:$_gb_port declined by the operator"
-			return 1
-			;;
-	esac
+
+	# See this function's own header comment: `read`'s exit status, not
+	# just the string it captured, is what tells a real "no" (read
+	# succeeded, the operator typed something other than y/yes) apart from
+	# "could not ask at all" (read failed -- EOF, no stdin to read from).
+	if IFS= read -r _gb_ans; then
+		case "$_gb_ans" in
+			y|Y|yes|YES) ;;
+			*)
+				rm -f "$_gb_scratch"
+				gb_log notice "gb_accept_hostkey: $_gb_host:$_gb_port declined by the operator"
+				return 1
+				;;
+		esac
+	else
+		rm -f "$_gb_scratch"
+		gb_log err "gb_accept_hostkey: $_gb_host:$_gb_port could not ask for confirmation -- no interactive input is available here. Run 'gitbackup test' from a terminal with a real stdin, or accept the host key from the LuCI web UI (Settings -> Connection test), which uses 'gitbackup hostkey show'/'hostkey accept' for exactly this case."
+		return 3
+	fi
 
 	cat "$_gb_scratch" >>"$_gb_known"
 	chmod 0600 "$_gb_known"
 	rm -f "$_gb_scratch"
 	gb_log notice "gb_accept_hostkey: $_gb_host:$_gb_port accepted and recorded in $_gb_known"
+	return 0
+}
+
+# gb_hostkey_show <host> [port]
+#
+# The non-interactive half of ticket 20's web flow: dials <host>, same as
+# gb_accept_hostkey above, but never asks anything and never writes
+# known_hosts. Instead it caches the exact bytes it fetched in
+# _gb_hostkey_pending_file, so a later gb_hostkey_accept call can commit
+# precisely THAT material -- not whatever a second, independent dial might
+# return -- which is what keeps the show/confirm round trip from opening a
+# window for a key swap in between (see gb_hostkey_accept's own comment).
+#
+# Prints exactly one line to stdout:
+#   trusted <host> <port>                       -- nothing to show, already known
+#   pending <host> <port> <fingerprint...>       -- ssh-keygen -lf's own text
+# Deliberately plain, not JSON: usr/sbin/gitbackup's cmd_hostkey is the one
+# JSON boundary here, same split gb_pubkey/`gitbackup pubkey` already uses.
+#
+# Returns 0 in both printed cases above, 2 when the host could not be
+# reached at all (nothing printed, nothing cached).
+gb_hostkey_show() {
+	_gb_host="$1"
+	_gb_port="${2:-22}"
+	case "$_gb_port" in
+		''|0) _gb_port=22 ;;
+	esac
+
+	mkdir -p "$GB_ETC_DIR" 2>/dev/null
+	_gb_known="$GB_ETC_DIR/known_hosts"
+	if [ -r "$_gb_known" ] && ssh-keygen -F "$_gb_host" -f "$_gb_known" >/dev/null 2>&1; then
+		printf 'trusted %s %s\n' "$_gb_host" "$_gb_port"
+		return 0
+	fi
+
+	_gb_pending=$(_gb_hostkey_pending_file)
+	if ! _gb_auth_dial_hostkey "$_gb_host" "$_gb_port" "$_gb_pending"; then
+		gb_log err "gb_hostkey_show: could not reach $_gb_host:$_gb_port to obtain its host key"
+		return 2
+	fi
+	chmod 0600 "$_gb_pending"
+
+	_gb_fp=$(ssh-keygen -lf "$_gb_pending" 2>/dev/null)
+	printf 'pending %s %s %s\n' "$_gb_host" "$_gb_port" "$_gb_fp"
+	return 0
+}
+
+# gb_hostkey_accept <host> [port] <fingerprint>
+#
+# Commits the key gb_hostkey_show cached, but ONLY when <fingerprint>
+# matches ssh-keygen's own fingerprint of exactly that cached material.
+# <fingerprint> is the text the operator was shown and clicked "accept"
+# on, so this check is what stops a second, possibly different dial from
+# silently substituting a different key between the moment the fingerprint
+# was displayed and the moment it was confirmed (an active MITM that
+# changed which key answers the connection the second time around, or a
+# second concurrent gb_hostkey_show call from another tab overwriting the
+# pending file first). This is exactly why this function never dials the
+# network itself: re-fetching "to double check" would defeat the point --
+# it would be confirming a NEW dial, not the one the operator actually
+# saw.
+#
+# Returns 0 once accepted and recorded, 1 when there is nothing pending
+# (gb_hostkey_show was never called, or its result already got
+# consumed/replaced -- call it again), 4 when <fingerprint> does not match
+# what is actually cached (exit-code contract: "4 отказ по безопасности" --
+# this is refused, never silently accepted with a mismatch logged instead).
+gb_hostkey_accept() {
+	_gb_host="$1"
+	_gb_port="${2:-22}"
+	_gb_want_fp="$3"
+	case "$_gb_port" in
+		''|0) _gb_port=22 ;;
+	esac
+
+	_gb_pending=$(_gb_hostkey_pending_file)
+	if [ ! -s "$_gb_pending" ]; then
+		gb_log err "gb_hostkey_accept: no pending host key for $_gb_host:$_gb_port -- run 'gitbackup hostkey show' first"
+		return 1
+	fi
+
+	_gb_have_fp=$(ssh-keygen -lf "$_gb_pending" 2>/dev/null)
+	if [ -z "$_gb_want_fp" ] || [ "$_gb_have_fp" != "$_gb_want_fp" ]; then
+		gb_log err "gb_hostkey_accept: fingerprint for $_gb_host:$_gb_port does not match the pending host key -- refusing"
+		return 4
+	fi
+
+	mkdir -p "$GB_ETC_DIR" 2>/dev/null
+	_gb_known="$GB_ETC_DIR/known_hosts"
+	cat "$_gb_pending" >>"$_gb_known"
+	chmod 0600 "$_gb_known"
+	rm -f "$_gb_pending"
+	gb_log notice "gb_hostkey_accept: $_gb_host:$_gb_port accepted and recorded in $_gb_known"
 	return 0
 }

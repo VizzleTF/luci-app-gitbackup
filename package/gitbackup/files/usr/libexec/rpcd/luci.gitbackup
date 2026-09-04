@@ -352,6 +352,37 @@ gbrpc_test() {
 	printf '{ "started": true }\n'
 }
 
+# gbrpc_hostkey -- ticket 20. gbrpc_test above backgrounds `gitbackup test`
+# and answers immediately, so it can never hand the operator an SSH host
+# key's fingerprint to confirm -- and `gitbackup test`'s own stdin is
+# `</dev/null` by construction here, so its interactive accept-or-decline
+# prompt (auth.sh's gb_accept_hostkey) can never be answered from the web
+# at all. This is the one new rpcd method that closes that gap, wrapping
+# `gitbackup hostkey` (usr/sbin/gitbackup's cmd_hostkey) -- itself
+# synchronous and fast (a single SSH host-key dial, ConnectTimeout=15;
+# `accept` makes no network call at all), unlike run/test/restore above.
+#
+# One method serves both steps of the flow, picked by whether "fingerprint"
+# was given: absent/empty -> `hostkey show` (dial, report, write nothing);
+# present -> `hostkey accept <fingerprint>` (commit ONLY if it matches what
+# is actually cached from the last `show` -- gb_hostkey_accept's own job,
+# not this file's). Never accepts a host key with no fingerprint given: an
+# empty "fingerprint" here can only mean "show", not "accept anything".
+gbrpc_hostkey() {
+	_gb_rpc_fp=$(_gb_rpc_param "$1" '@.fingerprint')
+	if [ -n "$_gb_rpc_fp" ]; then
+		_gb_rpc_out=$("$GB_BIN" hostkey accept "$_gb_rpc_fp" 2>&1)
+	else
+		_gb_rpc_out=$("$GB_BIN" hostkey show 2>&1)
+	fi
+	_gb_rpc_rc=$?
+	if [ "$_gb_rpc_rc" -eq 0 ]; then
+		printf '%s\n' "$_gb_rpc_out"
+	else
+		_gb_rpc_error "$_gb_rpc_out"
+	fi
+}
+
 gbrpc_keygen() {
 	_gb_rpc_force=$(_gb_rpc_param "$1" '@.force')
 	_gb_rpc_args=''
@@ -540,6 +571,7 @@ case "${1:-}" in
 	"run": {},
 	"keygen": { "force": true },
 	"test": {},
+	"hostkey": { "fingerprint": "" },
 	"set_secret": { "value": "" },
 	"set_paths": { "paths": [] },
 	"restore": { "device": "", "commit": "", "dry_run": true, "force": true, "with_packages": true },
@@ -574,6 +606,7 @@ EOF
 			run) gbrpc_run ;;
 			keygen) gbrpc_keygen "$_gb_rpc_input" ;;
 			test) gbrpc_test ;;
+			hostkey) gbrpc_hostkey "$_gb_rpc_input" ;;
 			set_secret) gbrpc_set_secret "$_gb_rpc_input" ;;
 			set_paths) gbrpc_set_paths "$_gb_rpc_input" ;;
 			restore) gbrpc_restore "$_gb_rpc_input" ;;

@@ -2219,6 +2219,113 @@ t_auth_accept_hostkey() {
 	)
 }
 
+# t_auth_accept_hostkey_eof -- ticket 20's first defect. A dial that DOES
+# obtain a host key, followed by an EOF on stdin (no controlling terminal
+# at all -- exactly gbrpc_test's own `"$GB_BIN" test </dev/null` shape) must
+# be told apart from a real, typed "no": different exit code, different
+# log line, and -- the actual bug reported live -- the message must never
+# say "declined by the operator" for an operator who was never asked.
+t_auth_accept_hostkey_eof() {
+	(
+		. "$share/lib.sh"; . "$share/auth.sh"
+
+		GB_ETC_DIR="$work/etc-hk-eof"; export GB_ETC_DIR
+		GB_TEST_SSH_HOSTKEY='example.com ssh-ed25519 AAAAtestkey'; export GB_TEST_SSH_HOSTKEY
+		out=$( ( gb_accept_hostkey example.com 22 </dev/null ) 2>&1 )
+		eq 'EOF on the confirmation prompt returns 3, not 1' '3' "$?"
+		if [ -e "$GB_ETC_DIR/known_hosts" ]; then
+			no 'and nothing was written' 'known_hosts exists'
+		else
+			ok 'and nothing was written'
+		fi
+		case "$out" in
+			*'declined by the operator'*) no 'the message never blames the operator for declining' "$out" ;;
+			*) ok 'the message never blames the operator for declining' ;;
+		esac
+		contains 'and says a confirmation could not be asked for' 'could not ask' "$out"
+		unset GB_TEST_SSH_HOSTKEY GB_ETC_DIR
+	)
+}
+
+# t_auth_hostkey_show_accept -- ticket 20's second defect: a way to accept
+# the host key without an interactive terminal at all. gb_hostkey_show
+# fetches and caches, never asking or writing known_hosts; gb_hostkey_accept
+# commits ONLY the cached material, and only when handed back the exact
+# fingerprint gb_hostkey_show printed for it -- a real key pair is
+# generated here (not the fixed "AAAAtestkey" string the other tests use)
+# so ssh-keygen -lf actually produces a fingerprint to compare, making the
+# match/mismatch assertions below meaningful rather than two empty strings
+# agreeing by accident.
+t_auth_hostkey_show_accept() {
+	(
+		. "$share/lib.sh"; . "$share/auth.sh"
+
+		_gb_hk_key="$work/hostkey-show-key"
+		rm -f "$_gb_hk_key" "$_gb_hk_key.pub"
+		ssh-keygen -t ed25519 -N '' -f "$_gb_hk_key" >/dev/null
+		GB_TEST_SSH_HOSTKEY="example.com $(cat "$_gb_hk_key.pub")"; export GB_TEST_SSH_HOSTKEY
+
+		GB_ETC_DIR="$work/etc-hk-show1"; export GB_ETC_DIR
+		unset GB_TEST_SSH_HOSTKEY_UNSET_MARKER
+		_gb_hk_saved="$GB_TEST_SSH_HOSTKEY"
+		unset GB_TEST_SSH_HOSTKEY
+		out=$( ( gb_hostkey_show unreachable.example 22 ) 2>/dev/null )
+		eq 'show on an unreachable host returns 2' '2' "$?"
+		eq 'and prints nothing' '' "$out"
+		GB_TEST_SSH_HOSTKEY="$_gb_hk_saved"; export GB_TEST_SSH_HOSTKEY
+
+		out=$(gb_hostkey_show example.com 22 2>/dev/null)
+		eq 'show on a reachable, untrusted host returns 0' '0' "$?"
+		case "$out" in
+			pending\ example.com\ 22\ *) ok 'and reports pending with a fingerprint' ;;
+			*) no 'and reports pending with a fingerprint' "$out" ;;
+		esac
+		_gb_hk_fp=$(printf '%s\n' "$out" | cut -d' ' -f4-)
+		if [ -s "$GB_ETC_DIR/hostkey_pending" ]; then
+			ok 'and caches the fetched key on disk'
+		else
+			no 'and caches the fetched key on disk' 'hostkey_pending missing'
+		fi
+		if [ -e "$GB_ETC_DIR/known_hosts" ]; then
+			no 'show never writes known_hosts by itself' 'known_hosts exists'
+		else
+			ok 'show never writes known_hosts by itself'
+		fi
+
+		out=$(gb_hostkey_accept example.com 22 'not the right fingerprint' 2>&1)
+		eq 'accept with a mismatched fingerprint returns 4' '4' "$?"
+		if [ -e "$GB_ETC_DIR/known_hosts" ]; then
+			no 'and a mismatch never writes known_hosts' 'known_hosts exists'
+		else
+			ok 'and a mismatch never writes known_hosts'
+		fi
+		if [ -s "$GB_ETC_DIR/hostkey_pending" ]; then
+			ok 'and the pending cache survives a rejected attempt'
+		else
+			no 'and the pending cache survives a rejected attempt' 'hostkey_pending gone'
+		fi
+
+		gb_hostkey_accept example.com 22 "$_gb_hk_fp" >/dev/null 2>&1
+		eq 'accept with the exact shown fingerprint returns 0' '0' "$?"
+		contains 'and known_hosts now carries the cached key' "$(cat "$_gb_hk_key.pub")" \
+			"$(cat "$GB_ETC_DIR/known_hosts" 2>/dev/null)"
+		if [ -e "$GB_ETC_DIR/hostkey_pending" ]; then
+			no 'and the pending cache is consumed' 'hostkey_pending still exists'
+		else
+			ok 'and the pending cache is consumed'
+		fi
+
+		out=$(gb_hostkey_accept example.com 22 "$_gb_hk_fp" 2>&1)
+		eq 'accepting again with nothing pending returns 1' '1' "$?"
+
+		out=$(gb_hostkey_show example.com 22 2>/dev/null)
+		eq 'show on an already-trusted host reports trusted, not a fresh fingerprint' \
+			'trusted example.com 22' "$out"
+
+		unset GB_TEST_SSH_HOSTKEY GB_ETC_DIR
+	)
+}
+
 t_askpass() {
 	(
 		GB_SHARE="$share"; export GB_SHARE
@@ -3894,6 +4001,90 @@ t_cli_test_hostkey_declined() {
 	unset GB_TEST_SSH_HOSTKEY GB_ETC_DIR
 }
 
+# t_cli_test_hostkey_needs_confirmation -- ticket 20's headline bug,
+# exercised through the full CLI rather than auth.sh directly: a reachable,
+# untrusted host key with NO stdin at all -- exactly gbrpc_test's own
+# `"$GB_BIN" test </dev/null` shape -- must read as "needs confirmation",
+# never as "was not accepted" (a real, typed decline, t_cli_test_hostkey_
+# declined above) and never blame the operator for a question nobody asked.
+t_cli_test_hostkey_needs_confirmation() {
+	GB_ETC_DIR="$work/etc-t-hk-noask"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=git@example.com:o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+	GB_TEST_SSH_HOSTKEY='example.com ssh-ed25519 AAAAtestkey'; export GB_TEST_SSH_HOSTKEY
+	out=$(cli test </dev/null 2>&1)
+	eq 'no interactive input to confirm a host key exits 3' '3' "$?"
+	contains 'and the message asks for confirmation, not a verdict' 'needs confirmation' "$out"
+	case "$out" in
+		*'was not accepted'*) no 'and never claims the operator declined' "$out" ;;
+		*) ok 'and never claims the operator declined' ;;
+	esac
+	unset GB_TEST_SSH_HOSTKEY GB_ETC_DIR
+}
+
+# t_cli_hostkey_not_ssh -- `hostkey` only makes sense for an ssh:// remote
+# (an https:// one authenticates with a token, not a host key); refused
+# with exit 2, the same "invalid config for what was asked" bucket
+# gb_validate_config itself uses elsewhere.
+t_cli_hostkey_not_ssh() {
+	GB_ETC_DIR="$work/etc-t-hk-https"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+	out=$(cli hostkey show 2>&1)
+	eq 'hostkey show on an https remote exits 2' '2' "$?"
+	contains 'and explains there is no host key for this transport' 'not ssh' "$out"
+	unset GB_ETC_DIR
+}
+
+# t_cli_hostkey_show_accept_roundtrip -- ticket 20's second defect, end to
+# end through the CLI exactly as the rpcd plugin will drive it: `hostkey
+# show` with no stdin at all (there is none to read -- this command never
+# asks anything), then `hostkey accept <fingerprint>` with the fingerprint
+# copied verbatim out of `show`'s own JSON, then a plain `test` (still with
+# no stdin) that now succeeds without ever prompting. A real key pair is
+# generated so ssh-keygen actually produces a fingerprint to round-trip,
+# instead of two empty strings agreeing by accident.
+t_cli_hostkey_show_accept_roundtrip() {
+	GB_ETC_DIR="$work/etc-t-hk-rt"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=git@example.com:o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+
+	_gb_hk_key="$work/cli-hostkey-key"
+	rm -f "$_gb_hk_key" "$_gb_hk_key.pub"
+	ssh-keygen -t ed25519 -N '' -f "$_gb_hk_key" >/dev/null
+	GB_TEST_SSH_HOSTKEY="example.com $(cat "$_gb_hk_key.pub")"; export GB_TEST_SSH_HOSTKEY
+
+	out=$(cli hostkey show </dev/null 2>&1)
+	eq 'hostkey show on an untrusted host exits 0 with no stdin needed' '0' "$?"
+	contains 'and reports trusted:false' '"trusted": false' "$out"
+	_gb_hk_fp=$(printf '%s' "$out" | sed -n 's/.*"fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	if [ -n "$_gb_hk_fp" ]; then
+		ok 'and includes a non-empty fingerprint'
+	else
+		no 'and includes a non-empty fingerprint' "$out"
+	fi
+
+	out=$(cli hostkey accept 'not the right fingerprint' </dev/null 2>&1)
+	eq 'accepting the wrong fingerprint exits 4' '4' "$?"
+
+	out=$(cli hostkey accept "$_gb_hk_fp" </dev/null 2>&1)
+	eq 'accepting the exact fingerprint shown exits 0' '0' "$?"
+	contains 'and confirms it' '"ok": true' "$out"
+
+	out=$(cli hostkey show </dev/null 2>&1)
+	eq 'hostkey show now exits 0' '0' "$?"
+	contains 'and reports trusted:true' '"trusted": true' "$out"
+
+	GB_TEST_GIT_RC=0; export GB_TEST_GIT_RC
+	out=$(cli test </dev/null 2>&1)
+	eq 'test connection now passes without any stdin at all' '0' "$?"
+	contains 'and reports success' 'reachable and authenticated' "$out"
+
+	unset GB_TEST_SSH_HOSTKEY GB_TEST_GIT_RC GB_ETC_DIR
+}
+
 t_cli_test_ok() {
 	GB_ETC_DIR="$work/etc-t6"; export GB_ETC_DIR
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
@@ -5058,6 +5249,54 @@ t_rpcd_long_methods_return_immediately() {
 	contains 'restore with no device is refused with a reason, never backgrounded blind' '"reason"' "$out"
 }
 
+# t_rpcd_hostkey_show_accept -- ticket 20's one new rpcd method, driven
+# exactly the way LuCI's Settings page will: `hostkey` with no fingerprint
+# (show), then again with the fingerprint copied out of that JSON (accept),
+# proving the whole web-only path -- no stdin anywhere in this test, unlike
+# gb_accept_hostkey's own interactive prompt. Synchronous, unlike run/test/
+# restore above: a single SSH dial (ConnectTimeout=15) for show, no network
+# call at all for accept.
+t_rpcd_hostkey_show_accept() {
+	GB_ETC_DIR="$work/rpcd-etc-hostkey"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=git@example.com:o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+
+	_gb_hk_key="$work/rpcd-hostkey-key"
+	rm -f "$_gb_hk_key" "$_gb_hk_key.pub"
+	ssh-keygen -t ed25519 -N '' -f "$_gb_hk_key" >/dev/null
+	GB_TEST_SSH_HOSTKEY="example.com $(cat "$_gb_hk_key.pub")"; export GB_TEST_SSH_HOSTKEY
+
+	out=$(rpcd_call hostkey)
+	assert_json 'hostkey (show) is valid JSON' "$out"
+	contains 'and reports trusted: false' '"trusted": false' "$out"
+	_gb_hk_fp=$(printf '%s' "$out" | sed -n 's/.*"fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	if [ -n "$_gb_hk_fp" ]; then
+		ok 'and carries a non-empty fingerprint'
+	else
+		no 'and carries a non-empty fingerprint' "$out"
+	fi
+
+	out=$(rpcd_call hostkey '{ "fingerprint": "not the right one" }')
+	assert_json 'hostkey (wrong fingerprint) is valid JSON' "$out"
+	contains 'a mismatched fingerprint is refused with a reason, not silently accepted' '"reason"' "$out"
+
+	# Not assert_json'd: gb_hostkey_accept's own success line is a gb_log
+	# notice, which -- same as gb_keygen's (t_rpcd_pubkey_before_and_after_
+	# keygen's own established pattern for this) -- lands on stderr ahead
+	# of the JSON body in this 2>&1 capture. The plugin's own real stdout
+	# (what ubus actually delivers) is JSON-only; only this test's own
+	# capture style mixes the two streams.
+	out=$(rpcd_call hostkey "$(printf '{ "fingerprint": "%s" }' "$_gb_hk_fp")")
+	contains 'the exact fingerprint shown is accepted' '"ok": true' "$out"
+
+	out=$(rpcd_call hostkey)
+	assert_json 'hostkey (show again) is valid JSON' "$out"
+	contains 'and now reports trusted: true' '"trusted": true' "$out"
+
+	unset GB_TEST_SSH_HOSTKEY GB_ETC_DIR
+}
+
 # t_rpcd_history_and_diff -- against a REAL bare repository (interfaces.md:
 # the one sanctioned exception to stubbing git, same as gitio.sh/restore.sh
 # above), because history/diff (R163i) are this ticket's own on-demand
@@ -5391,6 +5630,8 @@ run_test 'auth.sh: gb_git_env' t_auth_git_env
 run_test 'auth.sh: gb_keygen' t_auth_keygen
 run_test 'auth.sh: gb_pubkey' t_auth_pubkey
 run_test 'auth.sh: gb_accept_hostkey' t_auth_accept_hostkey
+run_test 'auth.sh: gb_accept_hostkey -- EOF is not a decline' t_auth_accept_hostkey_eof
+run_test 'auth.sh: gb_hostkey_show / gb_hostkey_accept' t_auth_hostkey_show_accept
 run_test 'askpass.sh: answers prompts with the token' t_askpass
 run_test 'gitio.sh: gb_remote_head on a branchless repository' t_gitio_remote_head_no_branch
 run_test 'gitio.sh: gb_remote_head against an unreachable repository' t_gitio_remote_head_unreachable
@@ -5433,6 +5674,9 @@ run_test 'cli: test -- public repository refused' t_cli_test_public_repo_refused
 run_test 'cli: test -- visibility inconclusive' t_cli_test_visibility_inconclusive
 run_test 'cli: test -- host key unreachable' t_cli_test_hostkey_unreachable
 run_test 'cli: test -- host key declined' t_cli_test_hostkey_declined
+run_test 'cli: test -- host key needs confirmation (no stdin)' t_cli_test_hostkey_needs_confirmation
+run_test 'cli: hostkey -- refused on an https remote' t_cli_hostkey_not_ssh
+run_test 'cli: hostkey -- show/accept round trip, no stdin' t_cli_hostkey_show_accept_roundtrip
 run_test 'cli: test -- accepted host key and working remote' t_cli_test_ok
 run_test 'cli: test -- credentials rejected' t_cli_test_auth_rejected
 run_test 'cli: keygen and pubkey need no remote configuration' t_cli_keygen_pubkey
@@ -5466,6 +5710,7 @@ run_test 'rpcd: call params survive a stdin with no trailing newline (real rpcd 
 run_test 'rpcd: set_secret writes 0600 and never logs the value' t_rpcd_set_secret_perms_and_no_log
 run_test 'rpcd: set_paths validates server-side' t_rpcd_set_paths_validates_serverside
 run_test 'rpcd: run/test/restore return immediately, not after a timeout' t_rpcd_long_methods_return_immediately
+run_test 'rpcd: hostkey -- show/accept round trip' t_rpcd_hostkey_show_accept
 run_test 'rpcd: history and diff against a real bare repository' t_rpcd_history_and_diff
 run_test 'rpcd: history on a branch with no backup yet' t_rpcd_history_no_backup_yet
 run_test 'rpcd: history with no remote configured' t_rpcd_history_unconfigured

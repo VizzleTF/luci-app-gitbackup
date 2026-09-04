@@ -24,6 +24,7 @@
 					"run",
 					"keygen",
 					"test",
+					"hostkey",
 					"set_secret",
 					"set_paths",
 					"restore",

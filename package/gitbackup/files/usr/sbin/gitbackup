@@ -59,6 +59,8 @@ Commands:
   keygen     generate the SSH deploy key
   pubkey     print the deploy key's public key
   test       verify connectivity and remote configuration
+  hostkey    show|accept <fingerprint> -- confirm the remote's SSH host key
+             without an interactive terminal (ticket 20, the web-flow path)
   paths      list [--json]|add|del|audit -- edit /etc/sysupgrade.conf
   restore    restore configuration from a commit
   card       print a recovery card
@@ -264,6 +266,13 @@ cmd_test() {
 		case $? in
 			0) ;;
 			1) gb_die 3 "$_gb_host:$_gb_hk_port host key was not accepted" ;;
+			3)
+				# Ticket 20: no interactive input to ask for confirmation
+				# with (e.g. rpcd's own `gitbackup test </dev/null`) --
+				# NOT the same thing as a real, typed decline (rc 1 above),
+				# and the message says so instead of blaming the operator.
+				gb_die 3 "$_gb_host:$_gb_hk_port host key needs confirmation before this can proceed -- run 'gitbackup hostkey show' (or use the web UI) to see its fingerprint, then 'gitbackup hostkey accept <fingerprint>' to trust it"
+				;;
 			*) gb_die 3 "$_gb_host:$_gb_hk_port host key could not be obtained -- is the network reachable?" ;;
 		esac
 	fi
@@ -303,6 +312,78 @@ _gb_test_classify() {
 			;;
 		*)
 			gb_die 3 "authentication to $GB_URL failed: $_gb_e"
+			;;
+	esac
+}
+
+# cmd_hostkey show|accept <fingerprint> -- ticket 20, the web-flow half of
+# host key acceptance: `gitbackup test`'s own interactive prompt
+# (gb_accept_hostkey) is unreachable from a caller with no stdin at all
+# (rpcd's own `"$GB_BIN" test </dev/null`), so this is the non-interactive
+# path the LuCI Settings page drives instead.
+#
+#   hostkey show             -- dials the remote, prints its fingerprint
+#                                (or "already trusted"), writes nothing
+#   hostkey accept <fp>      -- commits the fingerprint gb_hostkey_show
+#                                cached, but only if <fp> matches it exactly
+#
+# JSON is this command's own boundary (gb_hostkey_show/gb_hostkey_accept
+# below print plain text, same split gb_pubkey/`gitbackup pubkey` already
+# has) so the rpcd plugin can relay this command's stdout unchanged, the
+# same convention `paths list --json`/`history` already use.
+#
+# Only meaningful for an ssh:// remote -- an https:// remote authenticates
+# with a token, not a host key, and has none to show or accept.
+cmd_hostkey() {
+	_gb_hk_sub="${1:-}"
+	[ -n "$_gb_hk_sub" ] && shift
+	_gb_hk_fp="${1:-}"
+
+	_gb_parsed=$(gb_parse_url "$GB_URL") ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+	# shellcheck disable=SC2086  # word-splitting is the point: five fields from one line
+	set -- $_gb_parsed
+	_gb_hk_scheme="$1"
+	_gb_hk_host="$2"
+	_gb_hk_port="$3"
+	[ "$_gb_hk_port" != 0 ] || _gb_hk_port=22
+
+	if [ "$_gb_hk_scheme" != ssh ]; then
+		gb_die 2 "gitbackup.origin.url uses $_gb_hk_scheme://, not ssh:// -- there is no host key to show or accept"
+	fi
+
+	case "$_gb_hk_sub" in
+		show)
+			_gb_hk_out=$(gb_hostkey_show "$_gb_hk_host" "$_gb_hk_port")
+			_gb_hk_rc=$?
+			[ "$_gb_hk_rc" -eq 0 ] ||
+				gb_die 3 "could not reach $_gb_hk_host:$_gb_hk_port to obtain its host key -- is the network reachable?"
+
+			# shellcheck disable=SC2086  # word-splitting is the point
+			set -- $_gb_hk_out
+			_gb_hk_state="$1"
+			if [ "$_gb_hk_state" = trusted ]; then
+				printf '{ "host": %s, "port": %s, "trusted": true }\n' \
+					"$(gb_json_str "$_gb_hk_host")" "$_gb_hk_port"
+			else
+				shift 3
+				_gb_hk_fp_text="$*"
+				printf '{ "host": %s, "port": %s, "trusted": false, "fingerprint": %s }\n' \
+					"$(gb_json_str "$_gb_hk_host")" "$_gb_hk_port" "$(gb_json_str "$_gb_hk_fp_text")"
+			fi
+			;;
+		accept)
+			[ -n "$_gb_hk_fp" ] ||
+				gb_die 2 'gitbackup hostkey accept: a fingerprint argument is required (the exact text "hostkey show" printed)'
+			gb_hostkey_accept "$_gb_hk_host" "$_gb_hk_port" "$_gb_hk_fp"
+			case $? in
+				0) printf '{ "ok": true }\n' ;;
+				4) gb_die 4 "fingerprint for $_gb_hk_host:$_gb_hk_port does not match the pending host key; refusing to record it" ;;
+				*) gb_die 1 "no pending host key for $_gb_hk_host:$_gb_hk_port -- run 'gitbackup hostkey show' first" ;;
+			esac
+			;;
+		*)
+			gb_die 2 "gitbackup hostkey: unknown subcommand '$_gb_hk_sub' (expected show or accept)"
 			;;
 	esac
 }
@@ -1285,6 +1366,10 @@ case "$cmd" in
 	test)
 		gb_validate_config
 		cmd_test
+		;;
+	hostkey)
+		gb_validate_config
+		cmd_hostkey "$@"
 		;;
 	run)
 		gb_validate_config
