@@ -54,12 +54,22 @@ gb_remote_head() {
 	return 0
 }
 
-# gb_fetch_meta <branch> <repodir>
+# gb_fetch_meta <branch> <repodir> [depth]
 #
 # Prepares <repodir> as a scratch, non-bare git repository (created empty
 # the first time; reused as-is on a retry, spec step 14) and fetches only
 # <branch>'s tip -- commit and trees, never blobs, when the remote
 # understands partial clone (`--filter=blob:none`).
+#
+# <depth> defaults to 1 -- this function's original, and still by far its
+# most common, shape: `run`'s own "just the tip" need, every call site in
+# usr/sbin/gitbackup. An explicit empty string ("") skips `--depth`
+# entirely and fetches the branch's whole history instead, which is what
+# restore.sh needs to reach an arbitrary past commit (ticket 18: this
+# parameter is what let restore.sh's own near-identical
+# init/remote-add/fetch sequence for exactly that one case go away, instead
+# of staying a second, hand-maintained copy of this same function that
+# differed from it only in this one flag).
 #
 # Not `--filter=tree:0`, even though that measures smaller in the spec's
 # own table (12 KiB flat vs. 644 KiB for openwrt/luci -- "Проверенные
@@ -104,6 +114,7 @@ gb_remote_head() {
 gb_fetch_meta() {
 	_gb_branch="$1"
 	_gb_repodir="$2"
+	_gb_depth="${3-1}"
 
 	if [ ! -d "$_gb_repodir/.git" ]; then
 		git init -q "$_gb_repodir" 2>/dev/null ||
@@ -114,7 +125,10 @@ gb_fetch_meta() {
 		git --git-dir="$_gb_repodir/.git" remote add origin \
 			"${GB_URL:?gb_fetch_meta: GB_URL is not set}" 2>/dev/null
 
-	_gb_out=$(git --git-dir="$_gb_repodir/.git" fetch --depth=1 --filter=blob:none \
+	_gb_depth_opt=''
+	[ -n "$_gb_depth" ] && _gb_depth_opt="--depth=$_gb_depth"
+	# shellcheck disable=SC2086  # intentional: expands to zero or exactly one token, never unquoted user input
+	_gb_out=$(git --git-dir="$_gb_repodir/.git" fetch $_gb_depth_opt --filter=blob:none \
 		origin "$_gb_branch" 2>&1)
 	_gb_rc=$?
 	if [ "$_gb_rc" -ne 0 ]; then

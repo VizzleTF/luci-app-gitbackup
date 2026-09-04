@@ -41,21 +41,14 @@ gb_manifest_path() {
 # reasoning, neither do version/hostname/device/openwrt/board: none of them
 # describe what restore actually writes back, and comparing them would turn
 # an unrelated hostname change into a spurious commit on the next run.
+#
+# gb_manifest_tail (lib.sh) is the shared reader now: this used to be its
+# own private sed range here, one of three near-identical readers of the
+# same flat manifest.json format that scrub.sh and restore.sh had each
+# grown independently (ticket 18) -- one reader, not three.
 gb_manifest_equal() {
 	[ -r "$1" ] && [ -r "$2" ] || return 1
-	[ "$(_gb_collect_manifest_tail "$1")" = "$(_gb_collect_manifest_tail "$2")" ]
-}
-
-# _gb_collect_manifest_tail <manifest.json> -- everything from "entries"
-# onward, i.e. the entries[] and scrubbed[] arrays plus the closing brace.
-#
-# Relies on gb_collect's own fixed layout: "entries" and "scrubbed" are the
-# last two top-level keys and every array item is one line with no nested
-# brackets, so a plain sed range to end-of-file captures exactly the two
-# arrays gb_manifest_equal cares about without a JSON parser this image
-# does not have.
-_gb_collect_manifest_tail() {
-	sed -n '/^  "entries": \[/,$p' "$1"
+	[ "$(gb_manifest_tail "$1")" = "$(gb_manifest_tail "$2")" ]
 }
 
 # gb_collect <outdir>

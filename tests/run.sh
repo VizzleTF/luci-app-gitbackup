@@ -3804,10 +3804,24 @@ t_run_integration_bare_repo() {
 	eq 'run 3 exits 0' '0' "$?"
 	contains 'and reports a new push -- manifest caught the chmod' 'pushed' "$out3"
 
+	# Ticket 18: there used to be a third assertion here too, checking
+	# `git ls-tree` for mode 100644 on the just-chmodded file. It read as
+	# proof the permission-change detector (gb_manifest_equal, comparing
+	# manifest.json's own "mode" field) fired -- but git stores only the
+	# executable bit, and this file has none in either 0600 or 0644, so
+	# `ls-tree` would print 100644 whether or not the detector noticed
+	# anything at all: a chmod-only edit that gb_manifest_equal wrongly
+	# called "unchanged" would still leave a 100644 blob mode sitting
+	# there from run 1, an assertion green by construction, not by
+	# detection. The two checks right above it -- "reports a new push"
+	# and "adds exactly one more commit" -- are the ones that actually
+	# depend on the chmod having been caught: break gb_manifest_equal's
+	# own mode comparison and run 3 answers "no changes" with no new
+	# commit, which is exactly what a mutation test (temporarily making
+	# gb_collect always write mode "644") turns red here. Confirmed
+	# during ticket 18's own work and reverted immediately after.
 	_gt_count3=$(git --git-dir="$_gt_bare" log --oneline device/rt1 | grep -c .)
 	eq 'run 3 adds exactly one more commit' '2' "$_gt_count3"
-	_gt_mode3=$(git --git-dir="$_gt_bare" ls-tree device/rt1 devices/rt1/files/etc/config/network 2>/dev/null | awk '{print $1}')
-	eq 'and the pushed tree now carries the new mode' '100644' "$_gt_mode3"
 	_gt_barchive_calls3=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
 	if [ "$_gt_barchive_calls3" -gt "$_gt_barchive_calls2" ]; then
 		ok 'and the archive IS rebuilt on this real change'
@@ -4956,5 +4970,17 @@ run_test 'packaging: no untracked files under package/gitbackup/files (D02)' t_n
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")
+
+# Ticket 18: a filter that matched no test name used to fall through to
+# "0 passed, 0 failed" and exit 0 -- a run that executed nothing reporting
+# success, the same shape of bug that once made this very counter print
+# "0 failed" over real failures (see the harness comment above `results`).
+# A filter typo (or a test renamed out from under a caller) has to be loud,
+# not a silent no-op that looks exactly like "everything passed".
+if [ "$((passed + failed))" -eq 0 ]; then
+	printf '\n%s matched no test -- ran nothing, which is not success\n' "$only" >&2
+	exit 1
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

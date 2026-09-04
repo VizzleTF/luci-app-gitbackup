@@ -14,11 +14,13 @@
 # bare _gb_ helper name could collide with a sibling module's). Sourced,
 # never executed: nothing here runs at load time.
 #
-# Depends on lib.sh (gb_log, gb_uci_get, gb_json_str is NOT used here --
-# see this file's own JSON readers below) and gitio.sh (gb_remote_head,
-# gb_fetch_meta) already being sourced by the caller -- restore reuses
-# gitio.sh's own proven fetch machinery (a NAMED "origin" remote, a
-# --filter=blob:none fetch) for the common case instead of re-deriving it.
+# Depends on lib.sh (gb_log, gb_uci_get, gb_manifest_field, gb_manifest_each
+# -- gb_json_str is NOT used here, this module only ever reads manifest.json,
+# never writes one) and gitio.sh (gb_remote_head, gb_fetch_meta) already
+# being sourced by the caller -- restore reuses gitio.sh's own proven fetch
+# machinery (a NAMED "origin" remote, a --filter=blob:none fetch, an
+# optional depth) for both the common case and the specific-past-commit one
+# instead of re-deriving either.
 # Does NOT depend on collect.sh or device.sh: the device being restored is
 # whatever the caller passes as an argument, never gb_device_id's own
 # resolution -- a fresh/bare router calling `gitbackup restore --device D`
@@ -119,22 +121,17 @@ gb_restore() {
 		_gb_target="$_gb_tip"
 	else
 		# A specific past commit needs the branch's full history to be
-		# reachable at all -- gb_fetch_meta's own --depth=1 (gitio.sh,
-		# tuned for `run`'s own "just the tip" need) cannot reach it, so
-		# this repeats gb_fetch_meta's init/remote-add shape without the
-		# depth limit rather than changing gitio.sh's contract for a case
-		# it was never meant to serve. Still one branch, not the
-		# repository: "минимально: своя ветка, нужный коммит" (spec).
-		mkdir -p "$_gb_repodir"
-		git init -q "$_gb_repodir" || return 1
-		git -C "$_gb_repodir" remote get-url origin >/dev/null 2>&1 ||
-			git -C "$_gb_repodir" remote add origin "$GB_URL" 2>/dev/null
-		_gb_fe=$(git -C "$_gb_repodir" fetch -q --filter=blob:none origin "$_gb_branch" 2>&1)
-		_gb_fe_rc=$?
-		if [ "$_gb_fe_rc" -ne 0 ]; then
-			gb_log err "gb_restore: git fetch $GB_URL $_gb_branch failed: $_gb_fe"
-			return 3
-		fi
+		# reachable at all -- gb_fetch_meta's own default depth of 1
+		# (gitio.sh, tuned for `run`'s own "just the tip" need) cannot
+		# reach it. Passing it an explicit empty depth skips --depth
+		# entirely instead of this module repeating gb_fetch_meta's
+		# init/remote-add/fetch sequence a second time (ticket 18: this
+		# WAS that second copy, byte-for-byte, before gb_fetch_meta grew
+		# a depth argument). Still one branch, not the repository:
+		# "минимально: своя ветка, нужный коммит" (spec). Same mapping
+		# to exit 3 on any failure as the tip-fetch branch above, whether
+		# gb_fetch_meta failed at init or at the fetch itself.
+		gb_fetch_meta "$_gb_branch" "$_gb_repodir" '' || return 3
 		_gb_target="$_gb_commit"
 	fi
 
@@ -295,68 +292,13 @@ _gb_restore_check_release() {
 	return 0
 }
 
-# _gb_restore_json_str <object> <field> -- <field>'s quoted string value
-# out of one manifest entry object, unescaped for \" and \\ (the only two
-# escapes gb_json_esc, collect.sh's own writer, ever produces for a
-# filesystem path or symlink target -- newlines/tabs/CR do not occur in
-# either). Empty when the field is absent or JSON null.
-_gb_restore_json_str() {
-	_gb_js_obj="$1"
-	_gb_js_field="$2"
-	case "$_gb_js_obj" in
-		*'"'"$_gb_js_field"'":"'*)
-			_gb_js_v="${_gb_js_obj#*\""$_gb_js_field"\":\"}"
-			_gb_js_v="${_gb_js_v%%\"*}"
-			printf '%s' "$_gb_js_v" | sed 's/\\"/"/g; s/\\\\/\\/g'
-			;;
-		*) printf '' ;;
-	esac
-}
-
-# _gb_restore_json_num <object> <field> -- an unquoted numeric field's raw
-# text (mode/uid/gid). Empty when absent, never "0": unlike collect.sh's
-# own _gb_collect_json_num (which needs SOME digit to keep the manifest
-# valid JSON), a missing mode/uid/gid here must not silently become chmod/
-# chown 0 -- the caller skips the operation instead.
-_gb_restore_json_num() {
-	_gb_jn_obj="$1"
-	_gb_jn_field="$2"
-	case "$_gb_jn_obj" in
-		*'"'"$_gb_jn_field"'":'*)
-			_gb_jn_v="${_gb_jn_obj#*\""$_gb_jn_field"\":}"
-			_gb_jn_v="${_gb_jn_v%%[,\}]*}"
-			printf '%s' "$_gb_jn_v"
-			;;
-		*) printf '' ;;
-	esac
-}
-
-# _gb_restore_each_entry <manifest.json> <callback> -- calls
-# "<callback> <json-object>" once per entries[] item, the object
-# unindented and with its trailing comma (if any) already stripped -- the
-# same one-object-per-line, no-nested-brackets shape collect.sh's own
-# gb_manifest_equal already relies on. Reads the file via a plain
-# redirect, not a pipe: POSIX sh only forks a subshell for the pipe form,
-# so a callback's own global-variable accumulation (e.g.
-# _gb_restore_verify_sha's _gb_sha_bad) survives the loop here, unlike
-# collect.sh's _gb_collect_files, which has to write to a file instead for
-# exactly that reason.
-_gb_restore_each_entry() {
-	_gb_re_manifest="$1"
-	_gb_re_cb="$2"
-	_gb_re_in=0
-	while IFS= read -r _gb_re_line || [ -n "$_gb_re_line" ]; do
-		case "$_gb_re_line" in
-			'  "entries": ['*) _gb_re_in=1; continue ;;
-			'  ],') _gb_re_in=0; continue ;;
-		esac
-		[ "$_gb_re_in" -eq 1 ] || continue
-		_gb_re_obj="${_gb_re_line%,}"
-		_gb_re_obj="${_gb_re_obj#    }"
-		[ -n "$_gb_re_obj" ] || continue
-		"$_gb_re_cb" "$_gb_re_obj"
-	done <"$_gb_re_manifest"
-}
+# Field reads and entries[] iteration used to be this module's own private
+# copies (a quoted-string extractor, a bare-numeric one, and a hand-rolled
+# entries[] walker) -- ticket 18 moved all three to lib.sh as
+# gb_manifest_field and gb_manifest_each, shared with collect.sh's
+# gb_manifest_equal and scrub.sh's manifest rewriter instead of each
+# module maintaining its own copy of the same one-object-per-line,
+# no-nested-brackets parsing.
 
 # gb_restore's own hard gate: computes _gb_sha_bad (space-separated bad
 # paths) via _gb_restore_verify_sha_one, then refuses as a whole if
@@ -366,7 +308,7 @@ _gb_restore_verify_sha() {
 	_gb_srcfiles="$1"
 	_gb_manifest="$2"
 	_gb_sha_bad=''
-	_gb_restore_each_entry "$_gb_manifest" _gb_restore_verify_sha_one
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_verify_sha_one
 	if [ -n "$_gb_sha_bad" ]; then
 		gb_log err "gb_restore: sha256 mismatch, refusing to write anything to disk:$_gb_sha_bad"
 		return 1
@@ -380,8 +322,8 @@ _gb_restore_verify_sha_one() {
 		*'"type":"file"'*) ;;
 		*) return 0 ;;
 	esac
-	_gb_path=$(_gb_restore_json_str "$_gb_obj" path)
-	_gb_want=$(_gb_restore_json_str "$_gb_obj" sha256)
+	_gb_path=$(gb_manifest_field "$_gb_obj" path)
+	_gb_want=$(gb_manifest_field "$_gb_obj" sha256)
 	_gb_got=$(sha256sum "$_gb_srcfiles$_gb_path" 2>/dev/null | awk '{print $1}')
 	[ -n "$_gb_got" ] && [ "$_gb_got" = "$_gb_want" ] || _gb_sha_bad="$_gb_sha_bad $_gb_path"
 }
@@ -394,13 +336,13 @@ _gb_restore_verify_sha_one() {
 _gb_restore_print_plan() {
 	_gb_manifest="$1"
 	printf 'The following paths will be written:\n'
-	_gb_restore_each_entry "$_gb_manifest" _gb_restore_plan_one
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_plan_one
 }
 
 _gb_restore_plan_one() {
 	_gb_obj="$1"
-	_gb_type=$(_gb_restore_json_str "$_gb_obj" type)
-	_gb_path=$(_gb_restore_json_str "$_gb_obj" path)
+	_gb_type=$(gb_manifest_field "$_gb_obj" type)
+	_gb_path=$(gb_manifest_field "$_gb_obj" path)
 	_gb_dest="${GB_ROOT:-}$_gb_path"
 	if [ -e "$_gb_dest" ] || [ -L "$_gb_dest" ]; then
 		printf '  overwrite %s (%s)\n' "$_gb_path" "$_gb_type"
@@ -418,7 +360,7 @@ _gb_restore_write_files() {
 	_gb_srcfiles="$1"
 	_gb_manifest="$2"
 	_gb_write_failed=''
-	_gb_restore_each_entry "$_gb_manifest" _gb_restore_write_one
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_write_one
 	[ -z "$_gb_write_failed" ]
 }
 
@@ -428,7 +370,7 @@ _gb_restore_write_one() {
 		*'"type":"file"'*) ;;
 		*) return 0 ;;
 	esac
-	_gb_path=$(_gb_restore_json_str "$_gb_obj" path)
+	_gb_path=$(gb_manifest_field "$_gb_obj" path)
 	_gb_dest="${GB_ROOT:-}$_gb_path"
 	mkdir -p "$(dirname "$_gb_dest")" || { _gb_write_failed=1; return 1; }
 	# -f: busybox cp (unlike GNU/BSD cp) refuses an existing destination
@@ -445,16 +387,16 @@ _gb_restore_write_one() {
 # file -- collect.sh's own R24.1 comment on the same asymmetry).
 _gb_restore_apply_perms() {
 	_gb_manifest="$1"
-	_gb_restore_each_entry "$_gb_manifest" _gb_restore_perm_one
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_perm_one
 }
 
 _gb_restore_perm_one() {
 	_gb_obj="$1"
-	_gb_type=$(_gb_restore_json_str "$_gb_obj" type)
-	_gb_path=$(_gb_restore_json_str "$_gb_obj" path)
-	_gb_mode=$(_gb_restore_json_num "$_gb_obj" mode)
-	_gb_uid=$(_gb_restore_json_num "$_gb_obj" uid)
-	_gb_gid=$(_gb_restore_json_num "$_gb_obj" gid)
+	_gb_type=$(gb_manifest_field "$_gb_obj" type)
+	_gb_path=$(gb_manifest_field "$_gb_obj" path)
+	_gb_mode=$(gb_manifest_field "$_gb_obj" mode)
+	_gb_uid=$(gb_manifest_field "$_gb_obj" uid)
+	_gb_gid=$(gb_manifest_field "$_gb_obj" gid)
 	_gb_dest="${GB_ROOT:-}$_gb_path"
 
 	case "$_gb_type" in
@@ -469,14 +411,14 @@ _gb_restore_perm_one() {
 			# restored in a variable of that exact name (no `local` anywhere
 			# in this codebase, interfaces.md's own convention), and this
 			# helper runs from inside gb_restore's own call chain
-			# (_gb_restore_apply_perms -> _gb_restore_each_entry -> here) --
+			# (_gb_restore_apply_perms -> gb_manifest_each -> here) --
 			# reusing _gb_target here clobbered it, so the FINAL "restored
 			# <device> from <commit>" message printed the last symlink's
 			# target string instead of the commit sha whenever the backup
 			# set contained even one symlink. The restore itself was
 			# unaffected (this ran after every actual write), only the
 			# closing report was wrong.
-			_gb_symtarget=$(_gb_restore_json_str "$_gb_obj" target)
+			_gb_symtarget=$(gb_manifest_field "$_gb_obj" target)
 			mkdir -p "$(dirname "$_gb_dest")" 2>/dev/null
 			rm -f "$_gb_dest" 2>/dev/null
 			ln -s "$_gb_symtarget" "$_gb_dest" 2>/dev/null
@@ -503,31 +445,28 @@ _gb_restore_perm_one() {
 # gb_accept_hostkey's own prompts use), one per line, with a header only
 # once and only if there is at least one. Silent when scrubbed[] is empty
 # -- a private backup restoring cleanly should say nothing extra.
+#
+# gb_manifest_each (lib.sh) walks "scrubbed" the same way
+# _gb_restore_apply_perms's own each-entry call above walks "entries" --
+# this used to be its own hand-rolled entries/scrubbed-array walker,
+# parallel to (and slightly different from) the one gb_restore's other
+# helpers shared, before ticket 18 moved both to lib.sh.
 _gb_restore_print_scrubbed() {
 	_gb_manifest="$1"
-	_gb_scrub_in=0
 	_gb_scrub_any=0
-	while IFS= read -r _gb_line || [ -n "$_gb_line" ]; do
-		case "$_gb_line" in
-			'  "scrubbed": ['*) _gb_scrub_in=1; continue ;;
-			'  ]')
-				[ "$_gb_scrub_in" -eq 1 ] && _gb_scrub_in=0
-				continue
-				;;
-		esac
-		[ "$_gb_scrub_in" -eq 1 ] || continue
-		_gb_obj="${_gb_line%,}"
-		_gb_obj="${_gb_obj#    }"
-		[ -n "$_gb_obj" ] || continue
-		_gb_opt=$(_gb_restore_json_str "$_gb_obj" option)
-		[ -n "$_gb_opt" ] || continue
-		if [ "$_gb_scrub_any" -eq 0 ]; then
-			printf 'The following values were redacted before this backup was pushed -- enter them by hand:\n' >&2
-			_gb_scrub_any=1
-		fi
-		printf '  %s\n' "$_gb_opt" >&2
-	done <"$_gb_manifest"
+	gb_manifest_each "$_gb_manifest" scrubbed _gb_restore_scrubbed_one
 	return 0
+}
+
+_gb_restore_scrubbed_one() {
+	_gb_obj="$1"
+	_gb_opt=$(gb_manifest_field "$_gb_obj" option)
+	[ -n "$_gb_opt" ] || return 0
+	if [ "$_gb_scrub_any" -eq 0 ]; then
+		printf 'The following values were redacted before this backup was pushed -- enter them by hand:\n' >&2
+		_gb_scrub_any=1
+	fi
+	printf '  %s\n' "$_gb_opt" >&2
 }
 
 # _gb_restore_packages <meta-dir> -- --with-packages, best-effort (spec:

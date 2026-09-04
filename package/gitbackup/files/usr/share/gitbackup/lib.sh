@@ -101,6 +101,95 @@ gb_json_bool() {
 	esac
 }
 
+# gb_manifest_field <object> <field>
+#
+# <object> is one manifest.json array item -- exactly one line, no nested
+# brackets, the shape gb_collect (collect.sh) writes and gb_manifest_each
+# (below) hands to its own callback. Prints <field>'s value: unescaped and
+# unquoted for a JSON string (gb_json_esc above is the only writer, and it
+# only ever emits "\"" and "\\" for a filesystem path or symlink target --
+# newlines/tabs/CR do not occur in either), or the raw text up to the next
+# "," or "}" for a bare (numeric) field. Empty when the field is absent, or
+# JSON null -- gb_json_str's own bare-word encoding of an empty string
+# (above), which no caller here ever wants to see as the literal text
+# "null".
+#
+# One reader for what used to be three (ticket 18): collect.sh compared
+# whole manifests with a hand-rolled sed tail (gb_manifest_tail, below, is
+# what that became), restore.sh had two near-identical field extractors of
+# its own (a quoted-string one and a bare-numeric one), and scrub.sh
+# reached for "path" with one more copy of the same parameter-expansion
+# pair, unescaped. Same review finding, same fix, in one place instead of
+# three that could each drift the moment the manifest format ever does.
+gb_manifest_field() {
+	_gb_mf_obj="$1"
+	_gb_mf_field="$2"
+	case "$_gb_mf_obj" in
+		*'"'"$_gb_mf_field"'":"'*)
+			_gb_mf_v="${_gb_mf_obj#*\""$_gb_mf_field"\":\"}"
+			_gb_mf_v="${_gb_mf_v%%\"*}"
+			printf '%s' "$_gb_mf_v" | sed 's/\\"/"/g; s/\\\\/\\/g'
+			;;
+		*'"'"$_gb_mf_field"'":'*)
+			_gb_mf_v="${_gb_mf_obj#*\""$_gb_mf_field"\":}"
+			_gb_mf_v="${_gb_mf_v%%[,\}]*}"
+			[ "$_gb_mf_v" = null ] && _gb_mf_v=''
+			printf '%s' "$_gb_mf_v"
+			;;
+		*) printf '' ;;
+	esac
+}
+
+# gb_manifest_tail <manifest.json> [section]
+#
+# Everything from '  "<section>": [' (default "entries") onward, i.e. that
+# key's own array plus every key written after it, to end of file. Relies
+# on gb_collect's fixed layout (collect.sh): "entries" and "scrubbed" are
+# always the last two top-level keys, one object per line, so this one sed
+# range captures both without a JSON parser this image does not have.
+# gb_manifest_equal (collect.sh) is the one caller: comparing this tail
+# between two manifests is exactly comparing entries[] and scrubbed[]
+# together (spec: "generated не участвует в сравнении манифестов").
+gb_manifest_tail() {
+	sed -n '/^  "'"${2:-entries}"'": \[/,$p' "$1"
+}
+
+# gb_manifest_each <manifest.json> <section> <callback>
+#
+# Calls "<callback> <object>" once per <section>'s array item (e.g.
+# "entries" or "scrubbed"), <object> already unindented and with its
+# trailing comma (present on every item but the last) stripped -- the
+# shape gb_manifest_field expects. Reads the file via a plain redirect, not
+# a pipe: POSIX sh only forks a subshell for the pipe form, so a callback's
+# own global-variable accumulation (no `local` anywhere in this codebase)
+# survives the loop here.
+#
+# A section's own closing line is either '  ],' (something else follows it
+# in the object, e.g. "entries" with "scrubbed" after) or '  ]' (it is the
+# last key, e.g. "scrubbed" itself); both are accepted regardless of which
+# section was asked for, because the two sections never overlap and each
+# one's own opening line is what starts the count in the first place.
+gb_manifest_each() {
+	_gb_me_manifest="$1"
+	_gb_me_section="$2"
+	_gb_me_cb="$3"
+	_gb_me_in=0
+	while IFS= read -r _gb_me_line || [ -n "$_gb_me_line" ]; do
+		case "$_gb_me_line" in
+			'  "'"$_gb_me_section"'": ['*) _gb_me_in=1; continue ;;
+			'  ],' | '  ]')
+				[ "$_gb_me_in" -eq 1 ] && _gb_me_in=0
+				continue
+				;;
+		esac
+		[ "$_gb_me_in" -eq 1 ] || continue
+		_gb_me_obj="${_gb_me_line%,}"
+		_gb_me_obj="${_gb_me_obj#    }"
+		[ -n "$_gb_me_obj" ] || continue
+		"$_gb_me_cb" "$_gb_me_obj"
+	done <"$_gb_me_manifest"
+}
+
 # gb_free_kb <directory>  -- free kilobytes on the filesystem holding it.
 #
 # -P because the default df output wraps long device names onto their own line

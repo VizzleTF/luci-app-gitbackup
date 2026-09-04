@@ -11,7 +11,7 @@
 # sourcing the module over a tree that still has its secrets and checking
 # nothing changed.
 #
-# Depends on lib.sh (gb_log, gb_json_str, gb_uci_get) already being sourced
+# Depends on lib.sh (gb_log, gb_json_str, gb_uci_get, gb_manifest_field) already being sourced
 # by the caller, same convention every other module here uses. Does NOT
 # depend on collect.sh: gb_scrub computes manifest.json's path itself
 # (outdir/manifest.json, the one fixed shape gb_collect ever writes) rather
@@ -352,8 +352,7 @@ _gb_scrub_write_manifest() {
 					# surviving set is known.
 					_gb_obj="${_gb_line%,}"
 					_gb_obj="${_gb_obj#    }"
-					_gb_p="${_gb_obj#*'"path":"'}"
-					_gb_p="${_gb_p%%'"'*}"
+					_gb_p=$(gb_manifest_field "$_gb_obj" path)
 					if [ -s "$_gb_removed" ] && grep -qxF "$_gb_p" "$_gb_removed"; then
 						: # dropped -- hard-excluded, no longer in the tree
 					else
