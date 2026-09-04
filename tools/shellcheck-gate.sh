@@ -24,7 +24,6 @@ set -eu
 
 version='0.11.0'
 root=$(cd "$(dirname "$0")/.." && pwd)
-cache="$root/.cache/shellcheck-$version"
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
@@ -32,6 +31,16 @@ case "$arch" in
 	arm64) arch='aarch64' ;;
 	amd64) arch='x86_64' ;;
 esac
+
+# Keyed by os.arch, not just $version: .cache/ is gitignored but still part
+# of this checkout, so the exact same repo bind-mounted into a Linux
+# container (ticket 28's own debian:stable-slim reproduction, run from a
+# macOS host) would otherwise find a binary a PREVIOUS run already fetched
+# for the host OS sitting right there under the same path and try to run
+# that Mach-O executable under Linux -- confirmed live: "Cannot run macOS
+# (Mach-O) executable in Docker: Exec format error", not a checksum
+# mismatch, because the mismatch check only ever runs on a fresh download.
+cache="$root/.cache/shellcheck-$version.$os.$arch"
 
 case "$os.$arch" in
 	linux.x86_64)    sha='8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198' ;;

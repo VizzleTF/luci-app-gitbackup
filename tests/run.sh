@@ -602,8 +602,20 @@ cat >"$work/bin/df" <<'STUB'
 # whatever machine runs this suite is not a number this test controls.
 # Unset (the default): straight through to the host's real df, same
 # translate-on-request shape as the stat/date stubs above.
+#
+# Ticket 28: this used to be `exec command -p df "$@"`, which always fails
+# under dash ("exec: command: not found") -- `command` is a shell builtin,
+# and exec(3) can only take over the process image with a real executable
+# found on disk. See the date stub's own comment for why the fix is an
+# explicit directory scan rather than `command -p df` without the exec.
 if [ -z "${GB_TEST_DF_KB:-}" ]; then
-	exec command -p df "$@"
+	for _gb_df_dir in /usr/bin /bin; do
+		if [ -x "$_gb_df_dir/df" ]; then
+			exec "$_gb_df_dir/df" "$@"
+		fi
+	done
+	echo "df stub: no real df(1) found in /usr/bin or /bin" >&2
+	exit 127
 fi
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted-on\n'
 printf 'test 1 1 %s 1%% %s\n' "$GB_TEST_DF_KB" "${2:-/tmp}"
@@ -643,8 +655,30 @@ cat >"$work/bin/date" <<'STUB'
 # execs through to it; macOS ships a BSD date with no -d at all, so on
 # Darwin this translates the epoch form to BSD's own `-r <epoch>` (same
 # translate-only-on-Darwin strategy as the stat stub above).
+#
+# Ticket 28: the non-Darwin branch used to be `exec command -p date "$@"`.
+# `command` is a shell builtin -- exec(3) can only replace the process
+# image with a real executable found on disk, so `exec command ...`
+# always fails ("exec: command: not found"), a gap bash papers over (it
+# special-cases a builtin right after `exec` at parse time) but dash --
+# this stub's own interpreter under Ubuntu CI, and /bin/sh on plenty of
+# other Linux hosts -- does not. Dropping just the `exec` and keeping
+# `command -p date "$@"` would dodge that specific crash, but still
+# resolves the real binary via a PATH lookup (`-p`'s own "guaranteed
+# standard PATH"); an explicit directory scan is what this project
+# settled on instead, so the fallback used when a named tool is missing
+# says exactly where it looked, and can never end up resolving to
+# something unexpected ahead of the standard locations. It also, unlike a
+# bare `date`, cannot recurse into this very stub: $work/bin (the stub's
+# own directory) is never one of the directories searched.
 if [ "$(uname -s)" != "Darwin" ]; then
-	exec command -p date "$@"
+	for _gb_date_dir in /usr/bin /bin; do
+		if [ -x "$_gb_date_dir/date" ]; then
+			exec "$_gb_date_dir/date" "$@"
+		fi
+	done
+	echo "date stub: no real date(1) found in /usr/bin or /bin" >&2
+	exit 127
 fi
 epoch=""
 fmt="+%s"
@@ -689,6 +723,20 @@ results="$work/results"
 : >"$results"
 ok() { printf 'PASS\n' >>"$results"; printf '  ok    %s\n' "$1"; }
 no() { printf 'FAIL\n' >>"$results"; printf '  FAIL  %s\n        %s\n' "$1" "$2"; }
+
+# skip <name> <reason> -- ticket 28: this suite always had assertions that
+# quietly do nothing at all when an optional host tool (python3, nc,
+# pgrep) is missing, or when a precondition the test needs cannot be
+# fabricated in the current environment (running as root) -- the count of
+# tests that actually ran differed silently from one host to the next as
+# a result (734 on a fully-equipped macOS dev machine vs. 656 on the
+# minimal debian:stable-slim container this project's CI uses to
+# reproduce Linux locally, and neither run said why). `skip` is the
+# printed, counted alternative: it goes into $results as its own SKIP
+# line (never PASS or FAIL -- a skip is not evidence either way) and
+# prints immediately, so a smaller total is always something the output
+# says plainly, not something left to be noticed by counting.
+skip() { printf 'SKIP\n' >>"$results"; printf '  skip  %s (%s)\n' "$1" "$2"; }
 
 # eq <name> <expected> <actual>
 eq() {
@@ -881,6 +929,8 @@ t_have_net() {
 		# PATH -- gb_have_net's whole job is talking to the real network stack
 		# -- so this exercises the real nc against loopback instead.
 		if ! command -v nc >/dev/null 2>&1; then
+			skip 'gb_have_net fails against a port nothing listens on' 'nc not found on PATH'
+			skip 'gb_have_net succeeds against an open port' 'nc not found on PATH'
 			return
 		fi
 
@@ -938,6 +988,8 @@ time.sleep(3)
 			fi
 			kill "$listener_pid" 2>/dev/null
 			wait "$listener_pid" 2>/dev/null
+		else
+			skip 'gb_have_net succeeds against an open port' 'python3 not found on PATH'
 		fi
 	)
 }
@@ -1020,7 +1072,10 @@ STUB
 t_have_net_no_leaked_watchdog() {
 	(
 		. "$share/lib.sh"
-		command -v pgrep >/dev/null 2>&1 || return 0
+		if ! command -v pgrep >/dev/null 2>&1; then
+			skip 'gb_have_net leaves no orphaned watchdog process behind' 'pgrep not found on PATH'
+			return 0
+		fi
 		gb_have_net 127.0.0.1 1
 		sleep 0.3
 		if pgrep -f '^sleep 5$' >/dev/null 2>&1; then
@@ -1437,6 +1492,9 @@ t_collect_json_special_chars() {
 				no 'manifest.json stays valid JSON with quotes, spaces and non-ASCII in a path' \
 					"$(cat "$gb_manifest_file")"
 			fi
+		else
+			skip 'manifest.json stays valid JSON with quotes, spaces and non-ASCII in a path' \
+				'python3 not found on PATH'
 		fi
 		contains 'the quote in the path is escaped, not left to break the JSON' \
 			'\"name\"' "$(cat "$gb_manifest_file")"
@@ -2682,7 +2740,19 @@ t_gitio_shared_branch_preserves_other_device() {
 
 		GB_PREFIX='devices/rt1'; export GB_PREFIX
 		_gt_tree_sha=$(gb_build_tree "$_gt_repodir" "$_gt_tree")
-		_gt_commit=$(GIT_DIR="$_gt_repodir/.git" git commit-tree "$_gt_tree_sha" -p "$GB_PARENT" -m 'rt1 backup')
+		# GIT_AUTHOR_*/GIT_COMMITTER_* explicit, same as gb_commit_push
+		# itself (gitio.sh) -- this is a raw `git commit-tree` the test
+		# calls directly, not through gb_commit_push, so it does not
+		# inherit that function's own env vars and is just as exposed as
+		# any other git invocation to a host with no git identity
+		# configured at all. Confirmed on Linux CI: git's own auto-detect
+		# fails outright there ("fatal: unable to auto-detect email
+		# address") because the container's root user has no gecos entry
+		# to derive one from, whereas a macOS dev account always has one --
+		# an environment difference this test has no business depending on.
+		_gt_commit=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@e.st \
+			GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@e.st \
+			GIT_DIR="$_gt_repodir/.git" git commit-tree "$_gt_tree_sha" -p "$GB_PARENT" -m 'rt1 backup')
 		git --git-dir="$_gt_repodir/.git" push -q "$GB_URL" "$_gt_commit:refs/heads/shared"
 
 		_gt_rt1=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt1/files/etc/config/network" 2>/dev/null)
@@ -3504,18 +3574,43 @@ STUB
 		chmod +x "$work/cp-logger/cp"
 
 		out=$(PATH="$work/cp-logger:$PATH" gb_restore rt1 '' --yes 2>&1)
-		eq 'restore still exits non-zero (etc/locked/hosts really did not get written)' '1' "$?"
-		contains 'and names the path the preflight refused' 'etc/locked/hosts' "$out"
+		_rt_rc=$?
+		# Ticket 28: chmod 555 only makes a directory unwritable to an
+		# UNPRIVILEGED process -- access(2) (what `[ -w ]`, and therefore
+		# _gb_restore_check_writable, is built on) grants W_OK to a real
+		# uid of 0 regardless of permission bits, so root's own cp
+		# genuinely succeeds against this "locked" directory, exactly as
+		# it would on the router itself (gitbackup always runs as root
+		# there too -- there is no other user). That is not a bug in
+		# restore.sh: the write really does go through for root, so
+		# refusing it ahead of time would be the wrong answer, a false
+		# preflight failure over a path cp could actually have written.
+		# It does mean this half of the precondition -- same as the
+		# st_dev/bind-mount half already documented above as
+		# stand-verified only -- cannot be fabricated from a root test
+		# runner (the default identity inside a plain `docker run`, unlike
+		# a macOS dev shell or GitHub Actions' own non-root runner user).
+		if [ "$(id -u)" = 0 ]; then
+			skip 'restore still exits non-zero (etc/locked/hosts really did not get written)' \
+				'running as root -- chmod cannot revoke this process'\''s own write access'
+			skip 'and names the path the preflight refused' \
+				'running as root -- chmod cannot revoke this process'\''s own write access'
+			skip 'cp was never invoked for the locked path -- the preflight skipped it ahead of time' \
+				'running as root -- chmod cannot revoke this process'\''s own write access'
+		else
+			eq 'restore still exits non-zero (etc/locked/hosts really did not get written)' '1' "$_rt_rc"
+			contains 'and names the path the preflight refused' 'etc/locked/hosts' "$out"
 
-		case "$(cat "$_rt_cp_log")" in
-			*etc/locked/hosts*)
-				no 'cp was never invoked for the locked path -- the preflight skipped it ahead of time' \
-					"it was: $(cat "$_rt_cp_log")"
-				;;
-			*)
-				ok 'cp was never invoked for the locked path -- the preflight skipped it ahead of time'
-				;;
-		esac
+			case "$(cat "$_rt_cp_log")" in
+				*etc/locked/hosts*)
+					no 'cp was never invoked for the locked path -- the preflight skipped it ahead of time' \
+						"it was: $(cat "$_rt_cp_log")"
+					;;
+				*)
+					ok 'cp was never invoked for the locked path -- the preflight skipped it ahead of time'
+					;;
+			esac
+		fi
 		contains 'but cp WAS invoked for the other, writable path' 'etc/config/network' "$(cat "$_rt_cp_log")"
 
 		eq 'and that other path still got the manifest'"'"'s mode despite the skip' \
@@ -3699,6 +3794,8 @@ print(calendar.timegm(time.strptime('$gb_out2', '%Y-%m-%d %H:%M')))
 				no 'every-minute expression answers within the next minute of now' \
 					"now=$gb_now answer_epoch=$gb_out2_epoch diff=${gb_diff}s"
 			fi
+		else
+			skip 'every-minute expression answers within the next minute of now' 'python3 not found on PATH'
 		fi
 
 		gb_cron_next '@daily' >/dev/null 2>&1
@@ -4056,6 +4153,8 @@ t_cli_status_json() {
 		else
 			no 'status prints parseable JSON' "got [$out]"
 		fi
+	else
+		skip 'status prints parseable JSON' 'python3 not found on PATH'
 	fi
 	contains 'status reports enabled' '"enabled": true' "$out"
 	contains 'status reports the device' '"device": "rt1"' "$out"
@@ -4079,6 +4178,8 @@ t_cli_status_default_config() {
 		else
 			no 'status still prints parseable JSON on the default config' "got [$out]"
 		fi
+	else
+		skip 'status still prints parseable JSON on the default config' 'python3 not found on PATH'
 	fi
 	contains 'status reports the config as not configured' '"configured": false' "$out"
 	contains 'status reports the device as unresolved' '"device": null' "$out"
@@ -4525,7 +4626,11 @@ t_cli_run_flock_busy() {
 t_cli_run_space_check_fails() {
 	gb_listener
 	_gl_pid="$GB_LISTENER_PID"
-	[ -n "$_gl_pid" ] || return 0
+	if [ -z "$_gl_pid" ]; then
+		skip 'cli: run -- not enough space in /tmp' \
+			'python3 not found on PATH -- gb_listener needs it for a real listening socket'
+		return 0
+	fi
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
 		"gitbackup.origin.url=https://127.0.0.1:$GB_LISTENER_PORT/o/r.git" \
 		'gitbackup.origin.acknowledged=1'
@@ -4558,7 +4663,11 @@ t_cli_run_space_check_fails() {
 t_run_integration_bare_repo() {
 	gb_listener
 	_gl_pid="$GB_LISTENER_PID"
-	[ -n "$_gl_pid" ] || return 0
+	if [ -z "$_gl_pid" ]; then
+		skip 'run: integration on a real local bare repository (3 runs)' \
+			'python3 not found on PATH -- gb_listener needs it for a real listening socket'
+		return 0
+	fi
 
 	collect_fixture
 	GB_DEVICE=rt1
@@ -5270,11 +5379,15 @@ rpcd_call() {
 	printf '%s\n' "${2:-\{\}}" | rpcd call "$1"
 }
 
-# assert_json <name> <json> -- passes silently (no assertion recorded) when
-# python3 is not on PATH, same "skip rather than fake a result" convention
-# t_cli_status_json already established for this exact tradeoff.
+# assert_json <name> <json> -- ticket 28: used to pass silently (no
+# assertion recorded at all) when python3 is not on PATH; now records a
+# visible, counted skip instead, same "skip rather than fake a result"
+# tradeoff t_cli_status_json already established, just printed.
 assert_json() {
-	command -v python3 >/dev/null 2>&1 || return 0
+	if ! command -v python3 >/dev/null 2>&1; then
+		skip "$1" 'python3 not found on PATH'
+		return 0
+	fi
 	if printf '%s' "$2" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
 		ok "$1"
 	else
@@ -6218,6 +6331,7 @@ run_test 'packaging: no untracked files under package/gitbackup/files (D02)' t_n
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")
+skipped=$(grep -c '^SKIP$' "$results")
 
 # Ticket 18: a filter that matched no test name used to fall through to
 # "0 passed, 0 failed" and exit 0 -- a run that executed nothing reporting
@@ -6225,10 +6339,19 @@ failed=$(grep -c '^FAIL$' "$results")
 # "0 failed" over real failures (see the harness comment above `results`).
 # A filter typo (or a test renamed out from under a caller) has to be loud,
 # not a silent no-op that looks exactly like "everything passed".
-if [ "$((passed + failed))" -eq 0 ]; then
+if [ "$((passed + failed + skipped))" -eq 0 ]; then
 	printf '\n%s matched no test -- ran nothing, which is not success\n' "$only" >&2
 	exit 1
 fi
 
-printf '\n%s passed, %s failed\n' "$passed" "$failed"
+# Ticket 28: the skipped count only ever appears on the summary line when
+# it is non-zero, so a fully-equipped host (every optional tool present,
+# not running as root) prints the exact same "N passed, 0 failed" it
+# always did -- this is additive, not a format change anything downstream
+# has to learn.
+if [ "$skipped" -gt 0 ]; then
+	printf '\n%s passed, %s failed, %s skipped\n' "$passed" "$failed" "$skipped"
+else
+	printf '\n%s passed, %s failed\n' "$passed" "$failed"
+fi
 [ "$failed" -eq 0 ]
