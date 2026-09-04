@@ -4302,6 +4302,94 @@ t_cli_paths_list_add_del() {
 	unset GB_ROOT GB_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
 }
 
+# t_cli_paths_audit -- ticket 21's `paths audit`, moved verbatim out of the
+# rpcd plugin's own gbrpc_audit_paths (never tested there at all -- this is
+# the first test either version of this logic has ever had). /overlay/upper
+# is faked under GB_ROOT the same way collect_fixture fakes the rest of the
+# filesystem; a path already named by sysupgrade -l is not "changed and
+# unbacked", and this package's own secrets directory is hard-excluded
+# regardless of what sysupgrade -l says.
+t_cli_paths_audit() {
+	rm -rf "$work/cli-audit-root"
+	mkdir -p "$work/cli-audit-root/overlay/upper/etc/config" "$work/cli-audit-root/overlay/upper/root"
+	: >"$work/cli-audit-root/overlay/upper/etc/config/network"
+	: >"$work/cli-audit-root/overlay/upper/root/notes.txt"
+	mkdir -p "$work/cli-audit-root/overlay/upper/etc/gitbackup"
+	: >"$work/cli-audit-root/overlay/upper/etc/gitbackup/token"
+	GB_ROOT="$work/cli-audit-root"; export GB_ROOT
+	GB_TEST_SYSUPGRADE_L="$work/cli-audit-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+	printf '/etc/config/network\n' >"$GB_TEST_SYSUPGRADE_L"
+
+	out=$(cli paths audit 2>&1)
+	eq 'paths audit exits 0' '0' "$?"
+	assert_json 'paths audit is valid JSON' "$out"
+	case "$out" in
+		*'/etc/config/network'*) no 'a path sysupgrade -l already covers is not reported' "found in [$out]" ;;
+		*) ok 'a path sysupgrade -l already covers is not reported' ;;
+	esac
+	contains 'a changed-but-not-backed-up path is reported' '/root/notes.txt' "$out"
+	case "$out" in
+		*'/etc/gitbackup'*) no 'this package'\''s own secrets directory is never reported' "found in [$out]" ;;
+		*) ok 'this package'\''s own secrets directory is never reported' ;;
+	esac
+
+	unset GB_ROOT GB_TEST_SYSUPGRADE_L
+}
+
+# t_cli_history_rejects_bad_url -- ticket 21 (R109/D07): `gitbackup
+# history` now runs GB_URL through gb_parse_url before ever touching git,
+# same as cmd_test/cmd_run already did -- unlike the rpcd plugin's own
+# former _gb_rpc_resolve_remote, which took gitbackup.origin.url straight
+# out of UCI with no shape check at all (this ticket's own headline
+# finding). Checked at the CLI level, not only through rpcd, because the
+# CLI is the one place this check now actually lives.
+t_cli_history_rejects_bad_url() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=/not/a/real/remote/url'
+	out=$(cli history 2>&1)
+	eq 'history refuses a URL gb_parse_url does not recognize, exit 2' '2' "$?"
+	contains 'and explains why' 'does not match any supported remote URL form' "$out"
+}
+
+# t_cli_diff_two_arg_rejects_bad_sha -- ticket 21's own explicit acceptance
+# criterion: an argument shaped like an option (leading '-') is rejected
+# by shape, before it can ever reach `git diff` as a bare argument.
+t_cli_diff_two_arg_rejects_bad_sha() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+
+	out=$(cli diff '-upload-pack=touch /tmp/pwned' 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' 2>&1)
+	eq 'diff refuses a "from" that is not a full 40-hex sha, exit 2' '2' "$?"
+	contains 'and names the offending value' "'-upload-pack=touch /tmp/pwned'" "$out"
+	eq 'and no such file was ever created' '0' "$([ -e /tmp/pwned ] && echo 1 || echo 0)"
+
+	out=$(cli diff 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' 'tooshort' 2>&1)
+	eq 'diff refuses a "to" that is too short to be a real sha, exit 2' '2' "$?"
+
+	out=$(cli diff onlyonearg 2>&1)
+	eq 'diff with exactly one argument is refused, exit 2' '2' "$?"
+}
+
+# t_cli_restore_rejects_bad_commit_and_bad_url -- ticket 21: cmd_restore
+# used to hand GB_URL straight to gb_restore's own git ls-remote/fetch/
+# checkout with no gb_parse_url check at all (unlike cmd_test/cmd_run), and
+# --commit was forwarded with no shape check beyond what the caller typed
+# -- restore.sh's own git checkout/cat-file calls would have taken it as a
+# bare argument. Both are now refused by shape before gb_restore ever runs.
+t_cli_restore_rejects_bad_commit_and_bad_url() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+	out=$(cli restore --device rt1 --commit '-x' --yes 2>&1)
+	eq 'restore refuses a --commit that is not a full 40-hex sha or HEAD/empty, exit 2' '2' "$?"
+	contains 'and names the offending value' "'-x'" "$out"
+
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=/not/a/real/remote/url'
+	out=$(cli restore --device rt1 --yes 2>&1)
+	eq 'restore refuses a URL gb_parse_url does not recognize, exit 2' '2' "$?"
+	contains 'and explains why' 'does not match any supported remote URL form' "$out"
+}
+
 # diff_seed_push <bare-repo> <branch> <tree-dir> -- commits <tree-dir>'s
 # own content under devices/rt1/ as the sole commit on <branch>, with
 # plain git (fixture setup, not the code under test -- same reasoning
@@ -4323,24 +4411,30 @@ diff_seed_push() {
 }
 
 # diff_setup -- collect_fixture's own fake router filesystem plus a fresh
-# real local bare repository. cmd_diff's own gb_validate_config never
-# parses GB_URL (unlike cmd_run/cmd_test's gb_parse_url/gb_visibility_ok),
-# so a plain filesystem path is already a valid gitbackup.origin.url here
-# -- no GB_TEST_GIT_REMOTE_URL/PATH swap needed, unlike
-# t_run_integration_bare_repo. Sets $_diff_bare for the calling test.
+# real local bare repository. Ticket 21: cmd_diff now runs GB_URL through
+# gb_parse_url before ever touching git (R109/D07, "URL... на каждом пути"
+# -- this command used to skip that check, unlike cmd_run/cmd_test's own
+# gb_parse_url/gb_visibility_ok), so a plain filesystem path no longer
+# passes as gitbackup.origin.url here -- GB_TEST_GIT_REMOTE_URL/PATH (the
+# git stub, GB_TEST_GIT_REAL=1) swaps a schema-valid https://... for the
+# real local bare-repo path the moment git itself is invoked, same
+# mechanism t_run_integration_bare_repo already relies on. Sets $_diff_bare
+# for the calling test.
 diff_setup() {
 	collect_fixture
 	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
 	_diff_bare="$work/diff-bare.git"
 	rm -rf "$_diff_bare"
 	git init --bare -q "$_diff_bare"
+	GB_TEST_GIT_REMOTE_URL="https://example.org/o/r.git"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_diff_bare"; export GB_TEST_GIT_REMOTE_PATH
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		"gitbackup.origin.url=$_diff_bare" 'gitbackup.origin.branch=device/{device}' \
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL" 'gitbackup.origin.branch=device/{device}' \
 		'gitbackup.main.path_prefix=devices/{device}'
 }
 
 diff_teardown() {
-	unset GB_TEST_GIT_REAL
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH
 }
 
 # t_cli_diff_no_prior_backup -- the branch does not exist yet (first-ever
@@ -4708,6 +4802,42 @@ t_rpcd_acl_matches_plugin() {
 		'1' "$(awk '/"write":/{f=1} f&&/"uci":.*"gitbackup"/{print 1; exit}' "$acl" | grep -c 1)"
 }
 
+# t_rpcd_only_calls_gitbackup -- ticket 21's own headline acceptance
+# criterion, checked structurally rather than by eye (same reasoning
+# t_rpcd_acl_matches_plugin already gives for its own three-way check):
+# "Плагин не вызывает git, sysupgrade и прочие внешние команды напрямую --
+# только gitbackup". gbrpc_history/gbrpc_diff/gbrpc_list_paths/
+# gbrpc_audit_paths are exactly the four methods that used to run `git`/
+# `sysupgrade` themselves; each function's own body (not the file as a
+# whole, whose header comments necessarily still SAY "git"/"sysupgrade" in
+# prose) is extracted and checked for a bare `git`/`sysupgrade` command
+# word, and for actually forwarding to "$GB_BIN" instead of just deleting
+# the call outright -- a body that satisfies the first check by doing
+# nothing at all would be a regression this test must not wave through.
+t_rpcd_only_calls_gitbackup() {
+	plugin="$files/usr/libexec/rpcd/luci.gitbackup"
+	for fn in gbrpc_history gbrpc_diff gbrpc_list_paths gbrpc_audit_paths; do
+		_body=$(sed -n "/^${fn}() {/,/^}/p" "$plugin" | grep -v '^[[:space:]]*#')
+		[ -n "$_body" ] || { no "$fn: function body was found at all" 'sed range matched nothing -- the test itself is broken'; continue; }
+		case "$_body" in
+			*'git '*|*'git	'*)
+				no "$fn calls only \$GB_BIN, never git directly" "found a bare 'git' call in: $_body" ;;
+			*)
+				ok "$fn calls only \$GB_BIN, never git directly" ;;
+		esac
+		case "$_body" in
+			*'sysupgrade '*|*'sysupgrade	'*)
+				no "$fn calls only \$GB_BIN, never sysupgrade directly" "found a bare 'sysupgrade' call in: $_body" ;;
+			*)
+				ok "$fn calls only \$GB_BIN, never sysupgrade directly" ;;
+		esac
+		case "$_body" in
+			*'"$GB_BIN"'*) ok "$fn actually forwards to \$GB_BIN" ;;
+			*) no "$fn actually forwards to \$GB_BIN" "no \"\$GB_BIN\" call found in: $_body" ;;
+		esac
+	done
+}
+
 t_rpcd_status_hides_secret() {
 	GB_ETC_DIR="$work/rpcd-etc-status"; export GB_ETC_DIR
 	mkdir -p "$GB_ETC_DIR"
@@ -4946,6 +5076,13 @@ t_rpcd_history_and_diff() {
 	rm -rf "$_bare" "$_co"
 	git init --bare -q "$_bare"
 	git init -q "$_co"
+	# Ticket 21: `history`/`diff` now run GB_URL through gb_parse_url
+	# (usr/sbin/gitbackup's own cmd_history/cmd_diff) before ever touching
+	# git -- a bare filesystem path no longer qualifies, so a schema-valid
+	# URL is swapped for the real bare path at the git-stub level, same
+	# mechanism diff_setup/t_run_integration_bare_repo already rely on.
+	GB_TEST_GIT_REMOTE_URL="https://example.org/o/r.git"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_bare"; export GB_TEST_GIT_REMOTE_PATH
 	(
 		cd "$_co" || exit 1
 		git config user.email t@t; git config user.name t
@@ -4969,7 +5106,7 @@ t_rpcd_history_and_diff() {
 	_sha_new=$(git -C "$_co" log --format=%H | head -n 1)
 
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		"gitbackup.origin.url=$_bare"
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL"
 
 	out=$(rpcd_call history '{"limit":10}')
 	assert_json 'history is valid JSON' "$out"
@@ -4986,7 +5123,18 @@ t_rpcd_history_and_diff() {
 	out=$(rpcd_call diff '{}')
 	contains 'diff with no from/to is refused with a reason' '"reason"' "$out"
 
-	unset GB_TEST_GIT_REAL
+	# Ticket 21's own explicit acceptance criterion: a from/to shaped like
+	# an option is rejected, not handed to `git diff` unexamined. This used
+	# to be unreachable through this test's own real bare repo (no server
+	# to reach at all, per the ticket's own "не воспроизведён" note) -- now
+	# it never gets that far, because the CLI's _gb_valid_full_sha rejects
+	# the shape before any fetch is attempted.
+	out=$(rpcd_call diff "{\"from\":\"-upload-pack=touch /tmp/pwned\",\"to\":\"$_sha_new\"}")
+	contains 'a "from" shaped like an option is refused with a reason, never reaching git' \
+		'"reason"' "$out"
+	eq 'and no such file was ever created' '0' "$([ -e /tmp/pwned ] && echo 1 || echo 0)"
+
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH
 }
 
 # t_rpcd_history_no_backup_yet -- a configured remote whose branch has
@@ -4999,13 +5147,18 @@ t_rpcd_history_no_backup_yet() {
 	rm -rf "$_bare"
 	git init --bare -q "$_bare"
 
+	# Ticket 21: see t_rpcd_history_and_diff's own comment -- gb_parse_url
+	# now runs before git does, so a bare path no longer qualifies.
+	GB_TEST_GIT_REMOTE_URL="https://example.org/o/r.git"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_bare"; export GB_TEST_GIT_REMOTE_PATH
+
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		"gitbackup.origin.url=$_bare"
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL"
 
 	out=$(rpcd_call history '{}')
 	assert_json 'history on a branchless repo is still valid JSON' "$out"
 	contains 'and answers an empty commit list, not an error' '"commits": []' "$out"
-	unset GB_TEST_GIT_REAL
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH
 }
 
 t_rpcd_history_unconfigured() {
@@ -5290,6 +5443,10 @@ run_test 'cli: log shows run timings (A01)' t_cli_log
 run_test 'cli: collect --out DIR' t_cli_collect
 run_test 'cli: card --out FILE' t_cli_card
 run_test 'cli: paths list/add/del' t_cli_paths_list_add_del
+run_test 'cli: paths audit -- overlay/upper vs sysupgrade -l' t_cli_paths_audit
+run_test 'cli: history refuses a URL gb_parse_url does not recognize' t_cli_history_rejects_bad_url
+run_test 'cli: diff <from> <to> refuses a sha shaped like an option' t_cli_diff_two_arg_rejects_bad_sha
+run_test 'cli: restore refuses a bad --commit and a bad URL' t_cli_restore_rejects_bad_commit_and_bad_url
 run_test 'cli: diff -- no prior backup shows everything as new' t_cli_diff_no_prior_backup
 run_test 'cli: diff -- unchanged system prints nothing' t_cli_diff_unchanged_is_empty
 run_test 'cli: diff -- catches a chmod git cannot see, plus added/removed paths (D03)' t_cli_diff_catches_permission_and_membership_changes
@@ -5298,6 +5455,7 @@ run_test 'card.sh: ssh remote recommends --ssh-key, web link coerced to https' t
 run_test 'card.sh: never leaks the token or deploy key onto the card' t_card_no_secret
 run_test 'card.sh: never dies on a malformed or missing GB_URL/GB_DEVICE' t_card_never_dies
 run_test 'rpcd: ACL matches the plugin dispatcher, both directions' t_rpcd_acl_matches_plugin
+run_test 'rpcd: history/diff/list_paths/audit_paths call only $GB_BIN, never git/sysupgrade directly' t_rpcd_only_calls_gitbackup
 run_test 'rpcd: status never leaks the secret, only token_set' t_rpcd_status_hides_secret
 run_test 'rpcd: log wraps the CLI'\''s own text' t_rpcd_log_wraps_cli_text
 run_test 'rpcd: pubkey before and after keygen' t_rpcd_pubkey_before_and_after_keygen

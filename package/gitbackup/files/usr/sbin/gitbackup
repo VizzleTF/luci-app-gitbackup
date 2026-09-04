@@ -53,11 +53,13 @@ Commands:
   run        run a backup now
   status     print current status as JSON
   collect    build a backup set and manifest without pushing
-  diff       show what changed since the last successful run
+  diff       show what changed since the last successful run, or [from to]
+             (two full commit shas) for the diff between two backups
+  history    list this device's own backup commits as JSON
   keygen     generate the SSH deploy key
   pubkey     print the deploy key's public key
   test       verify connectivity and remote configuration
-  paths      list|add|del -- edit /etc/sysupgrade.conf
+  paths      list [--json]|add|del|audit -- edit /etc/sysupgrade.conf
   restore    restore configuration from a commit
   card       print a recovery card
   log        show recent gitbackup log entries
@@ -78,6 +80,28 @@ gb_cron_looks_valid() {
 	[ "$#" -eq 5 ] || return 1
 	case "$1" in '@'*) return 1 ;; esac
 	return 0
+}
+
+# _gb_valid_full_sha <value> -- exactly 40 lowercase hex characters: the one
+# shape a commit identifier coming from this package's own git plumbing
+# ever takes (gitio.sh's `git log --format=%H`/gb_remote_head/
+# gb_commit_push, all full sha1 hexdigests, never abbreviated). Ticket 21
+# (R110/R111/R109, D07): `cmd_diff`'s two-commit form and `cmd_restore`'s
+# --commit both hand a caller-supplied string straight to a bare `git`
+# argument (diff/checkout/cat-file) -- checking only "non-empty" let a value
+# shaped like an option ("-o value", "--upload-pack=...") reach that
+# argument unexamined. This is deliberately a single shared check: "одна
+# точка входа -- одна точка валидации" applies just as much to two callers
+# inside the same binary as it does to the rpcd plugin bypassing this
+# binary entirely (this ticket's own headline finding).
+_gb_valid_full_sha() {
+	case "$1" in
+		''|*[!0-9a-f]*) return 1 ;;
+	esac
+	# The charset check above only rules out the WRONG characters; a 7-char
+	# abbreviated sha or a 41-char typo both pass it just as easily as a
+	# real 40-char sha does, so length is checked separately here.
+	[ "${#1}" -eq 40 ]
 }
 
 # gb_validate_config -- resolves the device name and enforces the config rules
@@ -668,11 +692,110 @@ cmd_restore() {
 	GB_URL=$(gb_uci_get gitbackup.origin.url)
 	[ -n "$GB_URL" ] || gb_die 2 'gitbackup.origin.url: empty, a repository url is required'
 
+	# Ticket 21 (R109/D07): every path that ends up calling git on GB_URL
+	# validates its shape first, no exceptions -- restore used to skip
+	# straight from UCI to gb_restore's own git ls-remote/fetch/checkout,
+	# the same "URL used without gb_parse_url" gap the rpcd plugin's own
+	# resolve-remote bypass had (see the plugin's own header comment).
+	gb_parse_url "$GB_URL" >/dev/null ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+
+	# _gb_r_commit reaches restore.sh as a bare `git checkout <commit> --
+	# <prefix>`/`git cat-file -e <commit>^{commit}` argument whenever it is
+	# not empty -- same "the form the product defines, not just non-empty"
+	# rule as cmd_diff's two-commit form below (_gb_valid_full_sha):
+	# empty/"HEAD" (the branch tip, the only form bootstrap's own Path 1
+	# ever passes) or a full 40-hex commit sha, nothing else, so a value
+	# shaped like an option can never reach that git argument.
+	if [ -n "$_gb_r_commit" ] && [ "$_gb_r_commit" != HEAD ]; then
+		_gb_valid_full_sha "$_gb_r_commit" ||
+			gb_die 2 "gitbackup restore: --commit '$_gb_r_commit' must be a full 40-character commit sha, or omitted/HEAD for the branch tip"
+	fi
+
 	eval "$(gb_git_env)"
 
 	# shellcheck disable=SC2086  # word-splitting is the point: $_gb_r_flags is zero or more bare flag tokens
 	gb_restore "$_gb_r_device" "$_gb_r_commit" $_gb_r_flags
 	exit $?
+}
+
+# ---------------------------------------------------------------------------
+# history (ticket 21, R110/R111/D07) -- the branch's own commit list (sha,
+# subject, changed paths). Moved here from the rpcd plugin, which used to
+# run this exact fetch/log/diff-tree sequence itself, straight against
+# gitbackup.origin.url out of UCI, without ever validating its shape first
+# (the operator's own words: "вызывать под капотом может любые команды
+# роутера. желательно только gitbackup") -- `gitbackup` is now the only
+# thing that ever spawns git for this, same as run/test/diff/restore above,
+# and GB_URL is run through gb_parse_url before any of them do.
+# ---------------------------------------------------------------------------
+cmd_history() {
+	_gb_h_limit=20
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--limit) shift; _gb_h_limit="${1:-20}"; shift ;;
+			--limit=*) _gb_h_limit="${1#--limit=}"; shift ;;
+			*) shift ;;
+		esac
+	done
+	case "$_gb_h_limit" in ''|*[!0-9]*) _gb_h_limit=20 ;; esac
+
+	gb_parse_url "$GB_URL" >/dev/null ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+
+	_gb_h_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')") ||
+		gb_die 2 'gitbackup.origin.branch could not be expanded'
+
+	eval "$(gb_git_env)"
+
+	_gb_h_head=$(gb_remote_head "$_gb_h_branch")
+	_gb_h_head_rc=$?
+	[ "$_gb_h_head_rc" -eq 0 ] || gb_die 3 "gitbackup history: could not reach $GB_URL to resolve $_gb_h_branch"
+	if [ -z "$_gb_h_head" ]; then
+		printf '{ "branch": %s, "commits": [] }\n' "$(gb_json_str "$_gb_h_branch")"
+		return 0
+	fi
+
+	_gb_h_dir=$(mktemp -d "${TMPDIR:-/tmp}/gitbackup-history.XXXXXX") ||
+		gb_die 1 'gitbackup history: cannot create a scratch directory under /tmp'
+	trap 'rm -rf "$_gb_h_dir"' EXIT INT TERM
+
+	# Full history, not gitio.sh's own --depth=1 default: history needs
+	# every backup's own commit, not just the tip. An explicit empty depth
+	# skips --depth entirely (gb_fetch_meta's own header, ticket 18) --
+	# reused rather than a second fetch implementation, same as restore.sh's
+	# own past-commit case.
+	gb_fetch_meta "$_gb_h_branch" "$_gb_h_dir" '' ||
+		gb_die 3 "gitbackup history: could not fetch $_gb_h_branch from $GB_URL"
+
+	_gb_h_tab=$(printf '\t')
+	printf '{ "branch": %s, "commits": [' "$(gb_json_str "$_gb_h_branch")"
+	_gb_h_first=1
+	git -C "$_gb_h_dir" log -n "$_gb_h_limit" --format='%H%x09%s' FETCH_HEAD 2>/dev/null |
+		while IFS= read -r _gb_h_line || [ -n "$_gb_h_line" ]; do
+			_gb_h_sha="${_gb_h_line%%"$_gb_h_tab"*}"
+			_gb_h_subject="${_gb_h_line#*"$_gb_h_tab"}"
+			[ "$_gb_h_first" -eq 1 ] || printf ','
+			_gb_h_first=0
+			printf '{ "sha": %s, "subject": %s, "changed": [' \
+				"$(gb_json_str "$_gb_h_sha")" "$(gb_json_str "$_gb_h_subject")"
+			_gb_h_cfirst=1
+			# --root: a ROOT commit has no parent to diff against, and
+			# diff-tree prints nothing at all without it -- confirmed live
+			# against a device's own first-ever backup commit.
+			git -C "$_gb_h_dir" diff-tree --no-commit-id --name-only -r --root "$_gb_h_sha" 2>/dev/null |
+				while IFS= read -r _gb_h_path || [ -n "$_gb_h_path" ]; do
+					[ -n "$_gb_h_path" ] || continue
+					[ "$_gb_h_cfirst" -eq 1 ] || printf ','
+					_gb_h_cfirst=0
+					printf '%s' "$(gb_json_str "$_gb_h_path")"
+				done
+			printf '] }'
+		done
+	printf '] }\n'
+
+	rm -rf "$_gb_h_dir"
+	trap - EXIT INT TERM
 }
 
 # ---------------------------------------------------------------------------
@@ -873,7 +996,71 @@ _gb_diff_compare() {
 		done
 }
 
+# cmd_diff [<from> <to>] -- two shapes sharing one name, on purpose (spec/
+# ticket 21 both treat "diff" as one question with two possible baselines,
+# never two commands): with no arguments, the original ticket-17 question
+# ("live config vs the last commit", read field-by-field out of
+# manifest.json -- see this function's own header history above). With
+# exactly two arguments, ticket 21's own addition -- a plain `git diff`
+# between two already-committed shas (History's per-backup diff, moved here
+# from the rpcd plugin, which used to run this same `git diff` itself with
+# no shape check on either argument at all beyond non-empty).
+#
+# Both shapes read GB_URL, so it is validated here exactly once for either
+# one (R109/D07: "URL... на каждом пути, где потом вызывается git, на всех
+# путях без исключения") -- this command used to skip that check entirely,
+# unlike cmd_test/cmd_run, and accepted whatever gitbackup.origin.url held.
 cmd_diff() {
+	gb_parse_url "$GB_URL" >/dev/null ||
+		gb_die 2 "gitbackup.origin.url: '$GB_URL' does not match any supported remote URL form"
+
+	if [ "$#" -eq 2 ]; then
+		_gb_d_from="$1"
+		_gb_d_to="$2"
+		_gb_valid_full_sha "$_gb_d_from" ||
+			gb_die 2 "gitbackup diff: 'from' must be a full 40-character commit sha, got '$_gb_d_from'"
+		_gb_valid_full_sha "$_gb_d_to" ||
+			gb_die 2 "gitbackup diff: 'to' must be a full 40-character commit sha, got '$_gb_d_to'"
+
+		_gb_dc_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')") ||
+			gb_die 2 'gitbackup.origin.branch could not be expanded'
+
+		_gb_dc_work=$(mktemp -d "${TMPDIR:-/tmp}/gitbackup-diffc.XXXXXX") ||
+			gb_die 1 'gitbackup diff: cannot create a working directory under /tmp'
+		trap 'rm -rf "$_gb_dc_work"' EXIT INT TERM
+
+		eval "$(gb_git_env)"
+
+		# Full history, not gitio.sh's own --depth=1 default: either commit
+		# named here can be arbitrarily far back on the branch (History's own
+		# window is independent of gb_fetch_meta's "just the tip" default).
+		gb_fetch_meta "$_gb_dc_branch" "$_gb_dc_work" '' ||
+			gb_die 3 "gitbackup diff: could not fetch $_gb_dc_branch from $GB_URL"
+
+		# --end-of-options: belt-and-suspenders alongside _gb_valid_full_sha
+		# above -- a 40-lowercase-hex string can never start with '-' to
+		# begin with, but this is the same "где значение всё же идёт в
+		# команду -- ставь --" (ticket 21) this project already applies to
+		# every user-influenced argument that reaches a real command. Not a
+		# bare "--": for `git diff`, that specifically means "end of
+		# revisions, everything after is a pathspec", which would make git
+		# treat $_gb_d_from/$_gb_d_to as PATHS instead of commits -- the
+		# option-parsing-only guard (git >= 2.24, both the dev host's 2.51
+		# and the owlab stand's 2.50.1 qualify) is what --end-of-options is
+		# for instead.
+		_gb_dc_out=$(git -C "$_gb_dc_work" diff --end-of-options "$_gb_d_from" "$_gb_d_to" 2>&1)
+		_gb_dc_rc=$?
+		if [ "$_gb_dc_rc" -ne 0 ]; then
+			gb_die 3 "gitbackup diff: $_gb_dc_out"
+		fi
+		printf '%s\n' "$_gb_dc_out"
+		return 0
+	fi
+
+	if [ "$#" -ne 0 ]; then
+		gb_die 2 'gitbackup diff: expected either no arguments (live config vs the last commit) or exactly two (from-sha to-sha)'
+	fi
+
 	_gb_d_branch=$(gb_expand "$(gb_uci_get gitbackup.origin.branch 'device/{device}')")
 	_gb_d_prefix=$(gb_expand "$(gb_uci_get gitbackup.main.path_prefix 'devices/{device}')")
 
@@ -916,6 +1103,21 @@ cmd_diff() {
 	return 0
 }
 
+# _gb_paths_json_array <lines> -- prints <lines> (one path per line, blanks
+# skipped) as a JSON array body (no surrounding brackets, so a caller can
+# wrap it in whichever field name applies). Shared by `paths list --json`
+# and `paths audit` below -- both used to be built ad hoc, once each, in
+# the rpcd plugin itself.
+_gb_paths_json_array() {
+	_gb_pja_first=1
+	printf '%s\n' "$1" | while IFS= read -r _gb_pja_p || [ -n "$_gb_pja_p" ]; do
+		[ -n "$_gb_pja_p" ] || continue
+		[ "$_gb_pja_first" -eq 1 ] || printf ','
+		printf '%s' "$(gb_json_str "$_gb_pja_p")"
+		_gb_pja_first=0
+	done
+}
+
 # ---------------------------------------------------------------------------
 # paths (ticket 17, spec "LuCI -> Paths") -- list|add|del over
 # /etc/sysupgrade.conf, backed entirely by paths.sh (gb_paths_list/
@@ -925,6 +1127,12 @@ cmd_diff() {
 # configured yet, and a freshly installed router (no gitbackup.origin.url
 # at all) must still be able to use it -- gb_validate_config would refuse
 # that with exit 2 for a reason this command does not share.
+#
+# `list --json` and `audit` (ticket 21, R110/D07) are the JSON shapes the
+# rpcd plugin's own gbrpc_list_paths/gbrpc_audit_paths used to build
+# themselves, calling `sysupgrade -l` (and, for audit, walking
+# /overlay/upper) directly -- moved here so gitbackup remains the only
+# thing that ever runs those commands ("желательно только gitbackup").
 # ---------------------------------------------------------------------------
 cmd_paths() {
 	_gb_p_sub="${1:-list}"
@@ -932,8 +1140,24 @@ cmd_paths() {
 
 	case "$_gb_p_sub" in
 		list)
-			gb_paths_list
-			printf '# total: %s KB (effective sysupgrade set, sysupgrade -l)\n' "$(gb_paths_size_kb)"
+			if [ "${1:-}" = '--json' ]; then
+				# Two distinct sets, on purpose: "paths" is gb_paths_list's
+				# own raw, unexpanded content of GB_SYSUPGRADE_CONF -- a
+				# directory line included verbatim, and the only thing
+				# `set_paths` (the rpcd plugin) may ever write back.
+				# "effective" is plain `sysupgrade -l`, already expanded --
+				# read-only, for sizing/audit, never round-tripped into a
+				# save (see gbrpc_list_paths's own header comment for why
+				# collapsing the two into one field used to silently narrow
+				# a directory entry down to a moment-of-save file list).
+				_gb_p_raw=$(gb_paths_list)
+				_gb_p_eff=$(sysupgrade -l 2>/dev/null)
+				printf '{ "paths": [%s], "effective": [%s] }\n' \
+					"$(_gb_paths_json_array "$_gb_p_raw")" "$(_gb_paths_json_array "$_gb_p_eff")"
+			else
+				gb_paths_list
+				printf '# total: %s KB (effective sysupgrade set, sysupgrade -l)\n' "$(gb_paths_size_kb)"
+			fi
 			;;
 		add)
 			_gb_p_path="${1:-}"
@@ -952,8 +1176,43 @@ cmd_paths() {
 			gb_paths_del "$_gb_p_path"
 			printf 'removed %s\n' "$_gb_p_path"
 			;;
+		audit)
+			# G02: what changed on this router since the base image but is
+			# NOT in the backup set. /overlay/upper is the standard OpenWrt
+			# overlayfs upper layer; anything under it that is neither
+			# hard-excluded (/etc/gitbackup/**, this package's own secrets)
+			# nor already named by `sysupgrade -l` is exactly "changed and
+			# not backed up".
+			#
+			# VERIFY: measured only that /overlay/upper does not exist
+			# inside the owlab package-test container this file's own tests
+			# run in (a plain extracted rootfs, never booted through
+			# OpenWrt's own fstab/mount_root) -- not confirmed against a
+			# real overlay mount on the owrt2512 stand. Falls back to an
+			# empty list rather than erroring when the directory is absent.
+			_gb_p_upper="${GB_ROOT:-}/overlay/upper"
+			if [ ! -d "$_gb_p_upper" ]; then
+				printf '{ "paths": [] }\n'
+				return 0
+			fi
+			_gb_p_backed=$(sysupgrade -l 2>/dev/null)
+			printf '{ "paths": ['
+			_gb_p_first=1
+			( cd "$_gb_p_upper" 2>/dev/null && find . \( -type f -o -type l \) ) |
+				while IFS= read -r _gb_p_rel || [ -n "$_gb_p_rel" ]; do
+					_gb_p_abs="/${_gb_p_rel#./}"
+					case "$_gb_p_abs" in
+						/etc/gitbackup | /etc/gitbackup/*) continue ;;
+					esac
+					printf '%s\n' "$_gb_p_backed" | grep -qxF "$_gb_p_abs" && continue
+					[ "$_gb_p_first" -eq 1 ] || printf ','
+					_gb_p_first=0
+					printf '%s' "$(gb_json_str "$_gb_p_abs")"
+				done
+			printf '] }\n'
+			;;
 		*)
-			gb_die 2 "gitbackup paths: unknown subcommand '$_gb_p_sub' (expected list, add or del)"
+			gb_die 2 "gitbackup paths: unknown subcommand '$_gb_p_sub' (expected list, add, del or audit)"
 			;;
 	esac
 }
@@ -1044,9 +1303,13 @@ case "$cmd" in
 		gb_validate_config
 		case "$cmd" in
 			collect) cmd_collect "$@" ;;
-			diff) cmd_diff ;;
+			diff) cmd_diff "$@" ;;
 			card) cmd_card "$@" ;;
 		esac
+		;;
+	history)
+		gb_validate_config
+		cmd_history "$@"
 		;;
 	paths)
 		# No gb_validate_config -- see cmd_paths's own header comment.
