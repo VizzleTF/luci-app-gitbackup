@@ -121,14 +121,48 @@ gb_json_bool() {
 # reached for "path" with one more copy of the same parameter-expansion
 # pair, unescaped. Same review finding, same fix, in one place instead of
 # three that could each drift the moment the manifest format ever does.
+#
+# The quoted-string branch walks the value one character at a time instead
+# of cutting at the first literal '"' with a parameter-expansion pattern:
+# `${v%%\"*}` (the consolidation's first shape, inherited from ticket 08's
+# _gb_restore_json_str) stops at the FIRST quote character in the string
+# with no regard for whether a backslash precedes it, so a path containing
+# a literal quote -- which gb_json_esc above escapes as `\"`, and which
+# sysupgrade places no restriction against (only whitespace in a path is
+# unsupported) -- truncates there instead of at its own closing quote. The
+# writer can produce `\"`; the reader must be able to consume it. Walking
+# character by character and tracking "the previous character was an
+# unescaped backslash" finds the real closing quote and un-escapes `\"`/`\\`
+# in the same pass, so the trailing `sed` cleanup this branch used to need
+# is gone -- there is nothing left for it to fix up.
 gb_manifest_field() {
 	_gb_mf_obj="$1"
 	_gb_mf_field="$2"
 	case "$_gb_mf_obj" in
 		*'"'"$_gb_mf_field"'":"'*)
-			_gb_mf_v="${_gb_mf_obj#*\""$_gb_mf_field"\":\"}"
-			_gb_mf_v="${_gb_mf_v%%\"*}"
-			printf '%s' "$_gb_mf_v" | sed 's/\\"/"/g; s/\\\\/\\/g'
+			_gb_mf_rest="${_gb_mf_obj#*\""$_gb_mf_field"\":\"}"
+			_gb_mf_v=''
+			_gb_mf_bs=0
+			while [ -n "$_gb_mf_rest" ]; do
+				_gb_mf_ch="${_gb_mf_rest%"${_gb_mf_rest#?}"}"
+				_gb_mf_rest="${_gb_mf_rest#?}"
+				if [ "$_gb_mf_bs" -eq 1 ]; then
+					# Whatever follows a backslash is emitted as itself:
+					# gb_json_esc only ever escapes '"' and '\' into a
+					# manifest string field, so this covers both cases
+					# without needing to special-case which one it was.
+					_gb_mf_v="$_gb_mf_v$_gb_mf_ch"
+					_gb_mf_bs=0
+					continue
+				fi
+				# shellcheck disable=SC1003  # the '\' branch matches a literal backslash, not an escaped quote
+				case "$_gb_mf_ch" in
+					'\') _gb_mf_bs=1 ;;
+					'"') break ;;
+					*) _gb_mf_v="$_gb_mf_v$_gb_mf_ch" ;;
+				esac
+			done
+			printf '%s' "$_gb_mf_v"
 			;;
 		*'"'"$_gb_mf_field"'":'*)
 			_gb_mf_v="${_gb_mf_obj#*\""$_gb_mf_field"\":}"

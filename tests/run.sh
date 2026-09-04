@@ -30,6 +30,25 @@ share="$files/usr/share/gitbackup"
 work=$(mktemp -d "${TMPDIR:-/tmp}/gitbackup-tests.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT INT TERM
 
+# `gitbackup run`'s own $WORK (usr/sbin/gitbackup), gb_restore's scratch
+# workdir (restore.sh) and `gitbackup diff`'s scratch dir all create their
+# scratch directory under "${TMPDIR:-/tmp}", never a hardcoded "/tmp" --
+# usr/sbin/gitbackup's own step-4/5 comment already calls this "a TMPDIR
+# override (tests/run.sh's own seam...)". It was never actually turned on
+# here, which is why two `sh tests/run.sh` invocations running at the same
+# time could see, and even pick up, EACH OTHER's scratch directories
+# through a bare `find /tmp -name 'gitbackup*'` -- confirmed live:
+# launched together with no wait between them, one invocation's
+# t_restore_fetches_only_its_own_branch found an empty ref list (it had
+# grabbed the OTHER invocation's workdir) and its leftover-/tmp count in
+# t_run_integration_bare_repo came back one directory high, for the same
+# reason. $work above is unique per invocation (mktemp -d), so pointing
+# every scratch directory the code under test creates at $work instead of
+# the shared system /tmp removes the collision instead of racing to avoid
+# it: nothing under $work is ever visible to a different invocation.
+TMPDIR="$work"
+export TMPDIR
+
 only="${1:-}"
 
 # A missing module has to stop the run here. Every test body is a subshell, and
@@ -731,6 +750,105 @@ b')"
 	)
 }
 
+# t_manifest_field/tail/each -- the manifest reader (ticket 18's consolidation
+# of what collect.sh, scrub.sh and restore.sh each used to parse on their
+# own) had no test of its own before this one: the suite only ever exercised
+# it indirectly through gb_collect/gb_scrub/gb_restore, which is why the
+# escaped-quote truncation below went unnoticed even after it started
+# reaching all three modules at once.
+t_manifest_field() {
+	(
+		. "$share/lib.sh"
+		eq 'a quoted value with an escaped quote reads back whole, not truncated at it' \
+			'/etc/weird "name".conf' \
+			"$(gb_manifest_field '{"path":"/etc/weird \"name\".conf","type":"file"}' path)"
+		eq 'an escaped backslash in a quoted value is also un-escaped' \
+			'C:\path\file' \
+			"$(gb_manifest_field '{"path":"C:\\path\\file","type":"file"}' path)"
+		eq 'a bare numeric field is returned as-is' '600' \
+			"$(gb_manifest_field '{"path":"/etc/x","mode":600}' mode)"
+		eq 'JSON null becomes an empty string, not the literal "null"' '' \
+			"$(gb_manifest_field '{"path":"/etc/x","sha256":null}' sha256)"
+		eq 'a field absent from the object is empty' '' \
+			"$(gb_manifest_field '{"path":"/etc/x"}' mode)"
+	)
+}
+
+t_manifest_tail() {
+	(
+		. "$share/lib.sh"
+		gb_m="$work/manifest_tail.json"
+		cat >"$gb_m" <<'EOF'
+{
+  "version": "1",
+  "generated": "2026-01-01T00:00:00Z",
+  "entries": [
+    {"path":"/etc/a","type":"file"},
+    {"path":"/etc/b","type":"file"}
+  ],
+  "scrubbed": [
+    {"path":"/etc/config/wireless","option":"wireless.default_radio0.key"}
+  ]
+}
+EOF
+		gb_tail="$(gb_manifest_tail "$gb_m")"
+		contains 'the default section (entries) starts the tail at its own array' \
+			'"path":"/etc/a"' "$gb_tail"
+		contains 'the tail runs to end of file, past entries into scrubbed' \
+			'"path":"/etc/config/wireless"' "$gb_tail"
+		case "$gb_tail" in
+			'"version"'*|*'"version"'*) no 'the tail excludes everything before the section' "$gb_tail" ;;
+			*) ok 'the tail excludes everything before the section' ;;
+		esac
+		gb_scrubbed_tail="$(gb_manifest_tail "$gb_m" scrubbed)"
+		contains 'a named section starts its own tail at that array instead' \
+			'"path":"/etc/config/wireless"' "$gb_scrubbed_tail"
+		case "$gb_scrubbed_tail" in
+			*'"path":"/etc/a"'*) no 'a named tail excludes the section written before it' "$gb_scrubbed_tail" ;;
+			*) ok 'a named tail excludes the section written before it' ;;
+		esac
+	)
+}
+
+t_manifest_each() {
+	(
+		. "$share/lib.sh"
+		gb_m="$work/manifest_each.json"
+		cat >"$gb_m" <<'EOF'
+{
+  "version": "1",
+  "entries": [
+    {"path":"/etc/a","type":"file"},
+    {"path":"/etc/b","type":"file"}
+  ],
+  "scrubbed": [
+  ]
+}
+EOF
+		gb_count=0
+		gb_last=''
+		# shellcheck disable=SC2329  # invoked indirectly, by name, from inside gb_manifest_each below
+		gb_each_cb() {
+			gb_count=$((gb_count + 1))
+			gb_last="$1"
+		}
+		gb_manifest_each "$gb_m" entries gb_each_cb
+		# A plain pipe into this loop would fork a subshell, and gb_count's
+		# increments inside it would vanish the moment that subshell exits
+		# (the same trap this suite's own harness works around for $passed/
+		# $failed) -- exactly why gb_manifest_each reads via `done <"$file"`
+		# rather than `cat "$file" | while ...`. Asserting the count is
+		# 2, not 0, is what would catch that regression.
+		eq 'the callback runs once per array item, not lost to a subshell' '2' "$gb_count"
+		eq 'the trailing comma is stripped before the callback sees the object' \
+			'{"path":"/etc/b","type":"file"}' "$gb_last"
+
+		gb_count=0
+		gb_manifest_each "$gb_m" scrubbed gb_each_cb
+		eq 'an empty section calls the callback zero times' '0' "$gb_count"
+	)
+}
+
 t_uci_get() {
 	(
 		. "$share/lib.sh"
@@ -780,21 +898,44 @@ t_have_net() {
 		# same as this suite's other python3-gated assertions, when python3
 		# is not installed.
 		if command -v python3 >/dev/null 2>&1; then
-			# The sleep after listen() is not padding: without it the
-			# process exits and closes the socket the instant it is bound,
-			# and gb_have_net loses the race against its own connect().
-			python3 -c '
+			# Port 0 -- an OS-assigned free port, not a literal -- is what
+			# makes this safe against a second `sh tests/run.sh` running at
+			# the same time: a fixed literal here (this test's own port
+			# 18291 before the fix) is a real, reproducible collision the
+			# instant two invocations' listeners overlap in time, since
+			# SO_REUSEADDR only forgives a socket's OWN prior TIME_WAIT
+			# state and does nothing for a second process trying to bind a
+			# port a first one is actively listening on. The listener
+			# writes its OS-assigned port to a file once bound (after
+			# listen(), so the file appearing is also proof the socket is
+			# already accepting) and this polls for that file instead of a
+			# fixed sleep, which only ever encoded "how long Python usually
+			# takes to start", not a guarantee.
+			gb_hn_port_file="$work/t_have_net_port.$$"
+			rm -f "$gb_hn_port_file"
+			python3 -c "
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 18291))
+s.bind(('127.0.0.1', 0))
 s.listen(1)
+with open('$gb_hn_port_file', 'w') as f:
+    f.write(str(s.getsockname()[1]))
 time.sleep(3)
-' &
+" &
 			listener_pid=$!
-			sleep 0.5
-			gb_have_net 127.0.0.1 18291
-			eq 'gb_have_net succeeds against an open port' '0' "$?"
+			gb_hn_waited=0
+			while [ ! -s "$gb_hn_port_file" ] && [ "$gb_hn_waited" -lt 50 ]; do
+				sleep 0.1
+				gb_hn_waited=$((gb_hn_waited + 1))
+			done
+			if [ -s "$gb_hn_port_file" ]; then
+				gb_have_net 127.0.0.1 "$(cat "$gb_hn_port_file")"
+				eq 'gb_have_net succeeds against an open port' '0' "$?"
+			else
+				no 'gb_have_net succeeds against an open port' \
+					'listener never reported its port within 5s'
+			fi
 			kill "$listener_pid" 2>/dev/null
 			wait "$listener_pid" 2>/dev/null
 		fi
@@ -2967,6 +3108,12 @@ t_restore_fetches_only_its_own_branch() {
 		gb_restore rt1 '' --yes >"$work/restore-fetch-out.txt" 2>&1
 		eq 'gb_restore exits 0' '0' "$?"
 
+		# $TMPDIR is this run's own $work (see the top of this file), not
+		# the shared system /tmp, so this scan can only ever see scratch
+		# directories THIS invocation created -- a bare `find /tmp -name
+		# 'gitbackup-restore.*' | head -n1` used to be able to pick up a
+		# DIFFERENT `sh tests/run.sh` invocation's own directory instead
+		# when two ran at the same time.
 		_rt_workdir=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'gitbackup-restore.*' 2>/dev/null | head -n 1)
 		if [ -n "$_rt_workdir" ] && [ -d "$_rt_workdir/repo" ]; then
 			_rt_refs=$(git -C "$_rt_workdir/repo" for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null)
@@ -3794,22 +3941,40 @@ t_cli_keygen_pubkey() {
 	unset GB_ETC_DIR
 }
 
-# gb_listener <port> -- a background TCP listener on 127.0.0.1:<port>, for
-# `run` tests that need gb_have_net's real connect to succeed with no real
-# git/HTTP protocol behind it. Sets GB_LISTENER_PID (or leaves it empty when
-# python3 is not installed, same skip-gracefully convention t_have_net's
-# open-port case already uses -- nc itself never needs the far end to
-# accept(), only for the TCP handshake to complete, so a bare listen() is
-# enough). NOT `pid=$(gb_listener ...)`: a command substitution runs this
-# function in a subshell, and the background job it starts dies the moment
-# that subshell exits to produce the substitution's output -- confirmed
-# live, `ps` on the "returned" PID immediately after shows it already gone.
-# Caller kills it (`kill "$GB_LISTENER_PID"; wait "$GB_LISTENER_PID"
-# 2>/dev/null`) once done.
+# gb_listener -- a background TCP listener on 127.0.0.1, on an OS-assigned
+# free port, for `run` tests that need gb_have_net's real connect to
+# succeed with no real git/HTTP protocol behind it. Sets GB_LISTENER_PID
+# and GB_LISTENER_PORT (both empty when python3 is not installed, same
+# skip-gracefully convention t_have_net's open-port case already uses --
+# nc itself never needs the far end to accept(), only for the TCP
+# handshake to complete, so a bare listen() is enough).
+#
+# Used to take the port as an argument (a caller-chosen literal, 18491 and
+# 18492 respectively). A reviewer running `sh tests/run.sh` twice back to
+# back with no wait between them hit two failures that a lone rerun did not
+# reproduce -- two overlapping invocations both trying to bind the same
+# fixed port. SO_REUSEADDR only forgives a socket's OWN prior TIME_WAIT
+# state; it does nothing for a second, different process binding a port a
+# first one is actively listening on. Binding port 0 (the OS picks an
+# unused one) and reading it back via getsockname() removes the collision
+# instead of shrinking its odds -- two invocations can no longer be handed
+# the same port by construction. The port is written to a file only after
+# listen() has already been called, so the file appearing is itself proof
+# the socket is accepting, not just bound; the caller polls for that file
+# instead of a fixed sleep, which only ever encoded "how long Python
+# usually takes to start," not a guarantee.
+#
+# NOT `pid=$(gb_listener)`: a command substitution runs this function in a
+# subshell, and the background job it starts dies the moment that subshell
+# exits to produce the substitution's output -- confirmed live, `ps` on the
+# "returned" PID immediately after shows it already gone. Caller kills it
+# (`kill "$GB_LISTENER_PID"; wait "$GB_LISTENER_PID" 2>/dev/null`) once done.
 gb_listener() {
 	GB_LISTENER_PID=''
+	GB_LISTENER_PORT=''
 	command -v python3 >/dev/null 2>&1 || return 0
-	_gl_port="$1"
+	_gl_port_file="$work/gb_listener_port.$$"
+	rm -f "$_gl_port_file"
 	# Actually accept()s and closes every connection, rather than just
 	# listen()ing and never draining the backlog: measured live on macOS,
 	# a listener that never accepts leaves the very first connect() to it
@@ -3820,8 +3985,10 @@ gb_listener() {
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $_gl_port))
+s.bind(('127.0.0.1', 0))
 s.listen(5)
+with open('$_gl_port_file', 'w') as f:
+    f.write(str(s.getsockname()[1]))
 s.settimeout(30)
 end = time.time() + 30
 while time.time() < end:
@@ -3832,6 +3999,20 @@ while time.time() < end:
         break
 " &
 	GB_LISTENER_PID=$!
+	_gl_waited=0
+	while [ ! -s "$_gl_port_file" ] && [ "$_gl_waited" -lt 50 ]; do
+		sleep 0.1
+		_gl_waited=$((_gl_waited + 1))
+	done
+	if [ -s "$_gl_port_file" ]; then
+		GB_LISTENER_PORT=$(cat "$_gl_port_file")
+	else
+		# Never bound within 5s -- treat it the same as python3 missing
+		# rather than hand the caller an empty port to connect to.
+		kill "$GB_LISTENER_PID" 2>/dev/null
+		wait "$GB_LISTENER_PID" 2>/dev/null
+		GB_LISTENER_PID=''
+	fi
 }
 
 t_cli_run_flock_busy() {
@@ -3845,12 +4026,11 @@ t_cli_run_flock_busy() {
 }
 
 t_cli_run_space_check_fails() {
-	gb_listener 18491
+	gb_listener
 	_gl_pid="$GB_LISTENER_PID"
 	[ -n "$_gl_pid" ] || return 0
-	sleep 1
 	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
-		'gitbackup.origin.url=https://127.0.0.1:18491/o/r.git' \
+		"gitbackup.origin.url=https://127.0.0.1:$GB_LISTENER_PORT/o/r.git" \
 		'gitbackup.origin.acknowledged=1'
 	GB_TEST_DF_KB=100; export GB_TEST_DF_KB
 	out=$(cli run 2>&1)
@@ -3879,10 +4059,9 @@ t_cli_run_space_check_fails() {
 # real server anywhere in this test. gb_have_net still needs a REAL open
 # port to connect to, which is what gb_listener is for.
 t_run_integration_bare_repo() {
-	gb_listener 18492
+	gb_listener
 	_gl_pid="$GB_LISTENER_PID"
 	[ -n "$_gl_pid" ] || return 0
-	sleep 1
 
 	collect_fixture
 	GB_DEVICE=rt1
@@ -3900,7 +4079,7 @@ t_run_integration_bare_repo() {
 	rm -rf "$_gt_bare"
 	git init --bare -q "$_gt_bare"
 
-	GB_TEST_GIT_REMOTE_URL='https://127.0.0.1:18492/o/r.git'; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_URL="https://127.0.0.1:$GB_LISTENER_PORT/o/r.git"; export GB_TEST_GIT_REMOTE_URL
 	GB_TEST_GIT_REMOTE_PATH="$_gt_bare"; export GB_TEST_GIT_REMOTE_PATH
 	GB_TEST_SYSUPGRADE_B_LOG="$work/sysupgrade-b.log"; export GB_TEST_SYSUPGRADE_B_LOG
 	: >"$GB_TEST_SYSUPGRADE_B_LOG"
@@ -5006,6 +5185,9 @@ t_no_bashisms() {
 # --------------------------------------------------------------------------
 
 run_test 'lib.sh: gb_json_esc' t_json_esc
+run_test 'lib.sh: gb_manifest_field' t_manifest_field
+run_test 'lib.sh: gb_manifest_tail' t_manifest_tail
+run_test 'lib.sh: gb_manifest_each' t_manifest_each
 run_test 'lib.sh: gb_uci_get' t_uci_get
 run_test 'lib.sh: gb_free_kb' t_free_kb
 run_test 'lib.sh: gb_die' t_die
