@@ -39,6 +39,39 @@ gb_paths_list() {
 	return 0
 }
 
+# _gb_paths_is_comment_or_blank <line> -- true (0) when <line> is not a real
+# path entry: empty, or a sysupgrade.conf comment. sysupgrade.conf's own
+# comment syntax is "first character is '#'" -- nothing past that character
+# is ever inspected, so "# /etc/openvpn/" is a commented-out EXAMPLE line,
+# not a disabled entry for /etc/openvpn/, and backs up nothing at all
+# (ticket 26). This is the one and only place that decides what counts as
+# "not an entry" -- gb_paths_entries (what gets listed) and
+# gb_paths_replace_entries (what gets preserved on a full-list write) both
+# call it, so the two can never quietly disagree about the same line.
+_gb_paths_is_comment_or_blank() {
+	case "$1" in
+		'' | '#'*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# gb_paths_entries -- gb_paths_list, filtered down to genuine path entries:
+# blank lines and comments (see _gb_paths_is_comment_or_blank) are dropped.
+# gb_paths_list itself is left alone and stays raw -- ticket 26 chose two
+# functions with two distinct meanings ("what the file literally contains"
+# vs. "what a human's own path list looks like") over one function whose
+# answer would depend on which caller was asking. This is what the LuCI
+# view and `paths list --json`'s new "entries" field are built on: a stock
+# /etc/sysupgrade.conf's four header/example lines are comments, contain
+# zero real entries, and must render as an empty, unremovable list.
+gb_paths_entries() {
+	gb_paths_list | while IFS= read -r _gb_pe_l || [ -n "$_gb_pe_l" ]; do
+		_gb_paths_is_comment_or_blank "$_gb_pe_l" && continue
+		printf '%s\n' "$_gb_pe_l"
+	done
+	return 0
+}
+
 # gb_paths_size_kb -- kilobytes of everything `sysupgrade -l` would
 # actually collect (the full effective set: GB_SYSUPGRADE_CONF union
 # keep.d union changed conffiles -- the union sysupgrade itself computes,
@@ -146,6 +179,20 @@ gb_paths_add() {
 # gb_paths_del <path> -- removes every line equal to <path>, verbatim.
 # Silently succeeds when it was not there to begin with -- same
 # idempotence gb_paths_add already provides, in the other direction.
+#
+# Deliberately NOT routed through gb_paths_validate (ticket 26 checked
+# this): an exact-line removal of something that is not a valid entry is
+# harmless -- there is nothing to protect against by refusing to delete a
+# line that was never going to be backed up in the first place -- and a
+# human running this subcommand by hand is trusted the way `rm` is. This
+# does mean `gitbackup paths del '## some comment'` will happily strip
+# that exact comment line the same way it would any other line; that is
+# an accepted property of a deliberately unvalidated CLI subcommand, not a
+# defect. The actual bug ticket 26 fixed lived one layer up: the LuCI view
+# never called this function at all for its own "Remove" button (it always
+# went through `set_paths`'s full-list replace, see gbrpc_set_paths in
+# usr/libexec/rpcd/luci.gitbackup), and gb_paths_entries below is what
+# stops that button from ever being offered for a comment line again.
 gb_paths_del() {
 	_gb_pd_path="$1"
 	[ -r "$GB_SYSUPGRADE_CONF" ] || return 0
@@ -153,4 +200,39 @@ gb_paths_del() {
 	_gb_pd_tmp="${GB_SYSUPGRADE_CONF}.tmp.$$"
 	grep -vxF "$_gb_pd_path" "$GB_SYSUPGRADE_CONF" >"$_gb_pd_tmp" 2>/dev/null
 	mv "$_gb_pd_tmp" "$GB_SYSUPGRADE_CONF"
+}
+
+# gb_paths_replace_entries <entries> -- rewrites GB_SYSUPGRADE_CONF as:
+# every comment/blank line gb_paths_list already contains, in its original
+# order and wording, completely unchanged -- followed by <entries>
+# (newline-separated, blank lines ignored), one per line, exactly as
+# given. Ticket 13's decision that a full-list write (`set_paths`, the
+# rpcd plugin's only way to persist the LuCI Paths view's edits) writes
+# back VERBATIM what it was handed stays -- a directory entry is still
+# never expanded here. What changes is what "the file" means during that
+# rewrite: it used to mean "only what the caller sent", so the very first
+# save from the Paths view against a stock /etc/sysupgrade.conf silently
+# erased its own header comments and the two commented-out example lines,
+# because the caller (the LuCI view, then `gbrpc_set_paths`) never saw
+# them in the first place -- gb_paths_entries (this same module) is what
+# the view lists and edits, and comments are excluded from it by design.
+# Losing someone else's lines on a save they never touched is not
+# acceptable (ticket 26's own brief), so this function -- the one place a
+# full-list write happens -- re-reads the comments straight from disk
+# and keeps them, unconditionally, regardless of what the caller sent.
+gb_paths_replace_entries() {
+	_gb_pre_tmp="${GB_SYSUPGRADE_CONF}.tmp.$$"
+	mkdir -p "$(dirname "$GB_SYSUPGRADE_CONF")" 2>/dev/null
+
+	{
+		gb_paths_list | while IFS= read -r _gb_pre_l || [ -n "$_gb_pre_l" ]; do
+			_gb_paths_is_comment_or_blank "$_gb_pre_l" && printf '%s\n' "$_gb_pre_l"
+		done
+		printf '%s\n' "$1" | while IFS= read -r _gb_pre_e || [ -n "$_gb_pre_e" ]; do
+			[ -n "$_gb_pre_e" ] || continue
+			printf '%s\n' "$_gb_pre_e"
+		done
+	} >"$_gb_pre_tmp"
+
+	mv "$_gb_pre_tmp" "$GB_SYSUPGRADE_CONF"
 }

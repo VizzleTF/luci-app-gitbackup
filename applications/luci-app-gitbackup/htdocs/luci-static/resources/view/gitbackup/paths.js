@@ -21,19 +21,38 @@
 // this view was updated alongside it.
 //
 // ---------------------------------------------------------------------
-// Raw vs. effective -- the defect this file used to work around instead of
-// fixing, closed by making `list_paths` carry both sets explicitly:
+// Raw vs. entries vs. effective -- the defect this file used to work
+// around instead of fixing, closed by making `list_paths` carry three
+// sets explicitly:
 //
-//   - `paths`     -- the RAW, unexpanded lines of /etc/sysupgrade.conf
-//                    (gb_paths_list). What a human wrote, one line per
-//                    call. This is what this view edits, and the only
-//                    thing `set_paths` ever writes back -- a directory
-//                    line stays a directory line across any number of
-//                    edits, so anything added to it later keeps being
-//                    covered by a real sysupgrade the same way it always
-//                    was, instead of being frozen into the exact file
-//                    list that happened to exist on the day of the last
-//                    save here.
+//   - `paths`     -- the RAW, unexpanded content of /etc/sysupgrade.conf
+//                    (gb_paths_list), comments and blank lines included.
+//                    Not used by this view at all (see `entries` below).
+//   - `entries`   -- (ticket 26) `paths`, filtered down to genuine path
+//                    entries: comments (sysupgrade.conf's own syntax --
+//                    a line starting with '#', including a commented-out
+//                    EXAMPLE such as "# /etc/openvpn/", which backs up
+//                    nothing) and blank lines are dropped by
+//                    gb_paths_entries server-side. This is what this view
+//                    lists and edits, and the only thing `set_paths` ever
+//                    writes back -- a directory line stays a directory
+//                    line across any number of edits, so anything added
+//                    to it later keeps being covered by a real sysupgrade
+//                    the same way it always was, instead of being frozen
+//                    into the exact file list that happened to exist on
+//                    the day of the last save here. Before this field
+//                    existed, this view built its editable list straight
+//                    from `paths`, so a stock router's own header
+//                    comments and example lines rendered as four bogus,
+//                    removable entries -- and the first save from this
+//                    view (any Add or Remove click) silently erased them,
+//                    because `set_paths` used to write back only what it
+//                    was sent and never looked at the rest of the file.
+//                    That erasure is now prevented server-side
+//                    (gb_paths_replace_entries, paths.sh) rather than by
+//                    this view trying to resend lines it was never shown
+//                    in the first place -- see that function's own header
+//                    comment for why the fix belongs there.
 //   - `effective` -- plain `sysupgrade -l`'s own wider union (spec:
 //                    "(/etc/sysupgrade.conf ∪ /lib/upgrade/keep.d/*) ∪
 //                    изменённые conffiles"), already recursively expanded
@@ -43,7 +62,7 @@
 //                    just the lines a human typed) and to show what is
 //                    already covered without anyone having added it here.
 //
-// Earlier, `list_paths` returned only the second set under the name
+// Earlier, `list_paths` returned only the effective set under the name
 // `paths`, so this view's own edits were built on top of the ALREADY
 // EXPANDED list -- the first save after a human added a directory line
 // via the CLI would write that directory's individual files straight
@@ -345,7 +364,7 @@ return view.extend({
 		var self = this;
 		var view;
 
-		self._paths = (data[0] && data[0].paths) || [];
+		self._paths = (data[0] && data[0].entries) || [];
 		self._effective = (data[0] && data[0].effective) || [];
 		self._audit = (data[1] && data[1].paths) || [];
 		self._sizeKb = null;
@@ -438,7 +457,7 @@ return view.extend({
 			L.resolveDefault(callListPaths(), null),
 			L.resolveDefault(callAuditPaths(), null)
 		]).then(function(data) {
-			self._paths = (data[0] && data[0].paths) || [];
+			self._paths = (data[0] && data[0].entries) || [];
 			self._effective = (data[0] && data[0].effective) || [];
 			self._audit = (data[1] && data[1].paths) || [];
 			self.renderBody();

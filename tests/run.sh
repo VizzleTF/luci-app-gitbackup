@@ -3869,6 +3869,100 @@ t_paths_list_and_size() {
 	)
 }
 
+# GB_STOCK_SYSUPGRADE_CONF -- the exact four lines the ticket 26 bug report
+# reproduced against a stock OpenWrt 25.12.4 /etc/sysupgrade.conf: two
+# header comments that happen to be one English sentence split in half, a
+# commented-out example file, a commented-out example directory. Every one
+# of the four starts with '#' -- none is a real entry.
+GB_STOCK_SYSUPGRADE_CONF='## This file contains files and directories that should
+## be preserved during an upgrade.
+# /etc/example.conf
+# /etc/openvpn/'
+
+# t_paths_entries_stock_file -- ticket 26's own acceptance criterion: a
+# stock /etc/sysupgrade.conf, untouched by any human, has zero genuine
+# entries -- gb_paths_entries must report an empty list, not the four
+# comment lines gb_paths_list (still raw) keeps returning unchanged.
+t_paths_entries_stock_file() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		printf '%s\n' "$GB_STOCK_SYSUPGRADE_CONF" >"$GB_SYSUPGRADE_CONF"
+
+		eq 'gb_paths_entries is empty on a stock, untouched file' '' "$(gb_paths_entries)"
+		eq 'gb_paths_list itself is unchanged -- still the raw four comment lines' \
+			"$GB_STOCK_SYSUPGRADE_CONF" "$(gb_paths_list)"
+	)
+}
+
+# t_paths_entries_comments_only -- same shape as the stock file above, but
+# with the two commented-out example lines given a leading '##' and an
+# extra blank line thrown in, to make sure the filter is "starts with '#'
+# at all", not "starts with exactly one '#'", and that blank lines are
+# dropped too, not just single-'#' comments.
+t_paths_entries_comments_only() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		printf '## a\n\n## b\n#c\n' >"$GB_SYSUPGRADE_CONF"
+
+		eq 'gb_paths_entries is empty on a comments-and-blanks-only file' '' "$(gb_paths_entries)"
+	)
+}
+
+# t_paths_entries_mixed_and_blanks -- the general case: real entries
+# interleaved with comments and blank lines, in an order that does not put
+# every comment first. gb_paths_entries must return exactly the real
+# entries, in their original relative order, and nothing else -- neither a
+# comment nor a blank line, wherever in the file they sit.
+t_paths_entries_mixed_and_blanks() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+
+		printf '# header\n\n/etc/config/network\n\n# a commented-out example\n/root/scripts\n#trailing\n' >"$GB_SYSUPGRADE_CONF"
+
+		eq 'gb_paths_entries keeps only the two real entries, in order, comments and blanks dropped' \
+			"$(printf '/etc/config/network\n/root/scripts')" "$(gb_paths_entries)"
+	)
+}
+
+# t_paths_replace_entries_preserves_comments -- the trap ticket 26 exists to
+# close: `set_paths` (ticket 13) writes back verbatim whatever entry list
+# it is given, and that list never includes comments (gb_paths_entries is
+# what the LuCI view now edits) -- so a full-list replace that simply wrote
+# the given entries as the WHOLE new file would silently erase a stock
+# router's own header comments on the very first save. gb_paths_replace_entries
+# is the fix: every comment/blank line already in the file survives,
+# unchanged and in its original order, and the new entries are appended
+# after them -- exactly as given, never expanded (a directory entry stays
+# one line).
+t_paths_replace_entries_preserves_comments() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+		mkdir -p "$work/paths-root/root/scripts"
+
+		printf '%s\n' "$GB_STOCK_SYSUPGRADE_CONF" >"$GB_SYSUPGRADE_CONF"
+
+		gb_paths_replace_entries "$(printf '/etc/config/network\n/root/scripts')"
+
+		eq 'the four original comment lines survive, unchanged and in order, followed by the new entries' \
+			"$(printf '%s\n/etc/config/network\n/root/scripts' "$GB_STOCK_SYSUPGRADE_CONF")" \
+			"$(cat "$GB_SYSUPGRADE_CONF")"
+
+		# A second replace with an empty entry list (every path removed by
+		# the operator) must not duplicate the preserved comments, and must
+		# leave the file as comments-only, not delete the comments along
+		# with the entries.
+		gb_paths_replace_entries ''
+		eq 'removing every entry leaves the comments intact, not deleted along with them' \
+			"$GB_STOCK_SYSUPGRADE_CONF" "$(cat "$GB_SYSUPGRADE_CONF")"
+	)
+}
+
 # --------------------------------------------------------------------------
 # etc/init.d/gitbackup
 # --------------------------------------------------------------------------
@@ -4740,6 +4834,38 @@ t_cli_paths_list_add_del() {
 	unset GB_ROOT GB_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
 }
 
+# t_cli_paths_list_json_entries -- ticket 26's own repro: `paths list
+# --json` against a stock, untouched /etc/sysupgrade.conf must report an
+# empty "entries" array (nothing here is a real, removable path) while
+# "paths" keeps the four raw comment lines exactly as ticket 26's bug
+# report captured them -- the JSON shape gbrpc_list_paths forwards
+# verbatim to the LuCI view.
+t_cli_paths_list_json_entries() {
+	rm -rf "$work/cli-paths-json-root"
+	mkdir -p "$work/cli-paths-json-root/etc/config"
+	GB_ROOT="$work/cli-paths-json-root"; export GB_ROOT
+	GB_SYSUPGRADE_CONF="$work/cli-paths-json-sysupgrade.conf"; export GB_SYSUPGRADE_CONF
+	GB_TEST_SYSUPGRADE_L="$work/cli-paths-json-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+
+	printf '## This file contains files and directories that should\n## be preserved during an upgrade.\n# /etc/example.conf\n# /etc/openvpn/\n' >"$GB_SYSUPGRADE_CONF"
+	: >"$GB_TEST_SYSUPGRADE_L"
+
+	out=$(cli paths list --json 2>&1)
+	assert_json 'paths list --json is valid JSON' "$out"
+	contains 'raw "paths" still carries the four comment lines' \
+		'## This file contains files and directories that should' "$out"
+	contains '"entries" field itself is present and empty -- none of the four lines is a real path' \
+		'"entries": []' "$out"
+
+	rm -f "$GB_SYSUPGRADE_CONF"
+	printf '/etc/config/dhcp\n' >"$GB_SYSUPGRADE_CONF"
+	: >"$work/cli-paths-json-root/etc/config/dhcp"
+	out=$(cli paths list --json 2>&1)
+	contains 'a genuine entry does show up in "entries"' '"entries": ["/etc/config/dhcp"]' "$out"
+
+	unset GB_ROOT GB_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
+}
+
 # t_cli_paths_audit -- ticket 21's `paths audit`, moved verbatim out of the
 # rpcd plugin's own gbrpc_audit_paths (never tested there at all -- this is
 # the first test either version of this logic has ever had). /overlay/upper
@@ -5406,6 +5532,38 @@ t_rpcd_list_paths_raw_vs_effective() {
 	unset GB_TEST_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
 }
 
+# t_rpcd_list_paths_entries_excludes_comments -- ticket 26: "paths list
+# --json" and rpcd's "list_paths" are the same shape (gbrpc_list_paths
+# forwards the CLI's own JSON verbatim, never rebuilding it) -- this pins
+# that agreement down for the new "entries" field specifically: a raw
+# sysupgrade.conf mixing a header comment, a commented-out example
+# directory and two real entries must come back with "entries" holding
+# only the two real ones, in order, while "paths" still carries all four
+# raw lines unfiltered.
+t_rpcd_list_paths_entries_excludes_comments() {
+	GB_TEST_SYSUPGRADE_CONF="$work/rpcd-entries-sysupgrade.conf"
+	printf '## header\n# /etc/openvpn/\n/etc/config/network\n/root/scripts\n' >"$GB_TEST_SYSUPGRADE_CONF"
+	GB_TEST_SYSUPGRADE_L="$work/rpcd-entries-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
+	: >"$GB_TEST_SYSUPGRADE_L"
+
+	out=$(rpcd_call list_paths)
+	assert_json 'list_paths is valid JSON' "$out"
+
+	_gb_t_entries_part="${out#*\"entries\"}"
+	_gb_t_entries_part="${_gb_t_entries_part%%\"effective\"*}"
+
+	contains 'raw "paths" still has the comment lines' '## header' "$out"
+	contains '"entries" has the first real entry' '/etc/config/network' "$_gb_t_entries_part"
+	contains '"entries" has the second real entry' '/root/scripts' "$_gb_t_entries_part"
+	case "$_gb_t_entries_part" in
+		*'## header'*|*'/etc/openvpn/'*)
+			no '"entries" excludes both comment lines' "found a comment in [$_gb_t_entries_part]" ;;
+		*) ok '"entries" excludes both comment lines' ;;
+	esac
+
+	unset GB_TEST_SYSUPGRADE_CONF GB_TEST_SYSUPGRADE_L
+}
+
 t_rpcd_validate_cron() {
 	out=$(rpcd_call validate_cron '{"expr":"0 3 * * *"}')
 	assert_json 'validate_cron (valid) is valid JSON' "$out"
@@ -5501,6 +5659,39 @@ t_rpcd_set_paths_validates_serverside() {
 
 	eq 'only the valid entries land in sysupgrade.conf, and the directory is kept as one line, not expanded' \
 		"$(printf '/etc/config/network\n/root/scripts')" \
+		"$(cat "$GB_TEST_SYSUPGRADE_CONF" 2>/dev/null)"
+
+	unset GB_TEST_SYSUPGRADE_CONF GB_ROOT
+}
+
+# t_rpcd_set_paths_preserves_comments -- ticket 26's own trap: the LuCI
+# Paths view only ever sends back gb_paths_entries' own list (comments
+# excluded by design -- see gbrpc_list_paths's own header comment above),
+# so before this ticket the very first `set_paths` call against a stock
+# /etc/sysupgrade.conf silently erased its own header comments and its two
+# commented-out example lines, because gbrpc_set_paths used to write back
+# only what it was sent, nothing else. paths.sh's own
+# gb_paths_replace_entries now keeps them; this exercises that through the
+# actual rpcd call (argv + stdin JSON), not just the shell function
+# directly.
+t_rpcd_set_paths_preserves_comments() {
+	GB_ROOT="$work/rpcd-paths-comments-root"; export GB_ROOT
+	rm -rf "$GB_ROOT"
+	mkdir -p "$GB_ROOT/etc/config"
+	: >"$GB_ROOT/etc/config/network"
+
+	GB_TEST_SYSUPGRADE_CONF="$work/rpcd-sysupgrade-comments.conf"
+	printf '## This file contains files and directories that should\n## be preserved during an upgrade.\n# /etc/example.conf\n# /etc/openvpn/\n' >"$GB_TEST_SYSUPGRADE_CONF"
+
+	# Simulates the fixed LuCI view: it never saw the four comment lines
+	# above at all (list_paths's own "entries" excludes them), so it can
+	# only ever resubmit real entries -- here, the one path a human added.
+	out=$(rpcd_call set_paths '{"paths":["/etc/config/network"]}')
+	assert_json 'set_paths is valid JSON' "$out"
+	contains 'the submitted entry is reported written' '"/etc/config/network"' "$out"
+
+	eq 'the four original comment lines survive the save, unchanged and in order, the new entry appended after them' \
+		"$(printf '## This file contains files and directories that should\n## be preserved during an upgrade.\n# /etc/example.conf\n# /etc/openvpn/\n/etc/config/network')" \
 		"$(cat "$GB_TEST_SYSUPGRADE_CONF" 2>/dev/null)"
 
 	unset GB_TEST_SYSUPGRADE_CONF GB_ROOT
@@ -5951,6 +6142,10 @@ run_test 'paths.sh: gb_paths_validate against the fixed blacklist' t_paths_valid
 run_test 'paths.sh: gb_paths_validate on a space and a nonexistent path' t_paths_validate_space_and_missing
 run_test 'paths.sh: gb_paths_add/gb_paths_del are idempotent' t_paths_add_del_idempotent
 run_test 'paths.sh: gb_paths_list and gb_paths_size_kb' t_paths_list_and_size
+run_test 'paths.sh: gb_paths_entries is empty on a stock sysupgrade.conf' t_paths_entries_stock_file
+run_test 'paths.sh: gb_paths_entries is empty on a comments-and-blanks-only file' t_paths_entries_comments_only
+run_test 'paths.sh: gb_paths_entries on a mixed file with entries, comments and blanks' t_paths_entries_mixed_and_blanks
+run_test 'paths.sh: gb_paths_replace_entries preserves comments across a full-list write' t_paths_replace_entries_preserves_comments
 run_test 'init.d/gitbackup: backed-up package list from sysupgrade -l' t_init_backed_up_packages
 run_test 'init.d/gitbackup: config_change debounces a burst into one run' t_init_config_change_debounces
 run_test 'cli: usage' t_cli_usage
@@ -5980,6 +6175,7 @@ run_test 'cli: log shows run timings (A01)' t_cli_log
 run_test 'cli: collect --out DIR' t_cli_collect
 run_test 'cli: card --out FILE' t_cli_card
 run_test 'cli: paths list/add/del' t_cli_paths_list_add_del
+run_test 'cli: paths list --json "entries" excludes comments (ticket 26)' t_cli_paths_list_json_entries
 run_test 'cli: paths audit -- overlay/upper vs sysupgrade -l' t_cli_paths_audit
 run_test 'cli: history refuses a URL gb_parse_url does not recognize' t_cli_history_rejects_bad_url
 run_test 'cli: diff <from> <to> refuses a sha shaped like an option' t_cli_diff_two_arg_rejects_bad_sha
@@ -5999,10 +6195,12 @@ run_test 'rpcd: pubkey before and after keygen' t_rpcd_pubkey_before_and_after_k
 run_test 'rpcd: keygen force requires a matching confirm' t_rpcd_keygen_force_requires_confirm
 run_test 'rpcd: list_paths' t_rpcd_list_paths
 run_test 'rpcd: list_paths keeps raw sysupgrade.conf separate from the expanded effective set' t_rpcd_list_paths_raw_vs_effective
+run_test 'rpcd: list_paths "entries" excludes comments (ticket 26)' t_rpcd_list_paths_entries_excludes_comments
 run_test 'rpcd: validate_cron -- valid and invalid' t_rpcd_validate_cron
 run_test 'rpcd: call params survive a stdin with no trailing newline (real rpcd shape)' t_rpcd_call_params_survive_no_trailing_newline
 run_test 'rpcd: set_secret writes 0600 and never logs the value' t_rpcd_set_secret_perms_and_no_log
 run_test 'rpcd: set_paths validates server-side' t_rpcd_set_paths_validates_serverside
+run_test 'rpcd: set_paths preserves comments across a save (ticket 26)' t_rpcd_set_paths_preserves_comments
 run_test 'rpcd: run/test/restore return immediately, not after a timeout' t_rpcd_long_methods_return_immediately
 run_test 'rpcd: hostkey -- show/accept round trip' t_rpcd_hostkey_show_accept
 run_test 'rpcd: history and diff against a real bare repository' t_rpcd_history_and_diff

@@ -149,21 +149,27 @@ gbrpc_pubkey() {
 	fi
 }
 
-# gbrpc_list_paths -- two distinct sets, on purpose (the read/write
+# gbrpc_list_paths -- three distinct sets, on purpose (the read/write
 # asymmetry this ticket exists to close): "paths" is the RAW, unexpanded
 # content of GB_SYSUPGRADE_CONF (paths.sh's own gb_paths_list) -- exactly
-# what a human wrote, a directory line included verbatim -- and the only
-# thing gbrpc_set_paths below may ever write back. "effective" is plain
-# `sysupgrade -l`, the full union spec §sysupgrade names
+# what the file contains, comments and blank lines included. "entries"
+# (ticket 26) is gb_paths_entries -- the same content with every comment
+# and blank line dropped, i.e. only genuine path entries, a directory line
+# still included verbatim -- what the LuCI view lists and edits, and the
+# only shape gbrpc_set_paths below may ever write back; a stock
+# /etc/sysupgrade.conf's own header comments and commented-out example
+# lines are not entries and must never render as a removable row. "effective"
+# is plain `sysupgrade -l`, the full union spec §sysupgrade names
 # (GB_SYSUPGRADE_CONF ∪ /lib/upgrade/keep.d/* ∪ changed conffiles) already
 # recursively expanded to individual files/symlinks. Read-only: it exists
 # for sizing (gb_paths_size_kb's own walk) and so a caller can show what is
-# already covered without the operator having added it. Collapsing the two
-# into one field (the previous shape of this method) is exactly what let a
-# directory a human added survive only until the next `set_paths` call,
-# which would write the already-expanded file list straight back to disk
-# and permanently lose the "anything added to this directory later is
-# covered too" property a real sysupgrade gives a directory line.
+# already covered without the operator having added it. Collapsing "paths"
+# and "effective" into one field (the previous shape of this method) is
+# exactly what let a directory a human added survive only until the next
+# `set_paths` call, which would write the already-expanded file list
+# straight back to disk and permanently lose the "anything added to this
+# directory later is covered too" property a real sysupgrade gives a
+# directory line.
 #
 # Ticket 21: used to build both halves itself, calling `sysupgrade -l`
 # directly -- the one external command this method ever needed, and the
@@ -480,6 +486,21 @@ gbrpc_set_secret() {
 # Rejected entries are reported, not silently dropped (spec: "отклоняются
 # с объяснением, а не молча"), but do not abort the whole write -- the
 # remaining, valid paths are still saved.
+#
+# Ticket 26: this used to write the validated entries as the ENTIRE new
+# file (`mv "$_gb_rpc_tmp" "$GB_SYSUPGRADE_CONF"`, nothing else). The LuCI
+# Paths view only ever sends back gb_paths_entries' own list (comments
+# excluded by design, see gbrpc_list_paths's own header above), so that
+# used to mean the first `set_paths` call against a stock
+# /etc/sysupgrade.conf -- one Add or Remove click anywhere -- silently
+# erased its two header-comment lines and its two commented-out example
+# lines, because this method never looked at them at all before
+# overwriting the file. paths.sh's own gb_paths_replace_entries is the
+# fix: it re-reads GB_SYSUPGRADE_CONF's comment/blank lines off disk right
+# before the write and keeps them, unconditionally, regardless of what
+# this call's "paths" param contained -- so a save from the view can never
+# lose a line it was never shown. What still writes back verbatim,
+# unexpanded, is exactly the caller's own entries -- ticket 13's decision.
 gbrpc_set_paths() {
 	_gb_rpc_dir=$(dirname "$GB_SYSUPGRADE_CONF")
 	mkdir -p "$_gb_rpc_dir" 2>/dev/null
@@ -509,7 +530,8 @@ gbrpc_set_paths() {
 		fi
 	done
 
-	mv "$_gb_rpc_tmp" "$GB_SYSUPGRADE_CONF"
+	gb_paths_replace_entries "$(cat "$_gb_rpc_tmp" 2>/dev/null)"
+	rm -f "$_gb_rpc_tmp"
 
 	printf '{ "ok": true, "written": ['
 	_gb_rpc_first=1

@@ -1353,19 +1353,29 @@ cmd_paths() {
 	case "$_gb_p_sub" in
 		list)
 			if [ "${1:-}" = '--json' ]; then
-				# Two distinct sets, on purpose: "paths" is gb_paths_list's
-				# own raw, unexpanded content of GB_SYSUPGRADE_CONF -- a
-				# directory line included verbatim, and the only thing
-				# `set_paths` (the rpcd plugin) may ever write back.
+				# Three distinct sets, on purpose: "paths" is gb_paths_list's
+				# own raw, unexpanded content of GB_SYSUPGRADE_CONF, comments
+				# and blank lines included -- kept for whatever wants to see
+				# the file exactly as it sits on disk. "entries" (ticket 26)
+				# is gb_paths_entries: the same content with every comment
+				# and blank line dropped, i.e. only genuine path entries -- a
+				# directory line included verbatim, still unexpanded, and the
+				# only thing a caller should ever list as "one entry, one
+				# Remove button" or hand back to `set_paths`. Before this
+				# field existed, callers built that list themselves by
+				# filtering "paths" (or, before ticket 21, did not filter it
+				# at all) -- two places able to disagree about what counts as
+				# an entry; now there is exactly one, gb_paths_entries itself.
 				# "effective" is plain `sysupgrade -l`, already expanded --
 				# read-only, for sizing/audit, never round-tripped into a
 				# save (see gbrpc_list_paths's own header comment for why
 				# collapsing the two into one field used to silently narrow
 				# a directory entry down to a moment-of-save file list).
 				_gb_p_raw=$(gb_paths_list)
+				_gb_p_entries=$(gb_paths_entries)
 				_gb_p_eff=$(sysupgrade -l 2>/dev/null)
-				printf '{ "paths": [%s], "effective": [%s] }\n' \
-					"$(_gb_paths_json_array "$_gb_p_raw")" "$(_gb_paths_json_array "$_gb_p_eff")"
+				printf '{ "paths": [%s], "entries": [%s], "effective": [%s] }\n' \
+					"$(_gb_paths_json_array "$_gb_p_raw")" "$(_gb_paths_json_array "$_gb_p_entries")" "$(_gb_paths_json_array "$_gb_p_eff")"
 			else
 				gb_paths_list
 				printf '# total: %s KB (effective sysupgrade set, sysupgrade -l)\n' "$(gb_paths_size_kb)"
