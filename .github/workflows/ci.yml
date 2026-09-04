@@ -12,10 +12,15 @@
 # a real SDK build under either target produces the SAME bytes twice. The
 # actual release artifact is built once, through `owfeed build` (see the
 # `build` job), which -- unlike the SDK -- also runs the default_postinst
-# wrapper /etc/uci-defaults/99-gitbackup depends on. `sdk-sanity` below is
-# kept anyway, on ONE arch only, as a second, independent proof that
-# "a real OpenWrt SDK still accepts this Makefile" -- never as a source of
-# what ships.
+# wrapper /etc/uci-defaults/99-gitbackup depends on.
+#
+# There WAS an `sdk-sanity` job here that built the same package through a
+# real OpenWrt SDK to prove the Makefiles still work. It was removed: 26
+# minutes per push, `continue-on-error: true`, so a broken Makefile left CI
+# green and nobody was told. What it was meant to protect -- the Makefiles
+# not drifting from owfeed.yml -- is checked by the unit tests instead
+# ("owfeed.yml depends: matches Makefile DEPENDS", "...conffiles..."), and
+# those can actually fail the build.
 name: CI
 
 on:
@@ -197,7 +202,7 @@ jobs:
   # pull request exercises the same 570+ invariant checks the real release
   # pipeline runs, with no secret anywhere in this job. `owfeed build`
   # afterward produces the actual dist/noarch/*.apk this workflow's other
-  # jobs (live, sdk-sanity's own comparison, release) consume -- built
+  # jobs (live, package-size, release) consume -- built
   # UNSIGNED here on purpose: only the `release` job below ever sees
   # OWFEED_SIGN_KEY, and it re-runs `owfeed sign` itself on a tag.
   #
@@ -240,50 +245,6 @@ jobs:
             dist/VERSION
           if-no-files-found: error
 
-  # ------------------------------------------------------------------
-  # Second, independent proof that a real OpenWrt SDK still accepts both
-  # Makefiles -- NEVER the source of what ships (see this file's own header
-  # for why the brief's x86/64 + mediatek/filogic pair would otherwise
-  # build the identical noarch artifact twice). One arch is enough to prove
-  # that claim; it says nothing an SDK build on a second arch would not
-  # also say for a package with no compiled byte in it.
-  #
-  # continue-on-error: this job is a courtesy check for anyone who still
-  # builds via a real buildroot checkout (spec "Упаковка": "собрать пакет в
-  # настоящем SDK по-прежнему может кто угодно"), not a release gate --
-  # nothing here blocks `build`, `live` or `release`.
-  # ------------------------------------------------------------------
-  sdk-sanity:
-    name: sdk sanity build (x86/64, not a release source)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: openwrt/gh-action-sdk@v11
-        env:
-          # Same release line as owlab.yaml's own stand (x86_64-25.12.4);
-          # not a second version to keep in sync by hand, just the one this
-          # whole project already targets (spec "Стек и ограничения").
-          ARCH: x86_64-25.12.4
-          FEEDNAME: gitbackup_ci
-          PACKAGES: gitbackup luci-app-gitbackup
-          NO_SHFMT_CHECK: 1
-
-  # ------------------------------------------------------------------
-  # Everything above proves the packages were BUILT correctly. It proves
-  # nothing about what a user cares about: that installing them gives a
-  # router that works. owfeed/owlab/action boots a real, clean OpenWrt
-  # 25.12.4, installs both .apk files this workflow just built, and asserts
-  # against the running router -- an unauthenticated LuCI request is a
-  # redirect to the login form, which is why `assert: http 200 ...` here
-  # runs AFTER the action's own login, not as a hand-written curl.
-  #
-  # No key anywhere in this job, on a pull request or otherwise: it asserts
-  # that the package WORKS, never that anyone should trust its signature.
-  # ------------------------------------------------------------------
   live:
     name: the package works on a real router
     runs-on: ubuntu-latest
