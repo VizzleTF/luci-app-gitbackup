@@ -58,8 +58,41 @@ perl "$scanner" "$APP/htdocs" >"$fresh_pot"
 # comment/line-number or a reordered entry, neither of which is "drifted
 # from sources". POT-Creation-Date and other header noise never reach this
 # extraction, since it looks only at msgid lines.
+#
+# A gettext .pot wraps a long msgid across several lines -- `msgid ""`
+# followed by one bare-quoted continuation line per fragment, no "msgid"
+# keyword on those lines. A plain `s/^msgid "\(.*\)"$/\1/` (what used to be
+# here) only matches the first line, capturing an empty string, and never
+# looks at the continuation lines at all -- so a reworded multi-line string
+# collapses to the same "" for both the fresh and the committed .pot as long
+# as the *count* of multi-line entries did not change, and the comparison
+# below passes on a wording change it never actually read. This awk instead
+# tracks an in_msgid flag across lines and concatenates every bare-quoted
+# line that follows a `msgid "..."` line into one string before printing it,
+# so a multi-line reword changes what gets compared, not just what gets
+# printed.
 extract_msgids() {
-	sed -n 's/^msgid "\(.*\)"$/\1/p' "$1" | sort
+	awk '
+		/^msgid "/ {
+			id = $0
+			sub(/^msgid "/, "", id)
+			sub(/"$/, "", id)
+			in_msgid = 1
+			next
+		}
+		in_msgid && /^"/ {
+			line = $0
+			sub(/^"/, "", line)
+			sub(/"$/, "", line)
+			id = id line
+			next
+		}
+		in_msgid {
+			print id
+			in_msgid = 0
+		}
+		END { if (in_msgid) print id }
+	' "$1" | sort
 }
 
 fresh_ids=$(extract_msgids "$fresh_pot")

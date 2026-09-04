@@ -62,6 +62,22 @@ GB_ETC_DIR="${GB_ETC_DIR:-/etc/gitbackup}"
 # code path anywhere in this package that can turn certificate verification
 # off, only one that can hand it an extra trusted certificate.
 #
+# _gb_ssh_cmd below is built as a plain `ssh ...` command, not busybox's
+# `dbclient` -- and this StrictHostKeyChecking=yes option is exactly why.
+# Measured on the 25.12.4 stand (dropbear 2025.89, git 2.50.1): with
+# GIT_SSH_COMMAND set to a dbclient invocation, `GIT_TRACE=1 git fetch`
+# shows git's ssh-variant probe (`dbclient -G ...`, used to detect whether
+# the ssh command understands OpenSSH's own option syntax) failing, after
+# which git silently falls back to its "simple" transport form and stops
+# passing any `-o NAME=VALUE` pair at all -- not just this one, every
+# option this function sets, including UserKnownHostsFile and BatchMode.
+# The failure is invisible: git does not warn that it dropped them, fetch
+# still succeeds against a reachable host, and the option only turns out
+# to have been a no-op the day host-key checking was supposed to catch
+# something. That silent downgrade, not merely dbclient's separate inability
+# to read OpenSSH-format keys (see package/gitbackup/Makefile), is why this
+# package depends on the real openssh-client instead.
+#
 # Never prints the token itself: GIT_ASKPASS names askpass.sh's path, and
 # the token is read off disk by askpass.sh's own process, later, only once
 # git has actually decided it needs credentials.

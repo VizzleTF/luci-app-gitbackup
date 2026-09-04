@@ -34,6 +34,11 @@ packages together; see `dist/size-report.json` for the raw numbers this table is
 | + `gitbackup` | 45.7 MiB | 147 |
 | + `gitbackup` + `luci-app-gitbackup` | 45.9 MiB | 148 |
 
+An earlier, separate measurement of the same clean image put it at 15.9 MiB — that run used a
+plainer stand than this one, which carries a few extra owlab test fixtures on top of stock
+25.12.4; either baseline is fine to reason from as long as it is not mixed with the other one's
+delta, which is why this table sticks to numbers from a single `size-report.sh` run.
+
 `gitbackup` itself is 226 KiB and `luci-app-gitbackup` is 139 KiB (`apk info -s`); essentially
 everything else in that ~25 MiB delta is dependencies pulled in once, on the first install:
 
@@ -43,8 +48,10 @@ everything else in that ~25 MiB delta is dependencies pulled in once, on the fir
   the delta, roughly 22 MiB on its own.
 - **`openssh-client` + `openssh-keygen`** — about 1.3 MiB. Busybox's own `dbclient` was tried and
   rejected: it cannot read OpenSSH-format private keys, does not honor `UserKnownHostsFile`, and
-  git silently drops `-o StrictHostKeyChecking=yes` when it falls back to dbclient's `simple`
-  mode. None of that is acceptable for a tool whose whole job is not silently failing open.
+  — measured on a 25.12.4 stand with `GIT_TRACE=1`, dropbear 2025.89, git 2.50.1, see the comment
+  above `gb_git_env` in `auth.sh` — git silently drops `-o StrictHostKeyChecking=yes` (and every
+  other `-o` option) when it falls back to dbclient's `simple` mode. None of that is acceptable
+  for a tool whose whole job is not silently failing open.
 - **`coreutils-stat`** — about 100 KiB. The base image ships no `stat` at all, and the backup
   manifest (which records file modes and ownership) depends on it.
 
@@ -156,6 +163,20 @@ version or feed mismatches are not something a config restore can paper over. `g
 --with-packages` makes a best-effort attempt to reinstall recorded packages, but "best effort"
 is the operative phrase: it is not a guarantee, and a firmware reinstalled from scratch on a
 different release is the case most likely to hit this.
+
+## Theme compatibility
+
+`luci-app-gitbackup` depends only on `luci-base` — it does not require, import, or read
+private tokens from any specific theme — and is styled to render correctly under any of them,
+footstrap included. This was checked, not assumed: on 2026-09-04, the CSS actually shipped in
+all four views (`overview.js`, `settings.js`, `paths.js`, `history.js`) was run through the
+"Fix my styles" checker at https://vizzletf.github.io/luci-theme-footstrap/#fix (the eleven
+rules on that page — CSS scoped inside the view tree, no `:root`/`*` selectors, only the
+`--*-color-*` export tokens with literal fallbacks, no `prefers-color-scheme`, no
+`window.onload`, container queries instead of viewport media queries, and so on), which
+reported "Nothing flagged — this already follows the rules." A manual grep for the rules that
+checker cannot see from pasted CSS alone (`document.head.appendChild`, `window.onload`,
+`prefers-color-scheme`, stray `!important`) found none in the shipped JS either.
 
 ## Further reading
 
