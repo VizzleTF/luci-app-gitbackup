@@ -422,15 +422,19 @@ cat >"$work/bin/stat" <<'STUB'
 # alone -- a symlink's lstat MODE is not portable to assert (Linux always
 # reports 0777 for one regardless of chmod; macOS/BSD does not), but its
 # ownership is, so the permissions test checks that pair on its own for a
-# symlink and the full triple for files/dirs. macOS ships a BSD stat with
-# different flags entirely, so this stub translates on Darwin; elsewhere
-# it defers straight to the real GNU stat, found via the POSIX default
-# PATH so it does not recurse into itself.
+# symlink and the full triple for files/dirs. `%d` (ticket 19,
+# _gb_restore_check_writable's own device-number comparison) is a third,
+# separate format -- BSD stat has a directly equivalent %d of its own, no
+# field reordering needed the way %a/%Lp needed. macOS ships a BSD stat
+# with different flags entirely, so this stub translates on Darwin;
+# elsewhere it defers straight to the real GNU stat, found via the POSIX
+# default PATH so it does not recurse into itself.
 [ "${1:-}" = "-c" ] || { echo "stat stub: expected -c, got '${1:-}'" >&2; exit 64; }
 fmt="$2"; path="$3"
 case "$fmt" in
 	'%a %u %g') bsd_fmt='%Lp %u %g' ;;
 	'%u %g') bsd_fmt='%u %g' ;;
+	'%d') bsd_fmt='%d' ;;
 	*) echo "stat stub: unsupported format '$fmt'" >&2; exit 64 ;;
 esac
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -2979,6 +2983,171 @@ t_restore_fetches_only_its_own_branch() {
 	)
 }
 
+# t_restore_write_failure_does_not_block_perms -- ticket 19's own headline
+# scenario, reproduced exactly as found on the owlab stand: restoring over
+# /etc/hosts there fails because it is a Docker/OrbStack bind mount, and
+# busybox/coreutils cp's own "File exists" is stubbed here verbatim (same
+# "stub the exact tool's shape" technique t_restore_overwrites_existing_
+# destination already uses for busybox's own missing -f) rather than
+# fabricated a real mount, which an unprivileged host test cannot do.
+# Everything ELSE in the manifest must still land with the manifest's own
+# mode, the operator must be told the truth about the one path that did
+# not, and the exit code must say so too.
+#
+# Mutation check: putting the old
+#   _gb_restore_write_files ... || { ...; return 1; }
+# back in front of _gb_restore_apply_perms's own call (restore.sh) turns
+# the mode assertion below red -- that `return 1` leaves gb_restore before
+# _gb_restore_apply_perms ever runs for /etc/shadow or anything else, so
+# it keeps whatever mode `cp` itself produced (this process' own umask,
+# never 600) instead of the manifest's.
+t_restore_write_failure_does_not_block_perms() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc"
+		printf '127.0.0.1 localhost\n' >"$work/restore-seed/devices/rt1/files/etc/hosts"
+		printf 'root:!:19000:0:99999:7:::\n' >"$work/restore-seed/devices/rt1/files/etc/shadow"
+		_rt_sha_hosts=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/hosts" | awk '{print $1}')
+		_rt_sha_shadow=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/shadow" | awk '{print $1}')
+		_rt_uid=$(id -u)
+		_rt_gid=$(id -g)
+		_rt_entries=$(printf '%s\n%s\n' \
+			"$(restore_entry_file /etc/hosts 644 "$_rt_uid" "$_rt_gid" "$_rt_sha_hosts")" \
+			"$(restore_entry_file /etc/shadow 600 "$_rt_uid" "$_rt_gid" "$_rt_sha_shadow")")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		# Something has to already be at the destination for a "cannot
+		# replace it" cp to have anything to refuse -- an empty
+		# destination directory has nothing to overwrite in the first
+		# place. Left world-readable on purpose, like a real /etc/hosts:
+		# the point is that the REPLACE is refused, not that the file's
+		# own permission bits were ever wrong.
+		mkdir -p "$work/restore-dest/etc"
+		printf "stale hosts file, e.g. Docker's own bind mount\\n" >"$work/restore-dest/etc/hosts"
+		chmod 644 "$work/restore-dest/etc/hosts"
+
+		mkdir -p "$work/cp-hosts-stuck"
+		cat >"$work/cp-hosts-stuck/cp" <<'STUB'
+#!/bin/sh
+for a in "$@"; do dest="$a"; done
+case "$dest" in
+	*etc/hosts) echo "cp: can't create '$dest': File exists" >&2; exit 1 ;;
+esac
+args=""
+for a in "$@"; do
+	case "$a" in
+		-*) ;;
+		*) args="$args $a" ;;
+	esac
+done
+# shellcheck disable=SC2086
+command -p cp $args
+STUB
+		chmod +x "$work/cp-hosts-stuck/cp"
+
+		out=$(PATH="$work/cp-hosts-stuck:$PATH" gb_restore rt1 '' --yes 2>&1)
+		eq 'a write failure on one path exits non-zero, not a silent 0' '1' "$?"
+		contains 'and names the specific path that failed' 'etc/hosts' "$out"
+		contains 'with the real reason cp reported, not a swallowed one' 'File exists' "$out"
+
+		eq 'the OTHER path (etc/shadow) still got the manifest'"'"'s own mode despite etc/hosts failing' \
+			'600 '"$_rt_uid $_rt_gid" \
+			"$(stat -c '%a %u %g' "$work/restore-dest/etc/shadow" 2>/dev/null)"
+
+		if [ -f "$work/restore-dest/etc/shadow" ]; then
+			ok 'and etc/shadow was actually written despite etc/hosts failing'
+		else
+			no 'and etc/shadow was actually written despite etc/hosts failing' 'missing'
+		fi
+
+		restore_teardown
+	)
+}
+
+# t_restore_precheck_skips_a_known_unwritable_path_before_attempting_cp --
+# criterion 3: writability is checked the same way sha256 already is,
+# BEFORE the first file is touched, not discovered only when cp happens to
+# fail. Proven with a directory stripped of its own write permission
+# (chmod 555) -- unlike the st_dev-based half of the same check restore.sh
+# also does for a single bind-mounted FILE (confirmed live on the owlab
+# stand only: /etc/hosts there is device 41, /etc is device 1048628 --
+# there is no portable, unprivileged way to fabricate a real distinct
+# mount point from a host test), an unwritable directory is a real,
+# unprivileged-reproducible instance of "this destination cannot be
+# replaced" that the very same preflight is expected to catch.
+#
+# The proof that this was caught AHEAD OF TIME, not merely handled after a
+# failed attempt (which the previous test already covers): cp(1) itself,
+# stubbed to log every invocation it receives, never once runs for the
+# locked path -- only for the other, writable one.
+t_restore_precheck_skips_a_known_unwritable_path_before_attempting_cp() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/locked" \
+			"$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'locked content\n' >"$work/restore-seed/devices/rt1/files/etc/locked/hosts"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha_locked=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/locked/hosts" | awk '{print $1}')
+		_rt_sha_net=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_uid=$(id -u)
+		_rt_gid=$(id -g)
+		_rt_entries=$(printf '%s\n%s\n' \
+			"$(restore_entry_file /etc/locked/hosts 644 "$_rt_uid" "$_rt_gid" "$_rt_sha_locked")" \
+			"$(restore_entry_file /etc/config/network 640 "$_rt_uid" "$_rt_gid" "$_rt_sha_net")")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		mkdir -p "$work/restore-dest/etc/locked"
+		printf 'already there, directory refuses to give it up\n' >"$work/restore-dest/etc/locked/hosts"
+		chmod 555 "$work/restore-dest/etc/locked"
+
+		_rt_cp_log="$work/cp-calls.log"
+		: >"$_rt_cp_log"
+		mkdir -p "$work/cp-logger"
+		cat >"$work/cp-logger/cp" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >>"$_rt_cp_log"
+args=""
+for a in "\$@"; do
+	case "\$a" in
+		-*) ;;
+		*) args="\$args \$a" ;;
+	esac
+done
+# shellcheck disable=SC2086
+command -p cp \$args
+STUB
+		chmod +x "$work/cp-logger/cp"
+
+		out=$(PATH="$work/cp-logger:$PATH" gb_restore rt1 '' --yes 2>&1)
+		eq 'restore still exits non-zero (etc/locked/hosts really did not get written)' '1' "$?"
+		contains 'and names the path the preflight refused' 'etc/locked/hosts' "$out"
+
+		case "$(cat "$_rt_cp_log")" in
+			*etc/locked/hosts*)
+				no 'cp was never invoked for the locked path -- the preflight skipped it ahead of time' \
+					"it was: $(cat "$_rt_cp_log")"
+				;;
+			*)
+				ok 'cp was never invoked for the locked path -- the preflight skipped it ahead of time'
+				;;
+		esac
+		contains 'but cp WAS invoked for the other, writable path' 'etc/config/network' "$(cat "$_rt_cp_log")"
+
+		eq 'and that other path still got the manifest'"'"'s mode despite the skip' \
+			'640 '"$_rt_uid $_rt_gid" \
+			"$(stat -c '%a %u %g' "$work/restore-dest/etc/config/network" 2>/dev/null)"
+
+		chmod 755 "$work/restore-dest/etc/locked" 2>/dev/null
+		restore_teardown
+	)
+}
+
 # --------------------------------------------------------------------------
 # schedule.sh
 # --------------------------------------------------------------------------
@@ -4903,6 +5072,8 @@ run_test 'restore.sh: a major OpenWrt version gap warns, does not refuse' t_rest
 run_test 'restore.sh: a non-empty manifest.scrubbed is printed to the operator' t_restore_scrubbed_list_printed
 run_test 'restore.sh: --dry-run prints the plan and touches nothing' t_restore_dry_run_untouched
 run_test 'restore.sh: fetches only its own device branch, not the whole repo' t_restore_fetches_only_its_own_branch
+run_test 'restore.sh: a write failure on one path does not block perms on the rest (ticket 19)' t_restore_write_failure_does_not_block_perms
+run_test 'restore.sh: the writability preflight skips a known-bad path before ever attempting cp (ticket 19)' t_restore_precheck_skips_a_known_unwritable_path_before_attempting_cp
 run_test 'schedule.sh: gb_preset_expr is deterministic per device' t_schedule_preset_expr
 run_test 'schedule.sh: gb_cron_valid on hand-picked examples' t_schedule_cron_valid_examples
 run_test 'schedule.sh: gb_cron_valid against tests/fixtures/cron.tsv' t_schedule_cron_valid_fixtures

@@ -171,6 +171,18 @@ gb_restore() {
 	# every file's content is proven correct against the manifest.
 	_gb_restore_verify_sha "$_gb_srcroot/files" "$_gb_manifest" || return 1
 
+	# Ticket 19: a second read-only pass, same "сверили всё -> потом
+	# пишем" principle as the sha256 one just above, run before the
+	# dry-run branch for the same reason -- it finds out WHICH paths
+	# cannot possibly be replaced before a single byte is written,
+	# instead of finding out only when cp fails mid-restore.
+	# _gb_precheck_bad is consumed below by _gb_restore_write_one, which
+	# skips a doomed cp entirely for anything in it rather than let
+	# busybox's own misleading "File exists" (produced by an unlink that
+	# silently failed, then a create that hits EEXIST) stand in as the
+	# reported reason.
+	_gb_restore_check_writable "$_gb_manifest"
+
 	if [ "$_gb_dry" -eq 1 ]; then
 		_gb_restore_print_plan "$_gb_manifest"
 		return 0
@@ -190,13 +202,45 @@ gb_restore() {
 	# a second pass (spec: "разложить файлы, затем применить mode/uid/gid,
 	# создать пустые каталоги, пересоздать симлинки") -- content and
 	# ownership are deliberately two passes, not interleaved per entry.
-	_gb_restore_write_files "$_gb_srcroot/files" "$_gb_manifest" ||
-		{ gb_log err 'gb_restore: writing one or more files failed'; return 1; }
+	_gb_restore_write_files "$_gb_srcroot/files" "$_gb_manifest"
+	_gb_write_rc=$?
+
+	# Ticket 19: this call used to be gated behind
+	# `_gb_restore_write_files ... || { ...; return 1; }`, so ONE failed
+	# write (one busy bind mount, one read-only path) skipped applying
+	# rights to EVERY OTHER file. Found live on the owlab owrt2512 stand:
+	# a restore that failed only on /etc/hosts (a Docker/OrbStack bind
+	# mount there, but on a real router this is any path that is
+	# mounted, busy, read-only, or immutable) left /etc/shadow 644
+	# root:root -- world-readable -- because this line was never
+	# reached, and dropbear separately refused its own restored host
+	# keys for the same reason.
+	#
+	# Decision (spec explicitly leaves this to the implementer): a
+	# partially-restored router with correct permissions on every path
+	# that DID land is strictly safer than either extreme -- refusing
+	# the WHOLE restore over one stubborn path throws away everything
+	# else that would have worked (network, wireless, dropbear keys,
+	# cron, ...) over a file that is present in literally every backup
+	# (/etc/hosts is always in sysupgrade -l); silently reporting success
+	# is worse still. So this module always writes what it can, always
+	# applies rights to whatever got written, and always tells the
+	# operator the truth (below) with a non-zero exit -- unconditionally,
+	# not only under --force. --force here keeps meaning exactly what it
+	# already means one check up (override a board mismatch); it is not
+	# involved in this decision at all.
 	_gb_restore_apply_perms "$_gb_manifest"
 
 	_gb_restore_print_scrubbed "$_gb_manifest"
 
 	[ "$_gb_wp" -eq 1 ] && _gb_restore_packages "$_gb_srcroot/meta"
+
+	if [ "$_gb_write_rc" -ne 0 ]; then
+		gb_log err "gb_restore: the following paths were NOT written:$_gb_write_bad"
+		printf 'restore of %s from %s finished, but some paths were NOT written -- see above for which and why\n' \
+			"$_gb_device" "$_gb_target" >&2
+		return 1
+	fi
 
 	gb_log notice "gb_restore: restored $_gb_device from $_gb_target on $_gb_branch"
 	printf 'restored %s from %s\n' "$_gb_device" "$_gb_target"
@@ -328,6 +372,74 @@ _gb_restore_verify_sha_one() {
 	[ -n "$_gb_got" ] && [ "$_gb_got" = "$_gb_want" ] || _gb_sha_bad="$_gb_sha_bad $_gb_path"
 }
 
+# _gb_restore_check_writable <manifest.json> -- ticket 19's preflight: a
+# second read-only pass, run alongside _gb_restore_verify_sha above (same
+# "сверили всё -> потом пишем" principle applied to writability, not just
+# content). Sets _gb_precheck_bad, a space-separated path list in the same
+# shape as _gb_sha_bad above, to every "file" entry whose destination
+# already exists and is, as far as metadata alone can predict, NOT going
+# to survive cp's own unlink-then-recreate:
+#
+#   - its containing directory has no write permission. Also correctly
+#     answers "no" when the directory's own FILESYSTEM is mounted
+#     read-only, even for root -- access(2), which `[ -w ... ]` is built
+#     on, checks the mount's own read-only flag regardless of permission
+#     bits. The one half of this check reproducible from an
+#     unprivileged host test (chmod 555 a directory).
+#   - the destination's own device differs from its containing
+#     directory's (`stat -c %d` on each). True only when the exact
+#     destination PATH is itself a distinct mount point -- e.g. a
+#     Docker/OrbStack bind mount of a single file over /etc/hosts.
+#     Confirmed live on the owlab owrt2512 stand: `stat -c%d /etc/hosts`
+#     there is 41, `stat -c%d /etc` is 1048628 -- while /etc/shadow and
+#     /etc/config both report 1048628, same as /etc itself, so this does
+#     NOT misfire on an ordinary file. This is exactly what made cp -f
+#     fail there with a misleading "File exists" (busybox/coreutils cp's
+#     own unlink-before-recreate silently failed the unlink, then hit
+#     EEXIST on the create) -- also confirmed live: `cp -f /tmp/x
+#     /etc/hosts` -> "cp: can't create '/etc/hosts': File exists". This
+#     half cannot be fabricated from an unprivileged host test (that
+#     would need a real mount of its own), so it is stand-verified only,
+#     same as several other OS-level facts already in this file.
+#
+# Deliberately narrow: a permission-bit problem on the FILE itself, a
+# read-only attribute, or an immutable flag are not caught here -- there
+# is no metadata-only signal for those that would not also misfire on an
+# ordinary read-only file elsewhere in the tree (mode 444 is common and
+# perfectly overwritable by root). Those still only surface at actual
+# write time, exactly as before this ticket; this preflight only removes
+# the ONE failure mode the spec explicitly asks to catch ahead of time.
+_gb_restore_check_writable() {
+	_gb_manifest="$1"
+	_gb_precheck_bad=''
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_check_writable_one
+}
+
+_gb_restore_check_writable_one() {
+	_gb_obj="$1"
+	case "$_gb_obj" in
+		*'"type":"file"'*) ;;
+		*) return 0 ;;
+	esac
+	_gb_path=$(gb_manifest_field "$_gb_obj" path)
+	_gb_dest="${GB_ROOT:-}$_gb_path"
+	# Nothing at $_gb_dest yet -- cp will just create it, no replace
+	# involved, so there is nothing here that could go wrong this way.
+	[ -e "$_gb_dest" ] || return 0
+	_gb_wdir=$(dirname "$_gb_dest")
+
+	if [ ! -w "$_gb_wdir" ]; then
+		_gb_precheck_bad="$_gb_precheck_bad $_gb_path"
+		return 0
+	fi
+
+	_gb_dest_dev=$(stat -c %d "$_gb_dest" 2>/dev/null)
+	_gb_wdir_dev=$(stat -c %d "$_gb_wdir" 2>/dev/null)
+	if [ -n "$_gb_dest_dev" ] && [ -n "$_gb_wdir_dev" ] && [ "$_gb_dest_dev" != "$_gb_wdir_dev" ]; then
+		_gb_precheck_bad="$_gb_precheck_bad $_gb_path"
+	fi
+}
+
 # _gb_restore_print_plan <manifest.json> -- --dry-run's own output, and
 # also what the interactive confirmation prompt shows before asking. Marks
 # each path "overwrite" (something is already there at GB_ROOT) or
@@ -355,13 +467,25 @@ _gb_restore_plan_one() {
 # CONTENT only, no mode/uid/gid yet (_gb_restore_apply_perms is pass 2).
 # Only reached after _gb_restore_verify_sha has already confirmed every
 # file's hash, so a failure here is an I/O problem (disk full, a path
-# collision with an existing directory), not a data-integrity one.
+# collision with an existing directory, a mount that refuses to give up
+# its own path), not a data-integrity one.
+#
+# Sets _gb_write_bad, a multi-line "  <path>: <reason>" report (empty
+# when nothing failed), and returns 0 iff it stayed empty. The caller
+# (gb_restore) deliberately does NOT gate _gb_restore_apply_perms on this
+# return value (ticket 19) -- it only reads _gb_write_rc/_gb_write_bad
+# afterward, to tell the operator the truth and end the call non-zero,
+# once rights have already been applied to whatever DID get written.
+# gb_manifest_each itself never stops iterating on a callback's own
+# return code (lib.sh), so one failing entry here already does not
+# prevent the REST of this same pass from running either -- only the
+# call site one level up used to throw that away.
 _gb_restore_write_files() {
 	_gb_srcfiles="$1"
 	_gb_manifest="$2"
-	_gb_write_failed=''
+	_gb_write_bad=''
 	gb_manifest_each "$_gb_manifest" entries _gb_restore_write_one
-	[ -z "$_gb_write_failed" ]
+	[ -z "$_gb_write_bad" ]
 }
 
 _gb_restore_write_one() {
@@ -371,13 +495,33 @@ _gb_restore_write_one() {
 		*) return 0 ;;
 	esac
 	_gb_path=$(gb_manifest_field "$_gb_obj" path)
+
+	# Already known doomed by _gb_restore_check_writable above -- skip
+	# the attempt outright rather than let cp run into it and report its
+	# own less useful message (see that function's own comment for why).
+	case " $_gb_precheck_bad " in
+		*" $_gb_path "*)
+			_gb_write_bad="$_gb_write_bad
+  $_gb_path: destination cannot be replaced (not writable, or a distinct mount point sits exactly on this path) -- skipped, not attempted"
+			return 0
+			;;
+	esac
+
 	_gb_dest="${GB_ROOT:-}$_gb_path"
-	mkdir -p "$(dirname "$_gb_dest")" || { _gb_write_failed=1; return 1; }
+	_gb_mkdir_err=$(mkdir -p "$(dirname "$_gb_dest")" 2>&1) || {
+		_gb_write_bad="$_gb_write_bad
+  $_gb_path: $_gb_mkdir_err"
+		return 0
+	}
 	# -f: busybox cp (unlike GNU/BSD cp) refuses an existing destination
 	# outright ("File exists") without it -- found live on the owlab
 	# stand restoring over /etc/hosts, not caught by any host-side test
 	# since macOS/GNU cp both overwrite by default with no flag at all.
-	cp -f "$_gb_srcfiles$_gb_path" "$_gb_dest" || { _gb_write_failed=1; return 1; }
+	_gb_cp_err=$(cp -f "$_gb_srcfiles$_gb_path" "$_gb_dest" 2>&1) || {
+		_gb_write_bad="$_gb_write_bad
+  $_gb_path: $_gb_cp_err"
+		return 0
+	}
 }
 
 # _gb_restore_apply_perms <manifest.json> -- pass 2: mode/uid/gid for
