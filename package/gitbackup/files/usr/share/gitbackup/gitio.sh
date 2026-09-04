@@ -138,7 +138,7 @@ gb_fetch_meta() {
 	return 0
 }
 
-# gb_build_tree <repodir> <treedir>
+# gb_build_tree <repodir> <treedir> [extra_file] [extra_gitpath]
 #
 # Hashes and stages every regular file and symlink under <treedir> into a
 # scratch index, rooted at GB_PREFIX (environment, not an argument -- see
@@ -147,6 +147,17 @@ gb_fetch_meta() {
 # backup set (collect.sh's outdir) with no prefix baked into it on disk --
 # the prefix only ever exists inside the git tree this function builds, not
 # on the filesystem gb_collect wrote to.
+#
+# [extra_file]/[extra_gitpath] (ticket 22) stage exactly one additional
+# regular file at a git path given VERBATIM, bypassing GB_PREFIX entirely --
+# the one thing usr/sbin/gitbackup needs this for is a device branch's own
+# README.md, which has to sit at the BRANCH ROOT (a sibling of
+# "devices/<id>") for GitHub to render it when a human opens that branch
+# from a phone; a copy staged under GB_PREFIX would never be seen there.
+# Both empty (the two-argument form every other call site, including every
+# existing test, still uses) skips this step entirely -- behavior is
+# unchanged. Mode is always 100644: nothing that calls this today needs an
+# executable or a symlink at the extra path.
 #
 # When GB_PARENT (also environment: the SHA gb_remote_head returned, empty
 # for a brand-new branch) is set, the index is first seeded from that
@@ -179,6 +190,8 @@ gb_fetch_meta() {
 gb_build_tree() {
 	_gb_repodir="$1"
 	_gb_treedir="$2"
+	_gb_extra_file="${3:-}"
+	_gb_extra_gitpath="${4:-}"
 	_gb_prefix="${GB_PREFIX:?gb_build_tree: GB_PREFIX is not set}"
 	_gb_gitdir="$_gb_repodir/.git"
 	_gb_idx="$_gb_repodir/gitio-index.$$"
@@ -216,6 +229,14 @@ gb_build_tree() {
 		GIT_DIR="$_gb_gitdir" GIT_INDEX_FILE="$_gb_idx" \
 			git update-index --add --cacheinfo "$_gb_mode,$_gb_oid,$_gb_gitpath" 2>/dev/null
 	done
+
+	if [ -n "$_gb_extra_file" ] && [ -n "$_gb_extra_gitpath" ] && [ -f "$_gb_extra_file" ]; then
+		_gb_extra_oid=$(GIT_DIR="$_gb_gitdir" git hash-object -w "$_gb_extra_file" 2>/dev/null)
+		if [ -n "$_gb_extra_oid" ]; then
+			GIT_DIR="$_gb_gitdir" GIT_INDEX_FILE="$_gb_idx" \
+				git update-index --add --cacheinfo "100644,$_gb_extra_oid,$_gb_extra_gitpath" 2>/dev/null
+		fi
+	fi
 
 	_gb_tree=$(GIT_DIR="$_gb_gitdir" GIT_INDEX_FILE="$_gb_idx" git write-tree 2>/dev/null)
 	_gb_rc=$?

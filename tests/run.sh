@@ -2451,6 +2451,62 @@ t_gitio_first_commit_no_parent() {
 	)
 }
 
+# t_gitio_build_tree_extra_root_file -- ticket 22: a device-branch README.md
+# has to sit at the BRANCH ROOT, a sibling of GB_PREFIX ("devices/<id>"), not
+# inside it -- that is the one thing GitHub actually renders when a human
+# opens the branch from a phone. gb_build_tree's own file-staging loop only
+# ever walks <treedir> and always prefixes with GB_PREFIX, so reaching the
+# branch root needs a second, explicit staging path: an optional 3rd/4th
+# argument pair (a local file, and the exact git path to stage it at) that
+# bypasses GB_PREFIX entirely. Omitting both arguments must leave existing
+# behavior untouched -- the two tests above call gb_build_tree with only two
+# arguments and still have to pass.
+t_gitio_build_tree_extra_root_file() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"
+		GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+		GB_URL="$work/gitio-extra-bare.git"; export GB_URL
+		rm -rf "$GB_URL"
+		git init --bare -q "$GB_URL"
+
+		_gt_repodir="$work/gitio-extra-repo"
+		_gt_tree="$work/gitio-extra-tree"
+		_gt_extra="$work/gitio-extra-README.md"
+		rm -rf "$_gt_repodir" "$_gt_tree"
+		mkdir -p "$_gt_tree/files/etc/config"
+		printf 'config network\n' >"$_gt_tree/files/etc/config/network"
+		printf 'recovery instructions\n' >"$_gt_extra"
+		git init -q "$_gt_repodir"
+
+		unset GB_PARENT
+		GB_PREFIX='devices/rt1'; export GB_PREFIX
+		_gt_tree_sha=$(gb_build_tree "$_gt_repodir" "$_gt_tree" "$_gt_extra" 'README.md')
+		if [ -n "$_gt_tree_sha" ]; then
+			ok 'gb_build_tree still prints a tree SHA when an extra root file is given'
+		else
+			no 'gb_build_tree still prints a tree SHA when an extra root file is given' 'empty'
+		fi
+
+		: >"$work/gitio-extra-msg"
+		printf '2026-01-01 00:00 rt1: network\n' >"$work/gitio-extra-msg"
+		_gt_commit=$(gb_commit_push "$_gt_repodir" "$_gt_tree_sha" '' "$work/gitio-extra-msg" 'device/rt1')
+		eq 'gb_commit_push succeeds with the extra root file staged' '0' "$?"
+
+		_gt_seen=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:README.md" 2>/dev/null)
+		eq 'the extra file lands at the exact git path given, at the branch root' 'recovery instructions' "$_gt_seen"
+
+		_gt_prefixed=$(git --git-dir="$GB_URL" cat-file -p "$_gt_commit:devices/rt1/files/etc/config/network" 2>/dev/null)
+		eq 'and the normal prefixed content is still there too' 'config network' "$_gt_prefixed"
+
+		case "$(git --git-dir="$GB_URL" ls-tree "$_gt_commit" devices/rt1/README.md 2>/dev/null)" in
+			'') ok 'the extra file is NOT also duplicated under the prefix' ;;
+			*) no 'the extra file is NOT also duplicated under the prefix' 'found under devices/rt1/README.md' ;;
+		esac
+
+		unset GB_PREFIX
+	)
+}
+
 # t_gitio_commit_push_no_global_git_identity -- found live on the owlab
 # stand (not in any unit test, until this one): a freshly booted router
 # has no ~/.gitconfig and no [user] section anywhere at all, and
@@ -4326,6 +4382,31 @@ t_run_integration_bare_repo() {
 	_gt_barchive_calls1=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
 	eq 'sysupgrade -b was called once, for run 1' '1' "$_gt_barchive_calls1"
 
+	# Ticket 22: the same recovery text has to be reachable two ways --
+	# devices/<id>/RECOVERY.md (existing) and a README.md at the branch
+	# ROOT (new), because GitHub only ever renders the root README when a
+	# human opens a branch from a phone. One generator, one gb_card call --
+	# byte-identical by construction, not two texts that could drift apart.
+	_gt_recovery1=$(git --git-dir="$_gt_bare" cat-file -p device/rt1:devices/rt1/RECOVERY.md 2>/dev/null)
+	_gt_readme1=$(git --git-dir="$_gt_bare" cat-file -p device/rt1:README.md 2>/dev/null)
+	if [ -n "$_gt_recovery1" ]; then
+		ok 'devices/rt1/RECOVERY.md is committed, as before'
+	else
+		no 'devices/rt1/RECOVERY.md is committed, as before' 'missing'
+	fi
+	eq 'README.md at the branch root is byte-identical to devices/rt1/RECOVERY.md' \
+		"$_gt_recovery1" "$_gt_readme1"
+
+	# Ticket 22, criterion 4: the very first backup of the very first
+	# device also creates a "main" branch with a short index README --
+	# one extra push, but only ONCE (main did not exist at all yet), never
+	# on every run.
+	_gt_main_log1=$(git --git-dir="$_gt_bare" log --oneline main 2>/dev/null)
+	eq 'the first-ever run also creates a "main" branch (repo was otherwise empty)' \
+		'1' "$(printf '%s\n' "$_gt_main_log1" | grep -c .)"
+	_gt_main_readme1=$(git --git-dir="$_gt_bare" cat-file -p main:README.md 2>/dev/null)
+	contains 'main'\''s README points at the per-device branches' 'device/' "$_gt_main_readme1"
+
 	# --- run 2: nothing changed ---
 	out2=$(cli run 2>&1)
 	eq 'run 2 exits 0' '0' "$?"
@@ -4336,6 +4417,9 @@ t_run_integration_bare_repo() {
 	_gt_barchive_calls2=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
 	eq 'and sysupgrade -b was NOT called again -- the archive is not rebuilt when unchanged' \
 		"$_gt_barchive_calls1" "$_gt_barchive_calls2"
+	_gt_main_log2=$(git --git-dir="$_gt_bare" log --oneline main 2>/dev/null)
+	eq 'run 2 (no changes at all) does not push "main" again' \
+		'1' "$(printf '%s\n' "$_gt_main_log2" | grep -c .)"
 
 	# --- run 3: a chmod-only edit git itself would never see ---
 	chmod 0644 "$work/froot/etc/config/network"
@@ -4367,6 +4451,13 @@ t_run_integration_bare_repo() {
 	else
 		no 'and the archive IS rebuilt on this real change' "call count stayed at $_gt_barchive_calls3"
 	fi
+	_gt_readme3=$(git --git-dir="$_gt_bare" cat-file -p device/rt1:README.md 2>/dev/null)
+	_gt_recovery3=$(git --git-dir="$_gt_bare" cat-file -p device/rt1:devices/rt1/RECOVERY.md 2>/dev/null)
+	eq 'run 3'\''s branch-root README.md is still byte-identical to its own RECOVERY.md' \
+		"$_gt_recovery3" "$_gt_readme3"
+	_gt_main_log3=$(git --git-dir="$_gt_bare" log --oneline main 2>/dev/null)
+	eq 'run 3 (device/rt1 already existed) does not push "main" again either' \
+		'1' "$(printf '%s\n' "$_gt_main_log3" | grep -c .)"
 
 	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_SYSUPGRADE_B_LOG
 	kill "$_gl_pid" 2>/dev/null
@@ -5636,6 +5727,7 @@ run_test 'askpass.sh: answers prompts with the token' t_askpass
 run_test 'gitio.sh: gb_remote_head on a branchless repository' t_gitio_remote_head_no_branch
 run_test 'gitio.sh: gb_remote_head against an unreachable repository' t_gitio_remote_head_unreachable
 run_test 'gitio.sh: first commit on a new branch, no parent' t_gitio_first_commit_no_parent
+run_test 'gitio.sh: an extra file can be staged at the branch root, bypassing GB_PREFIX' t_gitio_build_tree_extra_root_file
 run_test 'gitio.sh: commit-tree works with no git identity configured (owlab finding)' t_gitio_commit_push_no_global_git_identity
 run_test 'gitio.sh: a shared branch preserves another device untouched' t_gitio_shared_branch_preserves_other_device
 run_test 'gitio.sh: non-fast-forward push is rejected, then retried once' t_gitio_commit_push_nonfastforward_then_retry

@@ -38,7 +38,7 @@
 	},
 
 	"admin/system/gitbackup/history": {
-		"title": "History",
+		"title": "History / Restore",
 		"order": 4,
 		"action": {
 			"type": "view",

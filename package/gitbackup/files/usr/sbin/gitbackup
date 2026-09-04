@@ -518,6 +518,95 @@ _gb_run_write_state() {
 	} >"$GB_STATE_DIR/state.json" 2>/dev/null
 }
 
+# _gb_run_ensure_main_index <repodir> <branch> -- ticket 22, criterion 4:
+# with the shipped "device/{device}" branch template, a fresh repository
+# has a "main" branch that GitHub renders on the repository's own front
+# page, but nothing ever commits to it -- a human opening the bare repo URL
+# after a router died sees an empty page, even though every device branch
+# carries a working README.md (this file's own README.md-at-branch-root
+# step, right above). This writes a short, one-time index to "main"
+# instead, ONLY when main does not exist at all yet: `gb_remote_head main`
+# printing nothing with rc 0 (interfaces.md's own contract: empty + 0 means
+# "reachable, branch absent", same read every call site in this file
+# already gives GB_PARENT).
+#
+# Deliberately called only once per device -- from _gb_run_backup, only
+# when THIS device's own branch was itself brand new (see
+# _gb_branch_was_new above) -- not on every run: an extra `git ls-remote`
+# to check "does main exist" on every single scheduled run, forever, is a
+# cost every run would pay for a question that only has one interesting
+# answer ever (the first time any device pushes to an empty repository).
+# Once main exists, later devices' own first runs see it already there and
+# skip this entirely -- so this never becomes a second push on any run
+# past the very first one, for any device.
+#
+# A generic, no-device index rather than one gb_card call per device: main
+# is shared across every device on this remote, and gb_card's whole
+# document (auth flags, a specific device's own bootstrap one-liner) only
+# makes sense once a browser is already on the ONE branch it is about.
+# This index's only job is to point that browser at the right branch to
+# begin with; it is not a second recovery card and cannot drift from the
+# real one printed on each device branch, because it never repeats any of
+# that content.
+#
+# Best-effort only: failure here must never fail the backup run that is
+# still in progress when this is called, same convention gb_card's own
+# header uses for exactly the same reason. Prints nothing; return value is
+# not checked by the caller.
+_gb_run_ensure_main_index() {
+	_gb_rmi_repodir="$1"
+	_gb_rmi_branch="$2"
+
+	# GB_PARENT (environment, gitio.sh's own seam) still holds the DEVICE
+	# branch's own parent from the caller -- irrelevant here and actively
+	# wrong to reuse: gb_build_tree would try to seed main's tree from a
+	# commit that belongs to a different branch entirely. Cleared so this
+	# always produces main's own root commit, same shape as any device's
+	# own first-ever backup (gb_commit_push's empty-parent form).
+	GB_PARENT=''
+
+	_gb_rmi_head=$(gb_remote_head main 2>/dev/null)
+	_gb_rmi_rc=$?
+	[ "$_gb_rmi_rc" -eq 0 ] || return 0
+	[ -z "$_gb_rmi_head" ] || return 0
+
+	_gb_rmi_readme="$WORK/main-readme.md"
+	{
+		printf '# gitbackup\n\n'
+		printf 'This repository holds automatic router configuration backups. Each\n'
+		printf 'router pushes to its own branch here -- by default named\n'
+		# shellcheck disable=SC2016  # backticks are markdown code spans in
+		# the generated document, not attempted command substitution
+		printf '`device/<id>`, e.g. `%s` for the router that just created this page.\n\n' "$_gb_rmi_branch"
+		# shellcheck disable=SC2016
+		printf 'Open one of the `device/*` branches above: its own README.md carries\n'
+		printf 'that router'\''s ready-made recovery instructions, including a one-line\n'
+		printf 'command to restore a freshly flashed replacement.\n'
+	} >"$_gb_rmi_readme" 2>/dev/null
+	[ -s "$_gb_rmi_readme" ] || return 0
+
+	_gb_rmi_msg="$WORK/main-readme-message"
+	printf 'gitbackup: initialize repository index\n\nSee device/* branches for each router'\''s own backup and recovery\ninstructions.\n' \
+		>"$_gb_rmi_msg" 2>/dev/null
+
+	# An empty scratch treedir -- gb_build_tree's own walk stages every
+	# regular file/symlink it finds under <treedir>, so this has to hold
+	# NOTHING: the README is added purely through the extra_file/
+	# extra_gitpath pair, at the exact root path "README.md", GB_PREFIX
+	# entirely bypassed (this repo has no per-device prefix to speak of on
+	# "main"). GB_PREFIX is still required to be non-empty by gb_build_tree
+	# itself (`${GB_PREFIX:?...}`) even though nothing here ever uses it.
+	_gb_rmi_emptydir="$WORK/main-readme-empty"
+	rm -rf "$_gb_rmi_emptydir"
+	mkdir -p "$_gb_rmi_emptydir" 2>/dev/null
+
+	_gb_rmi_tree=$(GB_PREFIX='.' gb_build_tree "$_gb_rmi_repodir" "$_gb_rmi_emptydir" "$_gb_rmi_readme" 'README.md' 2>/dev/null)
+	[ -n "$_gb_rmi_tree" ] || return 0
+
+	gb_commit_push "$_gb_rmi_repodir" "$_gb_rmi_tree" '' "$_gb_rmi_msg" main >/dev/null 2>&1
+	return 0
+}
+
 # _gb_run_backup <trigger> -- spec steps 7-15, see this section's own
 # header comment for why this is split out of cmd_run.
 _gb_run_backup() {
@@ -556,6 +645,11 @@ _gb_run_backup() {
 	GB_PARENT=$(gb_remote_head "$_gb_branch")
 	_gb_head_rc=$?
 	[ "$_gb_head_rc" -eq 0 ] || gb_die 3 "gitbackup run: could not reach $GB_URL to resolve $_gb_branch"
+	# Ticket 22: remembered from BEFORE the retry loop below can reassign
+	# GB_PARENT -- "was this device's branch brand new" has to reflect what
+	# was true when this run started, not the retry's re-resolved parent.
+	_gb_branch_was_new=""
+	[ -z "$GB_PARENT" ] && _gb_branch_was_new=1
 
 	_gb_old_manifest="$WORK/old_manifest.json"
 	_gb_changed=1
@@ -593,8 +687,24 @@ _gb_run_backup() {
 
 	# 11b: the recovery card -- only once card.sh (ticket 09) exists; see
 	# this file's own sourcing block for why it is optional today.
+	#
+	# Ticket 22: the exact same content also has to be reachable as
+	# README.md at the BRANCH ROOT (a sibling of $_gb_prefix), because
+	# GitHub only ever renders the root README when a human opens the
+	# branch from a phone after a reset -- devices/<id>/RECOVERY.md alone
+	# is invisible on that first screen. One gb_card call, one file, then
+	# copied byte for byte -- never a second generator call, which could
+	# only ever earn a different "Generated:" timestamp and nothing else,
+	# i.e. exactly the kind of two-texts-that-drifted-apart this ticket
+	# exists to rule out. gb_build_tree (gitio.sh) stages it at the exact
+	# git path "README.md", bypassing GB_PREFIX entirely.
+	_gb_readme_root=''
 	if command -v gb_card >/dev/null 2>&1; then
 		gb_card "$_gb_outdir/RECOVERY.md" 2>/dev/null
+		if [ -s "$_gb_outdir/RECOVERY.md" ]; then
+			_gb_readme_root="$WORK/branch-readme.md"
+			cp -f "$_gb_outdir/RECOVERY.md" "$_gb_readme_root" 2>/dev/null || _gb_readme_root=''
+		fi
 	fi
 
 	_gb_changed_list=$(_gb_run_changed_configs "$_gb_old_manifest" "$(gb_manifest_path "$_gb_outdir")")
@@ -611,7 +721,7 @@ _gb_run_backup() {
 	_gb_t_push_start=$(date +%s)
 	_gb_attempt=1
 	while :; do
-		_gb_tree=$(gb_build_tree "$_gb_repodir" "$_gb_outdir")
+		_gb_tree=$(gb_build_tree "$_gb_repodir" "$_gb_outdir" "$_gb_readme_root" 'README.md')
 		[ -n "$_gb_tree" ] || gb_die 1 'gitbackup run: gb_build_tree failed'
 
 		_gb_commit=$(gb_commit_push "$_gb_repodir" "$_gb_tree" "$GB_PARENT" "$_gb_msgfile" "$_gb_branch")
@@ -642,6 +752,17 @@ _gb_run_backup() {
 	_gb_run_write_state ok pushed "$_gb_commit" \
 		"{\"collect_s\":$_gb_t_collect_s,\"compare_s\":$_gb_t_compare_s,\"push_s\":$_gb_t_push_s}"
 	gb_log notice "gitbackup run: timings -- collect ${_gb_t_collect_s}s, compare ${_gb_t_compare_s}s, push ${_gb_t_push_s}s"
+
+	# Ticket 22, criterion 4: only ever attempted right after THIS device's
+	# own branch was created for the very first time (_gb_branch_was_new,
+	# captured before the retry loop above could reassign GB_PARENT) -- a
+	# regular run against an already-existing branch never even calls
+	# gb_remote_head on "main", let alone pushes to it. Best-effort, after
+	# the real backup already succeeded and its own state is already
+	# written; never changes this run's own reported result.
+	if [ -n "$_gb_branch_was_new" ]; then
+		_gb_run_ensure_main_index "$_gb_repodir" "$_gb_branch"
+	fi
 }
 
 # cmd_run [--trigger cron|manual|procd|luci] -- spec steps 1-6, then hands

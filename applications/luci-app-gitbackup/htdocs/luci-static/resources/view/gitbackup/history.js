@@ -388,10 +388,16 @@ return view.extend({
 		view = E('div', { 'class': 'gitbackup-view' }, [
 			E('style', { 'type': 'text/css' }, [ GB_CSS.join('\n') ]),
 
-			E('h2', {}, _('Git Backup - History')),
+			E('h2', {}, _('Git Backup - History / Restore')),
 
+			// Ticket 22: found-in-the-field complaint was "restore exists
+			// but nobody looks for it on a tab called History" -- this
+			// hint is the fix's cheap half (the tab rename above is the
+			// other): it states the round-trip capability up front, in
+			// plain text, with no hover required, before a single commit
+			// row has even loaded.
 			E('p', { 'class': 'gitbackup-card-hint' },
-				_('The last %d backups on this device\'s own branch. Click "View diff" to see exactly what a backup changed, or "Restore" to roll this router back to it.').format(GB_HISTORY_LIMIT)),
+				_('You can restore this router to any backup listed below, using that backup\'s own "Restore" button. Click "View diff" first to see exactly what it would change.')),
 
 			E('div', { 'id': 'gitbackup-history-body' }, [
 				E('p', { 'class': 'gitbackup-card-hint' }, _('Loading…'))

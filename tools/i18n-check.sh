@@ -52,7 +52,20 @@ chmod +x "$scanner"
 fresh_pot="$RUNNER_TEMP/gitbackup-fresh.pot"
 # i18n-scan.pl scans a whole directory tree by extension (.js among them,
 # per its own %keywords table) and writes one combined .pot to stdout.
-perl "$scanner" "$APP/htdocs" >"$fresh_pot"
+#
+# Ticket 22: this used to scan only "$APP/htdocs" -- which meant every menu
+# title in root/usr/share/luci/menu.d and every ACL description in
+# root/usr/share/rpcd/acl.d was silently invisible to this whole gate, even
+# though i18n-scan.pl's own %keywords table (confirmed against the real
+# openwrt/luci checkout, build/i18n-sync.sh: `./build/i18n-scan.pl "$dir"`
+# with $dir the WHOLE package, not one subdirectory) explicitly extracts
+# "title"/"description" from exactly those two paths (preprocess_json's own
+# `s/("(?:title|description)")\s*:\s*(...)/$1: _($2)/`). Scanning only
+# "$APP" (the whole package) instead is what real luci.mk tooling actually
+# does, and it is the only way a renamed tab (ticket 22's own "Название
+# живёт в menu.d, и его же надо провести через po/ru") can ever be
+# something this gate verifies rather than something nobody ever checks.
+perl "$scanner" "$APP" >"$fresh_pot"
 
 # msgids only, sorted -- comparing the whole file would also flag a changed
 # comment/line-number or a reordered entry, neither of which is "drifted
