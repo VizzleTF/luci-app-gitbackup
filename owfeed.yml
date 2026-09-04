@@ -58,3 +58,27 @@ packages:
     # conffile is an ordinary file to apk, replaced on every upgrade with the package
     # default, wiping the user's configuration.
     conffiles: ["/etc/config/gitbackup"]
+
+  # The second of the two noarch packages the spec names ("Упаковка"): client-side
+  # JS only (menu.d/acl.d JSON plus the four view/*.js files under htdocs/), same
+  # "not one compiled byte" reasoning as gitbackup's own arch: noarch above. Staged
+  # by the same tools/stage.sh into ./dist/luci-root (root/ plus htdocs/ merged at
+  # /www, mirroring this project's own owlab.yaml install: mapping for the dev stand).
+  #
+  # Ships with no translations yet: applications/luci-app-gitbackup/po/ does not
+  # exist until a later ticket adds it (spec "Локализация"; ticket 15's own zone
+  # note: "не падай, пока их нет"). luci-theme-footstrap's own i18n: blocks
+  # (luci-i18n-<app>-<lang> as separate packages, luci.mk's own naming) are the
+  # shape to copy once po/ru/gitbackup.po lands -- nothing to add here before then.
+  - name: luci-app-gitbackup
+    build: mkpkg
+    arch: noarch
+    version-from: file:./dist/LUCI_VERSION
+    files: ./dist/luci-root
+    description: "Automatic configuration backup to a Git repository (LuCI)"
+    # Matches applications/luci-app-gitbackup/Makefile's LUCI_DEPENDS:=+gitbackup --
+    # the "+" is package.mk syntax for "select by default", no owfeed equivalent.
+    depends: [gitbackup]
+    license: GPL-2.0-only
+    url: https://github.com/VizzleTF/luci-app-gitbackup
+    maintainer: "VizzleTF <vizzlef@gmail.com>"

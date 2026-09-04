@@ -1,0 +1,32 @@
+# THE SINGLE SOURCE of the openwrt/luci commit this project borrows two BUILD
+# TOOLS from, and of their checksums. Sourced as shell (`. tools/luci-upstream.pin`)
+# by tools/build-jsmin.sh and tools/fetch-eslint-config.sh, and read by
+# tools/jsmin-verify.mjs only through the binary path those scripts hand it.
+#
+# Three files are downloaded over the network and then EXECUTED as gates:
+#   - jsmin.c           compiled; decides whether our shipped LuCI JS survives
+#                        the exact minifier the OpenWrt buildbot runs it through
+#                        (its regex-vs-division lookback can silently eat a
+#                        file -- ticket 15's own "Главный гейт").
+#   - eslint.config.mjs  loaded by eslint; the brief asks for "eslint с
+#                         конфигом из openwrt/luci" verbatim, so this is that
+#                         config, not a local reimplementation of it.
+#   - i18n-scan.pl      run by perl+xgettext; decides whether our .pot/.po are
+#                        stale (tools/i18n-check.sh). Same upstream perl script
+#                        luci.mk itself uses to build every LuCI app's .pot.
+# Off a moving `master`, either gate would be whatever upstream pushed last --
+# a real (if usually silent) risk: openwrt/luci had jsmin.c REGRESS to eat
+# `return /regex/` more than once in its history (openwrt/luci#8299, #8020,
+# #8021, #8256, per luci-theme-footstrap's own tools/jsmin-verify.mjs, which
+# hit the same class of bug first).
+#
+# To bump: change LUCI_PIN, re-fetch both files at the new commit, update
+# their sha256s.
+#   NEW=<new-commit-sha>
+#   curl -fsSL -o /tmp/jsmin.c "https://raw.githubusercontent.com/openwrt/luci/$NEW/modules/luci-base/src/jsmin.c"
+#   curl -fsSL -o /tmp/eslint.config.mjs "https://raw.githubusercontent.com/openwrt/luci/$NEW/eslint.config.mjs"
+#   sha256sum /tmp/jsmin.c /tmp/eslint.config.mjs
+LUCI_PIN=506ca606d379dd69e9826b2a5e7e2ab90e6b89a5
+JSMIN_SHA256=0568b14873f27f339cf66a9c43603d0bc8ca501ff62522ea924c6e8daf1be215
+ESLINT_CONFIG_SHA256=5a0dd93305ba963f66254ee6090238357e41dbbc1222a115594fc40a132ee358
+I18N_SCAN_SHA256=a1823d1fdd942f31a105e1e53b401e146bc10527f231e016930b1a5123ef21d3

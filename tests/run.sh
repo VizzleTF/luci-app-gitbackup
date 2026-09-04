@@ -4694,18 +4694,51 @@ t_owfeed_yml_matches_makefile() {
 	mk="$root/package/gitbackup/Makefile"
 	yml="$root/owfeed.yml"
 
+	# ticket 15 added a second owfeed.yml package block (luci-app-gitbackup) --
+	# scoped to just the "- name: gitbackup" block (up to the next top-level
+	# "  - name:" or EOF), or a depends:/conffiles: line belonging to the OTHER
+	# package would be picked up by the plain grep below and blamed on this one.
+	yml_gitbackup_block=$(awk '
+		/^  - name: gitbackup$/ { grab = 1; print; next }
+		grab && /^  - name:/ { exit }
+		grab { print }
+	' "$yml")
+
 	# Makefile DEPENDS, minus the package.mk '+' (select-by-default) prefix, which
 	# has no owfeed equivalent (see owfeed.yml's own comment on its depends: line).
 	mk_depends=$(sed -n 's/^[[:space:]]*DEPENDS:=//p' "$mk" | tr ' ' '\n' | sed 's/^+//' | sort)
-	yml_depends=$(sed -n 's/^[[:space:]]*depends: \[\(.*\)\]/\1/p' "$yml" |
+	yml_depends=$(printf '%s\n' "$yml_gitbackup_block" | sed -n 's/^[[:space:]]*depends: \[\(.*\)\]/\1/p' |
 		tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort)
 	eq 'owfeed.yml depends: matches Makefile DEPENDS' "$mk_depends" "$yml_depends"
 
 	# The Package/gitbackup/conffiles block, one path per line between the markers.
 	mk_conffiles=$(sed -n '/^define Package\/gitbackup\/conffiles$/,/^endef$/p' "$mk" | sed '1d;$d' | sort)
-	yml_conffiles=$(sed -n 's/^[[:space:]]*conffiles: \[\(.*\)\]/\1/p' "$yml" |
+	yml_conffiles=$(printf '%s\n' "$yml_gitbackup_block" | sed -n 's/^[[:space:]]*conffiles: \[\(.*\)\]/\1/p' |
 		tr ',' '\n' | tr -d '"' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort)
 	eq 'owfeed.yml conffiles: matches Makefile Package/gitbackup/conffiles' "$mk_conffiles" "$yml_conffiles"
+}
+
+# t_owfeed_yml_matches_luci_makefile -- ticket 15's own second owfeed.yml
+# package block (luci-app-gitbackup, staged by tools/stage.sh into
+# dist/luci-root), held to the same "no second source of truth" standard as
+# t_owfeed_yml_matches_makefile above: applications/luci-app-gitbackup/
+# Makefile's LUCI_DEPENDS is what an SDK build would honor, and owfeed.yml's
+# depends: is what the RELEASED apk actually gets, so a drift between the
+# two would ship a package an SDK build and the release disagree about.
+t_owfeed_yml_matches_luci_makefile() {
+	mk="$root/applications/luci-app-gitbackup/Makefile"
+	yml="$root/owfeed.yml"
+
+	yml_luci_block=$(awk '
+		/^  - name: luci-app-gitbackup$/ { grab = 1; print; next }
+		grab && /^  - name:/ { exit }
+		grab { print }
+	' "$yml")
+
+	mk_depends=$(sed -n 's/^[[:space:]]*LUCI_DEPENDS:=//p' "$mk" | tr ' ' '\n' | sed 's/^+//' | sort)
+	yml_depends=$(printf '%s\n' "$yml_luci_block" | sed -n 's/^[[:space:]]*depends: \[\(.*\)\]/\1/p' |
+		tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort)
+	eq 'owfeed.yml luci-app-gitbackup depends: matches Makefile LUCI_DEPENDS' "$mk_depends" "$yml_depends"
 }
 
 t_config_sections_match_code() {
@@ -4917,6 +4950,7 @@ run_test 'rpcd: config_diff -- no remote configured answers a reason' t_rpcd_con
 run_test 'packaging: Makefile contract' t_makefile_contract
 run_test 'packaging: config sections match code' t_config_sections_match_code
 run_test 'packaging: owfeed.yml matches Makefile' t_owfeed_yml_matches_makefile
+run_test 'packaging: owfeed.yml luci-app-gitbackup block matches its Makefile' t_owfeed_yml_matches_luci_makefile
 run_test 'packaging: no bashisms' t_no_bashisms
 run_test 'packaging: no untracked files under package/gitbackup/files (D02)' t_no_untracked_files_in_package_tree
 

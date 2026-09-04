@@ -1,16 +1,26 @@
-# Seeded in ticket 01 with what exists so far: shellcheck, the POSIX sh unit
-# tests, and packaging via owfeed (not the OpenWrt SDK -- gitbackup is noarch
-# shell/UCI/JSON, and the SDK spent 40+ minutes under x86_64 emulation to
-# perform a `cp`; see owfeed.yml for the full reasoning). Ticket 15 (blocked
-# by the LuCI views, 11-14) replaces this with the full release pipeline --
-# jsmin, the ACL contract, i18n sync, eslint, and the live owlab/action
-# verification against a real router -- so this file stays small on purpose
-# rather than guessing at gates for code that does not exist yet.
-
+# The release pipeline (ticket 15): jsmin, the ACL/conffiles/Makefile/i18n
+# contracts, eslint against openwrt/luci's own config, the real installed
+# size, and a live install-and-poke of the actual .apk on a clean 25.12.4
+# router -- gates chosen by what each one alone would let past a fully
+# green CI otherwise (ticket 15's own brief; the shape borrows from
+# VizzleTF/luci-theme-footstrap's build.yml, not all of it -- see individual
+# job comments for what was and was not applicable to a package this small).
+#
+# G08 / this ticket's own honest resolution of a brief conflict: the brief
+# names `openwrt/gh-action-sdk` for x86/64 AND mediatek/filogic, but both
+# packages here are noarch -- not one compiled byte (spec "Упаковка") -- so
+# a real SDK build under either target produces the SAME bytes twice. The
+# actual release artifact is built once, through `owfeed build` (see the
+# `build` job), which -- unlike the SDK -- also runs the default_postinst
+# wrapper /etc/uci-defaults/99-gitbackup depends on. `sdk-sanity` below is
+# kept anyway, on ONE arch only, as a second, independent proof that
+# "a real OpenWrt SDK still accepts this Makefile" -- never as a source of
+# what ships.
 name: CI
 
 on:
   push:
+    tags: ['v*']
     branches: [main]
   pull_request:
   workflow_dispatch:
@@ -18,45 +28,375 @@ on:
 permissions:
   contents: read
 
-# Every job carries a timeout: the GitHub Actions default is six hours, and a
-# hung step is not the same failure as a red one -- it just takes six hours
-# longer to notice.
+# EVERY JOB CARRIES A TIMEOUT (ticket 15 acceptance criterion): the GitHub
+# Actions default is six hours, and a hung step is not the same failure as
+# a red one -- it is a build that looks "still running" until someone
+# notices and cancels it by hand.
 jobs:
+  # ------------------------------------------------------------------
+  # shellcheck -- file list DERIVED FROM THE TREE (tools/find-shell-files.sh),
+  # not hand-maintained. The old list here was hand-typed and had silently
+  # dropped bootstrap.sh and tests/bootstrap/run.sh -- the latter carrying
+  # fifteen SC2030/SC2031 findings (ticket 15 review) that never reached CI
+  # as a result. bootstrap.sh gets a SEPARATE, stricter pass: the brief's
+  # own words, "он должен быть валиден на голом busybox" -- checked here
+  # with `-s sh` same as everything else (shellcheck has no busybox-ash
+  # dialect of its own; POSIX sh is the closest available and is what every
+  # other script in this project is already held to).
+  # ------------------------------------------------------------------
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          shellcheck -s sh \
-            package/gitbackup/files/usr/share/gitbackup/*.sh \
-            package/gitbackup/files/usr/sbin/gitbackup \
-            package/gitbackup/files/etc/init.d/gitbackup \
-            package/gitbackup/files/etc/uci-defaults/* \
-            tests/run.sh \
-            tools/stage.sh
+      - run: sh tools/find-shell-files.sh | xargs shellcheck -s sh
 
+  # ------------------------------------------------------------------
+  # POSIX sh unit tests -- both suites. tests/run.sh covers
+  # package/gitbackup/files/ (the ACL contract, conffiles-via-Makefile,
+  # the Makefile contract and 570+ other cases from tickets 01-14);
+  # tests/bootstrap/run.sh covers bootstrap.sh itself and was NOT run in CI
+  # before this ticket (acceptance criterion: "sh tests/bootstrap/run.sh
+  # тоже гоняется в CI").
+  # ------------------------------------------------------------------
   unit-tests:
-    name: unit tests
+    name: unit tests (sh)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/run.sh
+      - run: sh tests/bootstrap/run.sh
 
-  # Proves the package still builds the way it is actually released: staged by
-  # tools/stage.sh, packaged by owfeed, not the SDK. No sign/index/publish here --
-  # those need a key and belong to the release pipeline ticket 15 adds.
-  build:
-    name: build (owfeed)
+  # ------------------------------------------------------------------
+  # JS unit tests (ticket 15 acceptance criterion: "Юнит-тесты на JS" --
+  # 575 mutation-tested shell tests and zero JS ones otherwise). Two
+  # separate invocations, not one `node --test tests/`: settings_cron_
+  # fixture.test.js (ticket 12) is a plain script with its own exit code,
+  # not a node:test file, and the shared-fixture requirement it proves --
+  # "tests/fixtures/cron.tsv гоняется и через sh (tests/run.sh, unit-tests
+  # job above), и через node" (R102/R153) -- is exactly what running it
+  # here, on the same fixture file, wires into CI for the first time.
+  # tests/history_view.test.mjs is the new node:test suite, on the three
+  # seams the ticket names: gbBoardMismatch, diff parsing, the restore-log
+  # terminal-line regex -- history.js being the one screen that
+  # irreversibly overwrites the router's filesystem.
+  # ------------------------------------------------------------------
+  js-tests:
+    name: unit tests (js)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: node tests/settings_cron_fixture.test.js
+      - run: node --test tests/history_view.test.mjs
+
+  # ------------------------------------------------------------------
+  # eslint, with openwrt/luci's OWN eslint.config.mjs -- the brief, verbatim
+  # ("eslint с конфигом из openwrt/luci"), not a local reimplementation of
+  # its LuCI globals/ecmaVersion/globalReturn that could quietly drift from
+  # what upstream lints its own resource files with. Fetched at the SAME
+  # pinned commit as jsmin.c (tools/luci-upstream.pin) for the same reason:
+  # it is downloaded over the network and then loaded as a gate.
+  #
+  # The CLI invocation is restricted to this project's own four view files,
+  # so the config's unrelated **/*.md and **/*.json blocks, and its jsdoc
+  # block (scoped to modules/luci-base/**/*.js upstream, which nothing here
+  # matches), never fire on anything of ours.
+  # ------------------------------------------------------------------
+  eslint:
+    name: eslint (openwrt/luci config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: echo "ESLINT_CONFIG=$(sh tools/fetch-eslint-config.sh)" >> "$GITHUB_ENV"
+      - run: npx eslint --config "$ESLINT_CONFIG" applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/*.js
+
+  # ------------------------------------------------------------------
+  # THE MAIN GATE (ticket 15's own words). Buildbot OpenWrt minifies every
+  # LuCI package's JS with its own hand-written jsmin.c, whose regex-vs-
+  # division heuristic can silently eat the rest of a file while still
+  # exiting 0 (openwrt/luci#8299 and friends) -- neither eslint nor the
+  # unit-tests job can see that, because both run against the SOURCE, never
+  # the router's own minified copy.
+  #
+  # tools/jsmin-gate.sh does three things in order: builds jsmin.c from the
+  # pinned openwrt/luci commit (SHA + sha256 in tools/luci-upstream.pin, not
+  # a floating `master`), proves the gate still rejects
+  # tests/fixtures/jsmin-broken.js (a REAL, confirmed-live repro, not a
+  # synthetic one -- see that file's own header for the exact `jsmin` output
+  # it triggers), and only then runs it for real against every shipped
+  # view/*.js. If the self-check itself does not fail, the job fails loudly
+  # BEFORE trusting the real result -- a gate that stopped catching anything
+  # would otherwise look identical to a clean pass.
+  # ------------------------------------------------------------------
+  jsmin:
+    name: jsmin (buildbot minifier round-trip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: sh tools/jsmin-gate.sh
+
+  # ------------------------------------------------------------------
+  # i18n sync (ticket 15 acceptance criterion: ".pot не разошёлся с
+  # исходниками, po/ru не отстал"). po/templates/gitbackup.pot and
+  # po/ru/gitbackup.po are a LATER ticket's files -- tools/i18n-check.sh
+  # exits 0 with an honest "nothing to check yet" until they exist, and
+  # only starts asserting once they do, per this ticket's own zone note
+  # ("не падай, пока их нет, но и не притворяйся, что проверил").
+  #
+  # gettext (xgettext/msgcmp) is asked for only when the runner image does
+  # not already carry it (same pattern as luci-theme-footstrap's own
+  # build.yml): apt is the half of this job that can stall, never the
+  # actual check.
+  # ------------------------------------------------------------------
+  i18n:
+    name: i18n sync (.pot / po/ru)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if command -v xgettext >/dev/null && command -v msgcmp >/dev/null; then
+            echo 'gettext already on this image'
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y gettext
+          fi
+      - run: sh tools/i18n-check.sh
+
+  # ------------------------------------------------------------------
+  # Proves the release is built the way it is actually shipped: staged by
+  # tools/stage.sh, packaged by owfeed (G08 -- both packages are noarch, no
+  # SDK involved), THEN run through `owfeed check` -- build, sign, index and
+  # doctor, entirely on throwaway keys owfeed generates and discards, so a
+  # pull request exercises the same 570+ invariant checks the real release
+  # pipeline runs, with no secret anywhere in this job. `owfeed build`
+  # afterward produces the actual dist/noarch/*.apk this workflow's other
+  # jobs (live, sdk-sanity's own comparison, release) consume -- built
+  # UNSIGNED here on purpose: only the `release` job below ever sees
+  # OWFEED_SIGN_KEY, and it re-runs `owfeed sign` itself on a tag.
+  #
+  # SOURCE_DATE_EPOCH is the COMMIT's own timestamp, not the job's --
+  # ticket 15's own acceptance criterion: a package's identity is a hash
+  # over its payload, so releasing the same commit twice has to produce the
+  # same bytes.
+  # ------------------------------------------------------------------
+  build:
+    name: build (owfeed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: owfeed/owfeed/setup@v0.5.1
         with:
           version: v0.5.1
       - run: ./tools/stage.sh
+      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - run: owfeed check
       - run: owfeed build
-      - run: ls dist/noarch/gitbackup-*.apk
+      - run: ls dist/noarch/gitbackup-*.apk dist/noarch/luci-app-gitbackup-*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owfeed-packages
+          path: dist/noarch
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Second, independent proof that a real OpenWrt SDK still accepts both
+  # Makefiles -- NEVER the source of what ships (see this file's own header
+  # for why the brief's x86/64 + mediatek/filogic pair would otherwise
+  # build the identical noarch artifact twice). One arch is enough to prove
+  # that claim; it says nothing an SDK build on a second arch would not
+  # also say for a package with no compiled byte in it.
+  #
+  # continue-on-error: this job is a courtesy check for anyone who still
+  # builds via a real buildroot checkout (spec "Упаковка": "собрать пакет в
+  # настоящем SDK по-прежнему может кто угодно"), not a release gate --
+  # nothing here blocks `build`, `live` or `release`.
+  # ------------------------------------------------------------------
+  sdk-sanity:
+    name: sdk sanity build (x86/64, not a release source)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: openwrt/gh-action-sdk@v11
+        env:
+          # Same release line as owlab.yaml's own stand (x86_64-25.12.4);
+          # not a second version to keep in sync by hand, just the one this
+          # whole project already targets (spec "Стек и ограничения").
+          ARCH: x86_64-25.12.4
+          FEEDNAME: gitbackup_ci
+          PACKAGES: gitbackup luci-app-gitbackup
+          NO_SHFMT_CHECK: 1
+
+  # ------------------------------------------------------------------
+  # Everything above proves the packages were BUILT correctly. It proves
+  # nothing about what a user cares about: that installing them gives a
+  # router that works. owfeed/owlab/action boots a real, clean OpenWrt
+  # 25.12.4, installs both .apk files this workflow just built, and asserts
+  # against the running router -- an unauthenticated LuCI request is a
+  # redirect to the login form, which is why `assert: http 200 ...` here
+  # runs AFTER the action's own login, not as a hand-written curl.
+  #
+  # No key anywhere in this job, on a pull request or otherwise: it asserts
+  # that the package WORKS, never that anyone should trust its signature.
+  # ------------------------------------------------------------------
+  live:
+    name: the package works on a real router
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: owfeed-packages
+          path: dist/noarch
+      - uses: owfeed/owlab/action@v0.5.3
+        with:
+          version: v0.5.3
+          releases: '25.12.4'
+          install: dist/noarch/gitbackup-*.apk dist/noarch/luci-app-gitbackup-*.apk
+          # `gitbackup status` -- valid JSON on an unconfigured router (spec:
+          # status is soft-validated and always answers, ticket 01). The two
+          # `http 200` lines are the LuCI pages this app actually ships,
+          # by their real dispatch path (root/usr/share/luci/menu.d/
+          # luci-app-gitbackup.json: "admin/system/gitbackup/overview" and
+          # "…/paths", not a guessed "admin/services/…"); the action logs in
+          # first, so an unauthenticated 403/redirect never shows up as a
+          # false pass here.
+          #
+          # The long `exec` line is the closest this static matrix gets to
+          # the brief's own "ванлайнер" without a second, real git host in
+          # the loop: gb_parse_url only accepts https:// or ssh:// (never a
+          # bare filesystem path, confirmed against remoteurl.sh), so the
+          # remote here is the ROUTER'S OWN dropbear sshd over loopback --
+          # gitbackup's own deploy key (gitbackup keygen/pubkey) is
+          # self-authorized into root's authorized_keys, `gitbackup test`
+          # accepts that loopback host key (fed "y" on stdin -- ticket 15's
+          # own note: `[ -r /dev/tty ]` cannot tell "no such node" from "no
+          # controlling terminal" under this same style of exec, interfaces.
+          # md ticket 09), and two `gitbackup run` calls then prove a real
+          # push followed by a real no-op. Confirmed live end-to-end while
+          # writing this workflow (owlab up/exec, not just read from a
+          # comment) before being put here.
+          assert: |
+            package gitbackup
+            package luci-app-gitbackup
+            exec gitbackup status | grep -q '"configured"'
+            http 200 /cgi-bin/luci/admin/system/gitbackup/overview
+            http 200 /cgi-bin/luci/admin/system/gitbackup/paths
+            exec set -eu; mkdir -p /root/.ssh; chmod 700 /root/.ssh; gitbackup keygen >/dev/null; gitbackup pubkey >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; git init -q --bare /tmp/gb-live.git; uci set gitbackup.origin.url='ssh://root@127.0.0.1/tmp/gb-live.git'; uci set gitbackup.origin.visibility=private; uci set gitbackup.origin.acknowledged=1; uci set gitbackup.main.enabled=1; uci commit gitbackup; echo y | gitbackup test; gitbackup run --trigger manual | grep -q pushed; gitbackup run --trigger manual | grep -q 'no changes'
+
+  # ------------------------------------------------------------------
+  # The real installed size, with dependencies (ticket 15 acceptance
+  # criterion: "Размерный бюджет считает реальный размер обоих пакетов с
+  # зависимостями и питает таблицу README" -- task 16's job, not typed by
+  # hand). tools/size-report.sh measures three real snapshots on a live,
+  # clean 25.12.4 router (du -sx / before either package, after gitbackup
+  # -- which pulls git/git-http and their own deps -- and after
+  # luci-app-gitbackup too) and writes dist/size-report.json, uploaded here
+  # for whatever builds README's table to read.
+  #
+  # A separate job from `live` on purpose: `live`'s assertions run through
+  # owfeed/owlab/action, a wrapping composite action with no hook for a
+  # mid-install measurement; this job drives the plain `owlab` CLI directly
+  # (owfeed/owlab/setup, not .../action) so it can snapshot BETWEEN the two
+  # `owlab install` calls. No key here either.
+  # ------------------------------------------------------------------
+  package-size:
+    name: real installed size (feeds README's table)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: owfeed-packages
+          path: dist/noarch
+      - uses: owfeed/owlab/setup@v0.5.3
+        with:
+          version: v0.5.3
+      - run: owlab up owrt2512
+      - run: sh tools/size-report.sh owrt2512 | tee "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        run: owlab down || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: size-report
+          path: dist/size-report.json
+
+  # ------------------------------------------------------------------
+  # The one job that ever sees the signing key. Runs only on a `v*` tag,
+  # which by construction is never a pull_request event -- ticket 15's own
+  # acceptance criterion, "ни одного ключа в джобе, исполняющей код из pull
+  # request", holds regardless of what triggers this workflow.
+  #
+  # `needs` names every gate above (sdk-sanity excluded on purpose -- it is
+  # a courtesy check, not a release gate, see its own comment): a red
+  # linter, a red shellcheck or a router that failed to boot must all block
+  # a release the same way a failed build would.
+  #
+  # OWFEED_SIGN_KEY is `owfeed sign`'s own default env var name (`owfeed
+  # sign -help`: "default: signing.key, or env:OWFEED_SIGN_KEY") -- no flag
+  # needed, and the public half this signs with is the one bootstrap.sh has
+  # embedded as a literal (interfaces.md, ticket 09).
+  #
+  # A release with no artifact has to fail the workflow (ticket 15
+  # acceptance criterion: bootstrap.sh fetches from this Release, so a
+  # release without one silently breaks the one-liner) --
+  # `fail_on_unmatched_files: true` is exactly that.
+  # ------------------------------------------------------------------
+  release:
+    name: sign and publish to the GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [shellcheck, unit-tests, js-tests, eslint, jsmin, i18n, build, live, package-size]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: owfeed/owfeed/setup@v0.5.1
+        with:
+          version: v0.5.1
+      - run: ./tools/stage.sh
+      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - run: owfeed build
+      - run: owfeed sign dist
+        env:
+          OWFEED_SIGN_KEY: ${{ secrets.OWFEED_SIGN_KEY }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            dist/noarch/gitbackup-*.apk
+            dist/noarch/luci-app-gitbackup-*.apk

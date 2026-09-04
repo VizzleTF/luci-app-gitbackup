@@ -1,0 +1,18 @@
+{
+  "name": "luci-app-gitbackup-ci",
+  "private": true,
+  "description": "npm-based CI tooling for gitbackup/luci-app-gitbackup. Nothing here ships to a router: luci.mk copies applications/luci-app-gitbackup/htdocs verbatim and the OpenWrt buildbot has no node. No top-level \"type\": \"module\" on purpose -- tests/settings_cron_fixture.test.js (ticket 12) is a plain CommonJS script and stays one; every file this ticket added that needs ESM (tools/jsmin-verify.mjs, tests/history_view.test.mjs, tests/lib/extract_luci_view.mjs) uses the .mjs extension instead, which is unambiguous regardless of this setting.",
+  "scripts": {
+    "test:js": "node --test tests/*.test.mjs",
+    "test:cron-fixture": "node tests/settings_cron_fixture.test.js"
+  },
+  "devDependencies": {
+    "acorn": "^8.15.0",
+    "eslint": "^10.9.1",
+    "@eslint/js": "^10.0.1",
+    "@eslint/json": "^2.1.0",
+    "@eslint/markdown": "^8.0.3",
+    "eslint-plugin-jsdoc": "^64.3.5",
+    "globals": "^17.12.0"
+  }
+}

@@ -1,10 +1,22 @@
 #!/bin/sh
-# shellcheck disable=SC1090,SC1091,SC2034
+# shellcheck disable=SC1090,SC1091,SC2034,SC2030,SC2031
 #
 # SC1090/SC1091: bootstrap.sh is sourced from a path built at runtime.
 # SC2034: GB_BOOTSTRAP_SOURCED is read by bootstrap.sh itself after being
 # sourced, not used in this file.
-#
+# SC2030/SC2031 (ticket 15 review -- these five sites were invisible to CI
+# before it, see .github/workflows/ci.yml's own shellcheck job for why):
+# every `PATH="$stubdir:$PATH"` in this file sits inside a whole-test-body
+# `( ... )` subshell (t_bootstrap_dry_run_untouched and friends below) and
+# is read only by commands later in that SAME subshell -- the "local to
+# subshell"/"might be lost" shellcheck warns about is exactly the isolation
+# these tests want, so a sibling test's own PATH is never touched by this
+# one. Confirmed by design, not by accident: this is the identical
+# subshell-per-test-body shape tests/run.sh's own harness uses everywhere
+# (that file's header explains why: a real assignment inside one WOULD be
+# invisible outside it, which is the point here and was the actual bug
+# there for the shared pass/fail counter, hence action via a file, not a
+# variable).
 # Unit tests for bootstrap.sh -- the root-router installer (ticket 09), kept
 # separate from tests/run.sh (which only covers package/gitbackup/files/):
 # bootstrap.sh lives in the repository root, is never installed onto a

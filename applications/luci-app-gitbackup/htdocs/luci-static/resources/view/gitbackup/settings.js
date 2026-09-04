@@ -223,7 +223,6 @@ function gbFieldValid(expr, min, max) {
 			return false;
 
 		rangeStr = term;
-		step = 1;
 
 		idx = term.indexOf('/');
 		if (idx !== -1) {
@@ -243,8 +242,7 @@ function gbFieldValid(expr, min, max) {
 		}
 
 		if (rangeStr === '*') {
-			lo = min;
-			hi = max;
+			// min/max are trivially satisfied; nothing to validate.
 		} else if (rangeStr.indexOf('-') !== -1) {
 			idx = rangeStr.indexOf('-');
 			loStr = rangeStr.slice(0, idx);
@@ -264,7 +262,7 @@ function gbFieldValid(expr, min, max) {
 		} else {
 			if (!/^[0-9]+$/.test(rangeStr))
 				return false;
-			lo = hi = parseInt(rangeStr, 10);
+			lo = parseInt(rangeStr, 10);
 			if (lo < min || lo > max)
 				return false;
 		}
@@ -327,7 +325,7 @@ function gbCronValid(expr) {
 // that also tries the modern API first when it is actually available.
 function gbCopyViaTextarea(text, container) {
 	var ta = document.createElement('textarea');
-	var ok = false;
+	var ok;
 
 	ta.value = text;
 	ta.setAttribute('readonly', 'readonly');
@@ -523,7 +521,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'main', 'gitbackup', _('General'));
 		s.addremove = false;
 
-		o = s.option(form.Flag, 'enabled', _('Enabled'),
+		s.option(form.Flag, 'enabled', _('Enabled'),
 			_('Turns the whole package on or off -- scheduled runs, the config-change trigger and manual "Backup now" all stay inert while this is unchecked.'));
 
 		o = s.option(form.Flag, 'archive', _('Keep a local archive'),
@@ -924,7 +922,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'security', 'security', _('Security'));
 		s.addremove = false;
 
-		o = s.option(form.Flag, 'scrub', _('Scrub secrets before committing'),
+		s.option(form.Flag, 'scrub', _('Scrub secrets before committing'),
 			_('Forced on automatically whenever "Repository visibility" above is set to Public -- this checkbox only matters while it is still Private.'));
 
 		o = s.option(form.DynamicList, 'scrub_option', _('Scrub these UCI options'),

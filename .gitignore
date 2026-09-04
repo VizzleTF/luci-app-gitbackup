@@ -11,3 +11,8 @@ __pycache__/
 /dist/
 dist/
 package/*/dist/
+
+# tools/fetch-eslint-config.sh's own scratch copy of openwrt/luci's
+# eslint.config.mjs (pinned + checksummed in tools/luci-upstream.pin,
+# re-fetched every run -- nothing to commit).
+/.cache/
