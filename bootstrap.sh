@@ -65,30 +65,46 @@ set -u
 # signing key come from, unrelated to --repo (the operator's own backup
 # repository, restored in step 4).
 #
-# GB_APK_KEY_PEM is the gitbackup feed's real, current signing public key
-# (generated with `owfeed keygen`, matching what `owfeed install-snippet`
-# emits for this project's own owfeed.yml) -- embedded here, not fetched
-# separately, so it travels inside the one file this whole chain of trust
-# already depends on this script arriving over https intact (spec: "Ключ
-# вшит в bootstrap.sh -- он публичный, а сам скрипт приезжает по TLS").
-# Its matching private half is not, and must never be, anywhere in this
-# repository; only whoever runs the release pipeline (ticket 15) holds it,
-# as a CI secret.
-GB_APK_KEYNAME='gitbackup'
+# GB_APK_KEY_PEM is the INDEX signing key of the feed these packages are
+# published through -- owfeed-packages (https://repo.owfeed.org), the same
+# key that feed's own README tells a router to fetch as
+# /etc/apk/keys/owfeed-packages.pem. It is embedded here rather than
+# downloaded beside the repository line, so the trust decision rides inside
+# the one file this chain already depends on arriving over TLS intact
+# (spec: "Ключ вшит в bootstrap.sh -- он публичный, а сам скрипт приезжает
+# по TLS"), instead of being fetched from the very host it is meant to
+# authenticate.
+#
+# This is NOT this project's own key, and that is the point: an installed
+# apk key is a trust anchor for every package NAME, so a router that
+# already trusts owfeed-packages gains nothing by trusting a second feed
+# for one package. What proves WE built these bytes is the author EC
+# signature inside each .apk (owfeed.yml: no `signing:` block, see there),
+# pinned by that feed as keys/luci-app-gitbackup.pub.pem.
+#
+# Installing this key trusts that feed for every package name it serves.
+# That is the same decision `https://repo.owfeed.org/subscribe.sh` asks a
+# router to make, stated here rather than hidden.
+GB_APK_KEYNAME='owfeed-packages'
 GB_APK_KEY_PEM='-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWNNjZVT3Ti/IAk8K/h7JmEvcngli
-CQXxEls3JruVEh6z+rLxvkJP/DofULHTQAJvfL7dkW3lSid8RI6K0/JuZQ==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVKWqVuaRuBZUBNNsZaQYqzF/GuIr
+J1akQ99KrzX451LbuKylDuYXiykv+ecIZ4G767N7xp6b+OrSoLiCWvm+Lw==
 -----END PUBLIC KEY-----'
 
-# The feed's release base: owfeed.yml's own `feed.url` plus the
-# `releases/<line>/<arch>/packages.adb` layout `owfeed index` actually
-# writes (confirmed live: `owfeed install-snippet -format sh` against this
-# project's committed owfeed.yml prints exactly this shape). Overridable so
-# the mandatory owlab end-to-end run in this ticket can point it at a
-# throwaway local feed built the same way (`owfeed build && owfeed sign &&
-# owfeed index`) instead of waiting on ticket 15's release pipeline to have
-# published the real one.
-GB_APK_FEED_BASE="${GB_BOOTSTRAP_FEED_BASE:-https://github.com/VizzleTF/luci-app-gitbackup/releases}"
+# The feed's base URL: owfeed.yml's own `feed.url`, which is what
+# `owfeed install-snippet` prints and what owfeed-packages' README documents
+# by hand -- ONE answer to "where is the feed", because two of them is a
+# defect that already shipped once (D13: this line used to name
+# https://github.com/VizzleTF/luci-app-gitbackup/releases, a path GitHub
+# serves release assets under /releases/download/<tag>/ and never as a
+# directory tree, so `apk update` could only ever fail here).
+#
+# The `releases/<line>/<arch>/packages.adb` layout under it is what
+# `owfeed index` writes and what that README installs by hand. Overridable
+# so the end-to-end run can point at a throwaway local feed built the same
+# way (`owfeed build && owfeed sign && owfeed index`) instead of waiting on
+# a real publish.
+GB_APK_FEED_BASE="${GB_BOOTSTRAP_FEED_BASE:-https://repo.owfeed.org}"
 
 GB_PKG_NAME='gitbackup'
 
@@ -209,6 +225,17 @@ gb_bs_check_network() {
 # measured live on the 25.12.4 stand (spec "Проверенные факты"): ca-bundle
 # and https already work out of the box here, so that line would be dead
 # weight on every single run of this script.
+# gb_bs_feed_url <line> <arch> -- the one place the repository line is
+# composed, split out of gb_bs_install_pkg so it can be asserted without a
+# root filesystem to write /etc/apk into. The shape is owfeed's, not ours:
+# `owfeed index` writes releases/<line>/<arch>/packages.adb and the feed's
+# own README installs exactly that by hand. Getting this string wrong is
+# not a loud failure -- it is an `apk update` that fails on a router which
+# has just been reset, which is how D13 stayed invisible.
+gb_bs_feed_url() {
+	printf '%s/releases/%s/%s/packages.adb\n' "$GB_APK_FEED_BASE" "$1" "$2"
+}
+
 gb_bs_install_pkg() {
 	mkdir -p /etc/apk/keys /etc/apk/repositories.d
 	printf '%s\n' "$GB_APK_KEY_PEM" >"/etc/apk/keys/$GB_APK_KEYNAME.pem"
@@ -225,7 +252,7 @@ gb_bs_install_pkg() {
 	[ -r /etc/apk/arch ] && _gb_ip_arch=$(cat /etc/apk/arch)
 	[ -n "$_gb_ip_arch" ] || gb_bs_die 'could not read /etc/apk/arch'
 
-	printf '%s\n' "$GB_APK_FEED_BASE/$_gb_ip_line/$_gb_ip_arch/packages.adb" \
+	gb_bs_feed_url "$_gb_ip_line" "$_gb_ip_arch" \
 		>"/etc/apk/repositories.d/$GB_APK_KEYNAME.list"
 
 	# Keep both across a firmware upgrade, same as the feed's own
@@ -235,7 +262,7 @@ gb_bs_install_pkg() {
 	printf '%s\n' "/etc/apk/keys/$GB_APK_KEYNAME.pem" "/etc/apk/repositories.d/$GB_APK_KEYNAME.list" \
 		>"/lib/upgrade/keep.d/$GB_APK_KEYNAME"
 
-	gb_bs_log "installing $GB_PKG_NAME from $GB_APK_FEED_BASE/$_gb_ip_line/$_gb_ip_arch/ ..."
+	gb_bs_log "installing $GB_PKG_NAME from $(gb_bs_feed_url "$_gb_ip_line" "$_gb_ip_arch") ..."
 	apk update || gb_bs_die 'apk update failed -- see above'
 	# No --allow-untrusted anywhere, ever: a signature failure here MUST stop
 	# the script, not fall back to installing an unverified package (ticket

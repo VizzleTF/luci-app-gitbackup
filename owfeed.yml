@@ -26,15 +26,41 @@ version: 1
 
 feed:
   name: gitbackup
-  # Same disclaimer as luci-theme-footstrap's owfeed.yml: this repository publishes
-  # release assets, not a feed anyone subscribes to. The url only has to satisfy the
-  # schema; `owfeed publish` is never run from here.
-  url: https://github.com/VizzleTF/luci-app-gitbackup
+  # This repository publishes RELEASE ASSETS, not a feed of its own. An installed apk key
+  # is a trust anchor for every package NAME, not just ours -- more authority than one
+  # package should ask a router for. The feed that carries these packages is
+  # owfeed-packages: it pins our released artifacts by the signed manifest and signs its
+  # own index, so `build` (plus `sign`/`release` in the release job) is the whole of what
+  # this file drives. `owfeed publish` is never run from here.
+  #
+  # The url is the feed our packages are installed FROM, and it is what
+  # `owfeed install-snippet` prints -- bootstrap.sh takes the same address from the same
+  # place, because two answers to "where is the feed" is exactly the defect that shipped
+  # once already (D13: bootstrap wrote a repositories.d line GitHub cannot serve).
+  url: https://repo.owfeed.org
   title: gitbackup
   maintainer: "VizzleTF <vizzlef@gmail.com>"
   license: GPL-2.0-only
   homepage: https://github.com/VizzleTF/luci-app-gitbackup
 
+# 25.12 and later only, and the line is stated rather than defaulted. This package needs
+# apk: /etc/apk/repositories.d, `apk add` by name and the default_postinst wrapper that
+# makes /etc/uci-defaults/99-gitbackup run are all 25.12-era, and nothing here has been
+# built or tested against opkg on 24.10.
+releases:
+  - line: "25.12"
+    default: true
+    format: apk
+
+# NO `signing:` block, and the absence is deliberate: those keys sign a feed's INDEX, and
+# this repository never builds one. What vouches for these bytes is the EC signature
+# `owfeed sign` puts INSIDE each .apk (the author key, pinned by the carrying feed under
+# keys/luci-app-gitbackup.pub.pem) plus the usign signature `owfeed release` writes over
+# manifest.txt -- both made in the release job, on a tag, where the secrets are reachable
+# and no pull-request job is.
+
+# Required by the schema and unused here: `publish` hands a built feed to a host, and this
+# repository stops after `build`.
 publish:
   - target: github-pages
 
@@ -58,6 +84,8 @@ packages:
     # conffile is an ordinary file to apk, replaced on every upgrade with the package
     # default, wiping the user's configuration.
     conffiles: ["/etc/config/gitbackup"]
+    # Which commit produced these bytes, recorded in the package itself.
+    repo-commit: env:GITHUB_SHA
 
   # The second of the two noarch packages the spec names ("Упаковка"): client-side
   # JS only (menu.d/acl.d JSON plus the four view/*.js files under htdocs/), same

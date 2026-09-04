@@ -484,6 +484,78 @@ t_bootstrap_help_documents_list_needs_package() {
 		'installs nothing' "$out"
 }
 
+# t_bootstrap_feed_url -- D13. The repository line this script writes is the
+# whole of Path 1: get it wrong and `apk update` fails on a router that has
+# just been reset, with an error an operator reads as "the internet is
+# broken". The shape asserted here is owfeed's own -- <base>/releases/<line>/
+# <arch>/packages.adb -- and it was verified against the live feed on the
+# owlab stand (apk update listed "owfeed community packages", `apk add
+# --simulate` resolved a package from it) before this test was written.
+#
+# The previous value, https://github.com/VizzleTF/luci-app-gitbackup/releases,
+# is asserted against explicitly: GitHub serves release assets under
+# /releases/download/<tag>/ and never as a directory tree, so that base could
+# not work at any point in the path and must not come back.
+t_bootstrap_feed_url() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		. "$bootstrap"
+
+		eq 'the default feed base is the feed that actually carries the package' \
+			'https://repo.owfeed.org' "$GB_APK_FEED_BASE"
+		eq 'gb_bs_feed_url composes owfeed'"'"'s own releases/<line>/<arch> layout' \
+			'https://repo.owfeed.org/releases/25.12/aarch64_generic/packages.adb' \
+			"$(gb_bs_feed_url 25.12 aarch64_generic)"
+
+		case "$GB_APK_FEED_BASE" in
+			*github.com*) no 'the feed base is not a github.com path apk cannot fetch' \
+				"base is $GB_APK_FEED_BASE" ;;
+			*) ok 'the feed base is not a github.com path apk cannot fetch' ;;
+		esac
+
+		# A fresh shell, because GB_APK_FEED_BASE is resolved once at load
+		# time: the override has to be in the environment BEFORE the script
+		# is sourced, which is exactly how the end-to-end run against a
+		# throwaway local feed uses it.
+		out=$(
+			GB_BOOTSTRAP_SOURCED=1 \
+			GB_BOOTSTRAP_FEED_BASE='http://127.0.0.1:8099' \
+			BS="$bootstrap" sh -c '. "$BS"; gb_bs_feed_url 25.12 noarch' 2>&1
+		)
+		eq 'GB_BOOTSTRAP_FEED_BASE still overrides it for a throwaway local feed' \
+			'http://127.0.0.1:8099/releases/25.12/noarch/packages.adb' "$out"
+	)
+}
+
+# t_bootstrap_key_name_and_pem_agree -- the key is written to
+# /etc/apk/keys/$GB_APK_KEYNAME.pem and the repository line to
+# /etc/apk/repositories.d/$GB_APK_KEYNAME.list, so the name is not cosmetic:
+# it is what the feed'"'"'s own documented install uses, and a router that
+# already subscribed by hand must end up with one key file, not two.
+#
+# The PEM itself is the feed'"'"'s index key. A wrong or stale one here fails as
+# UNTRUSTED at `apk add`, which is indistinguishable from tampering -- so
+# this asserts the exact bytes, and they were fetched from
+# https://repo.owfeed.org/owfeed-packages.pem and compared on the stand.
+t_bootstrap_key_name_and_pem_agree() {
+	(
+		GB_BOOTSTRAP_SOURCED=1
+		. "$bootstrap"
+
+		eq 'the key file is named after the feed that signs the index' \
+			'owfeed-packages' "$GB_APK_KEYNAME"
+		contains 'the embedded key is a PEM public key, not a private half' \
+			'-----BEGIN PUBLIC KEY-----' "$GB_APK_KEY_PEM"
+		case "$GB_APK_KEY_PEM" in
+			*PRIVATE*) no 'no private key material is embedded' 'PRIVATE found in GB_APK_KEY_PEM' ;;
+			*) ok 'no private key material is embedded' ;;
+		esac
+		contains 'and it is the owfeed-packages index key, byte for byte' \
+			'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVKWqVuaRuBZUBNNsZaQYqzF/GuIr' \
+			"$GB_APK_KEY_PEM"
+	)
+}
+
 # --------------------------------------------------------------------------
 run_test 'bootstrap: parses every flag, both "--f v" and "--f=v" forms' t_bootstrap_parses_all_flags
 run_test 'bootstrap: an unknown flag dies with a message naming it' t_bootstrap_unknown_flag_dies
@@ -496,6 +568,8 @@ run_test 'bootstrap: --list installs the package if it is missing' t_bootstrap_l
 run_test 'bootstrap: --list skips install when the package is already there' t_bootstrap_list_skips_install_when_already_installed
 run_test 'bootstrap: --list --dry-run installs nothing' t_bootstrap_list_dry_run_installs_nothing
 run_test 'bootstrap: --help documents --list needs the package' t_bootstrap_help_documents_list_needs_package
+run_test 'bootstrap: the feed URL is the one owfeed actually serves' t_bootstrap_feed_url
+run_test 'bootstrap: the apk key name and the embedded PEM agree with the feed' t_bootstrap_key_name_and_pem_agree
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")

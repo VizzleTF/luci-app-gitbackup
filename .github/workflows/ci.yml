@@ -216,10 +216,22 @@ jobs:
       - run: owfeed check
       - run: owfeed build
       - run: ls dist/noarch/gitbackup-*.apk dist/noarch/luci-app-gitbackup-*.apk
+      # TWO paths on purpose, and the second one is load-bearing.
+      # upload-artifact roots the archive at the least common ancestor of what
+      # it matched: with `dist/noarch` alone that root is dist/noarch, and the
+      # .apk files land FLAT in whatever directory the consumer unpacks into.
+      # `owfeed sign`/`owfeed release` walk one directory PER ARCHITECTURE and
+      # reject a flat tree outright ("dist holds no packages; run `owfeed build`
+      # first" -- reproduced locally before this was written), so the release
+      # job below would fail on a tag, after the tag is already pushed. Naming
+      # dist/VERSION too moves the root up to dist/ and the noarch/ directory
+      # survives the round trip.
       - uses: actions/upload-artifact@v4
         with:
           name: owfeed-packages
-          path: dist/noarch
+          path: |
+            dist/noarch
+            dist/VERSION
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -276,7 +288,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: owfeed-packages
-          path: dist/noarch
+          path: dist
       - uses: owfeed/owlab/action@v0.5.3
         with:
           version: v0.5.3
@@ -339,7 +351,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: owfeed-packages
-          path: dist/noarch
+          path: dist
       - uses: owfeed/owlab/setup@v0.5.3
         with:
           version: v0.5.3
@@ -353,50 +365,67 @@ jobs:
           path: dist/size-report.json
 
   # ------------------------------------------------------------------
-  # The one job that ever sees the signing key. Runs only on a `v*` tag,
-  # which by construction is never a pull_request event -- ticket 15's own
+  # The one job that ever sees a signing key -- and it does not run here:
+  # it is owfeed's own reusable release workflow, called on a `v*` tag,
+  # which by construction is never a pull_request event. Ticket 15's
   # acceptance criterion, "ни одного ключа в джобе, исполняющей код из pull
   # request", holds regardless of what triggers this workflow.
+  #
+  # WHY A REUSABLE WORKFLOW AND NOT THE FOUR STEPS IT REPLACES. The hand-
+  # written job that stood here signed the packages and attached two .apk
+  # files to the Release -- and that was the whole of it, which is what made
+  # D13 possible: no manifest, no index, nothing a feed could ingest, while
+  # bootstrap.sh told routers to add a repository line for it. The reusable
+  # workflow is the shape the feed actually consumes, and it closes three
+  # windows this repository had open (its own header documents each):
+  # the Release is created as a DRAFT and published only once its assets are
+  # attached, so a router polling `releases/latest/download/manifest.txt`
+  # never resolves to a release that has none; every signature is verified
+  # against the public half committed here before publishing, so a rotated
+  # secret fails the build instead of shipping a release every installer
+  # rejects; and the published manifest is fetched back through
+  # latest/download and compared with the one just built.
+  #
+  # WHAT SIGNS WHAT:
+  #   sign-key  -- the AUTHOR's EC key, one per repository. Its signature
+  #                goes INSIDE each .apk and travels all the way to the
+  #                router, so anyone can confirm who built a package
+  #                without trusting the feed that served it. Its public
+  #                half is pinned by owfeed-packages as
+  #                keys/luci-app-gitbackup.pub.pem.
+  #   usign-key -- the SHARED release key, the same one the other packages
+  #                in this feed use. It signs manifest.txt, the inventory of
+  #                the release as a whole, which per-package signatures
+  #                cannot cover. Its public half is release.pub in this
+  #                repository, and `verify-with` holds the job to it.
   #
   # `needs` names every gate above (sdk-sanity excluded on purpose -- it is
   # a courtesy check, not a release gate, see its own comment): a red
   # linter, a red shellcheck or a router that failed to boot must all block
-  # a release the same way a failed build would.
-  #
-  # OWFEED_SIGN_KEY is `owfeed sign`'s own default env var name (`owfeed
-  # sign -help`: "default: signing.key, or env:OWFEED_SIGN_KEY") -- no flag
-  # needed, and the public half this signs with is the one bootstrap.sh has
-  # embedded as a literal (interfaces.md, ticket 09).
-  #
-  # A release with no artifact has to fail the workflow (ticket 15
-  # acceptance criterion: bootstrap.sh fetches from this Release, so a
-  # release without one silently breaks the one-liner) --
-  # `fail_on_unmatched_files: true` is exactly that.
+  # a release the same way a failed build would. `live` in particular is
+  # what keeps a tag from publishing bytes no router has installed.
   # ------------------------------------------------------------------
   release:
-    name: sign and publish to the GitHub Release
+    name: sign and publish the release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [shellcheck, unit-tests, js-tests, eslint, jsmin, i18n, build, live, package-size]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: owfeed/owfeed/setup@v0.5.1
-        with:
-          version: v0.5.1
-      - run: ./tools/stage.sh
-      - run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-      - run: owfeed build
-      - run: owfeed sign dist
-        env:
-          OWFEED_SIGN_KEY: ${{ secrets.OWFEED_SIGN_KEY }}
-      - uses: softprops/action-gh-release@v2
-        with:
-          fail_on_unmatched_files: true
-          files: |
-            dist/noarch/gitbackup-*.apk
-            dist/noarch/luci-app-gitbackup-*.apk
+    uses: owfeed/owfeed/.github/workflows/package.yml@v0.5.1
+    secrets:
+      sign-key: ${{ secrets.OWFEED_AUTHOR_KEY }}
+      usign-key: ${{ secrets.FOOTSTRAP_USIGN_KEY }}
+    with:
+      owfeed-version: v0.5.1
+      # bootstrap.sh is fetched by `wget -qO- .../bootstrap.sh | sh` and run
+      # as root on a router that has just been reset -- it is not a package
+      # and has no place in the manifest's inventory, but it is executable
+      # code handed to root, so it is signed with the release key beside the
+      # packages and a careful operator can check it out of band.
+      sign-also: bootstrap.sh
+      pre-release: cp bootstrap.sh dist/bootstrap.sh
+      # The public half of the usign key above. A secret rotated without
+      # this file being updated otherwise ships a release every installer
+      # rejects with BAD SIGNATURE -- indistinguishable from the tampering
+      # the signature exists to catch.
+      verify-with: release.pub
