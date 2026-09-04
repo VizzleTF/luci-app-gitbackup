@@ -65,11 +65,6 @@ packages:
   # by the same tools/stage.sh into ./dist/luci-root (root/ plus htdocs/ merged at
   # /www, mirroring this project's own owlab.yaml install: mapping for the dev stand).
   #
-  # Ships with no translations yet: applications/luci-app-gitbackup/po/ does not
-  # exist until a later ticket adds it (spec "Локализация"; ticket 15's own zone
-  # note: "не падай, пока их нет"). luci-theme-footstrap's own i18n: blocks
-  # (luci-i18n-<app>-<lang> as separate packages, luci.mk's own naming) are the
-  # shape to copy once po/ru/gitbackup.po lands -- nothing to add here before then.
   - name: luci-app-gitbackup
     build: mkpkg
     arch: noarch
@@ -82,3 +77,46 @@ packages:
     license: GPL-2.0-only
     url: https://github.com/VizzleTF/luci-app-gitbackup
     maintainer: "VizzleTF <vizzlef@gmail.com>"
+
+  # Translation, as its own package -- same shape luci-theme-footstrap's owfeed.yml
+  # uses for luci-i18n-footstrap-<lang> (luci.mk's own naming: luci-i18n-<basename>-
+  # <lang>, one package per language). applications/luci-app-gitbackup/po/ru/
+  # gitbackup.po exists and is complete (i18n-check.sh's msgcmp gate is green); the
+  # only language shipped so far is ru, hence one package, not a loop.
+  #
+  # i18n.from points straight at the committed po/ tree, not a staged copy: owfeed's
+  # compiler globs <from>/*/*.po, so po/templates/gitbackup.pot (a .pot, not .po) is
+  # skipped by the extension alone and po/ needs no ticket-15-style staging step of
+  # its own. basename is spelled out rather than left to the .po filename's default
+  # (which already resolves to the same "gitbackup") for the reason footstrap's own
+  # owfeed.yml gives: a renamed .po must not silently rename the shipped .lmo under
+  # it.
+  #
+  # `files:` still has to point at a real staged directory -- owfeed rejects a mkpkg
+  # package with no files: at all -- and that directory (dist/i18n-ru, built by
+  # tools/stage.sh) carries exactly one thing: the uci-defaults line luci.mk's own
+  # Package/luci-i18n-$(LUCI_BASENAME)-$(1)/install emits, `uci set
+  # luci.languages.ru=...`. Without it the .lmo is on disk but LuCI's own Language
+  # dropdown (luci-mod-system's system.js: `Object.assign({en:'English'},
+  # uci.get('luci','languages'))`) never lists Russian as a choice -- confirmed
+  # against the openwrt/luci checkout, not assumed.
+  - name: luci-i18n-gitbackup-ru
+    build: mkpkg
+    arch: noarch
+    version-from: file:./dist/LUCI_VERSION
+    files: ./dist/i18n-ru
+    description: "Automatic configuration backup to a Git repository (LuCI) - Russian translation"
+    depends: [luci-app-gitbackup]
+    license: GPL-2.0-only
+    url: https://github.com/VizzleTF/luci-app-gitbackup
+    maintainer: "VizzleTF <vizzlef@gmail.com>"
+    i18n:
+      from: ./applications/luci-app-gitbackup/po
+      basename: gitbackup
+    # Two entries, one pinned with `=`, per owfeed's own requirement -- this is what
+    # re-fires the rule on every luci-app-gitbackup upgrade. luci-i18n-base-ru is
+    # what "this router already reads Russian" looks like to apk (it cannot read
+    # `uci luci.main.lang` itself); a router without it installed still gets this
+    # package by explicit `apk add luci-i18n-gitbackup-ru`, install-if only governs
+    # the automatic pull.
+    install-if: [ "luci-app-gitbackup={version}", "luci-i18n-base-ru" ]

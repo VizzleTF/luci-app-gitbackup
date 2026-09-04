@@ -1,16 +1,21 @@
 #!/bin/sh
-# Stage both of this repository's packages' rootfs for owfeed -- the half of
-# the build owfeed does not do.
+# Stage all three of this repository's packages' rootfs for owfeed -- the half
+# of the build owfeed does not do.
 #
 #   ./tools/stage.sh              # dist/root + dist/VERSION (gitbackup)
 #                                  # dist/luci-root + dist/LUCI_VERSION (luci-app-gitbackup)
+#                                  # dist/i18n-ru (luci-i18n-gitbackup-ru)
 #   GB_VERSION=1.2.0-r1 ./tools/stage.sh
 #   GB_LUCI_VERSION=1.2.0-r1 ./tools/stage.sh
 #
-# `owfeed build` packages a DIRECTORY; it does not build one. Both packages are
-# noarch -- POSIX shell, UCI text, JSON and client-side JS, not one compiled byte
-# (spec "Упаковка") -- so staging is a straight copy of each package's own files,
-# plus the version stamp an SDK build would otherwise be the only source of.
+# `owfeed build` packages a DIRECTORY; it does not build one. All three packages
+# are noarch -- POSIX shell, UCI text, JSON and client-side JS, not one compiled
+# byte (spec "Упаковка") -- so staging is a straight copy of each package's own
+# files, plus the version stamp an SDK build would otherwise be the only source
+# of. The third package's translation catalogue itself is not staged here at
+# all: owfeed.yml's `i18n:` block compiles applications/luci-app-gitbackup/po/
+# directly, so this script only prepares the one file that isn't a .po --
+# see the i18n-ru block below.
 #
 # No lifecycle-script extraction here, unlike luci-theme-footstrap's tools/stage.sh.
 # That script pulls postinst/prerm bodies out of its Makefile because that Makefile
@@ -76,9 +81,26 @@ LUCI_VER="${GB_LUCI_VERSION:-}"
 [ -n "$LUCI_VER" ] || LUCI_VER=$(_stage_version "$LUCI_SRC/Makefile")
 printf '%s\n' "$LUCI_VER" >"$DIST/LUCI_VERSION"
 
+# --------------------------------------------------------------------------
+# luci-i18n-gitbackup-ru -- owfeed.yml's `i18n:` block reads the .po files
+# straight from applications/luci-app-gitbackup/po/, so the only thing this
+# package's `files:` needs staged is the uci-defaults line luci.mk itself
+# emits for every luci-i18n-<basename>-<lang> package (luci.mk, Package/
+# luci-i18n-$(LUCI_BASENAME)-$(1)/install): without it the catalogue is on
+# disk but LuCI's own Language dropdown (luci-mod-system's system.js reads
+# uci.get('luci','languages')) never offers Russian as a choice. The label
+# is luci.mk's own LUCI_LANG.ru string, copied verbatim so this package
+# writes the same text every other luci-i18n-*-ru package does.
+# --------------------------------------------------------------------------
+I18N_RU_STAGE="$DIST/i18n-ru"
+mkdir -p "$I18N_RU_STAGE/etc/uci-defaults"
+printf "uci set luci.languages.ru='%s'; uci commit luci\n" 'Русский (Russian)' \
+	>"$I18N_RU_STAGE/etc/uci-defaults/luci-i18n-gitbackup-ru"
+
 # macOS writes these into any directory Finder has looked at; owfeed refuses a
 # payload that carries one.
 find "$DIST" -name '.DS_Store' -delete
 
 echo "staged $DIST/root at $(cat "$DIST/VERSION")"
 echo "staged $DIST/luci-root at $(cat "$DIST/LUCI_VERSION")"
+echo "staged $DIST/i18n-ru"
