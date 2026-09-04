@@ -30,12 +30,15 @@ function loadHelpers() {
 	const src = readFileSync(HISTORY_PATH, 'utf8');
 	const fns = [
 		'gbDiffSections', 'gbSectionPath', 'gbSectionStatus', 'gbDiffFileList',
-		'gbBoardMismatch', 'gbFilesPath', 'gbRestorePlan', 'gbRestoreLogSuccess'
+		'gbBoardMismatch', 'gbFilesPath', 'gbRestorePlan', 'gbRestoreLogSuccess',
+		'gbClassifyRestoreLog', 'gbRestoreSeverity'
 	];
 	const body = fns.map((n) => extractFunctionSource(src, n)).join('\n')
 		+ '\n' + extractVarStatement(src, 'GB_RESTORE_TERMINAL_RE')
+		+ '\nfunction _(s) { return s; }' // gbClassifyRestoreLog's own messages go through LuCI's gettext _() -- a plain passthrough here, same convention this file already needs none of otherwise (its extracted functions carry no user-facing text of their own).
 		+ '\nreturn { gbDiffSections, gbSectionPath, gbSectionStatus, gbDiffFileList, '
-		+ 'gbBoardMismatch, gbFilesPath, gbRestorePlan, gbRestoreLogSuccess, GB_RESTORE_TERMINAL_RE };';
+		+ 'gbBoardMismatch, gbFilesPath, gbRestorePlan, gbRestoreLogSuccess, '
+		+ 'gbClassifyRestoreLog, gbRestoreSeverity, GB_RESTORE_TERMINAL_RE };';
 	// eslint-disable-next-line no-new-func
 	return new Function(body)();
 }
@@ -174,16 +177,24 @@ test('gbRestorePlan lists only real files/ paths, skips meta/ and deletions', ()
 // жёсткий потолок 5 минут"). A false negative here means the poller never
 // notices restore finished; a false positive means it stops watching too
 // early.
+//
+// Ticket 23: this fixture's own "writing one or more files failed" line
+// used to stand in for restore.sh's partial-write outcome and never
+// actually matched anything the shell side logs -- restore.sh (ticket 19,
+// _gb_restore) prints "gb_restore: the following paths were NOT
+// written:<list>" instead, verified directly against
+// package/gitbackup/files/usr/share/gitbackup/restore.sh. The line below
+// is that real string, not the one this test used to assert against.
 test('GB_RESTORE_TERMINAL_RE matches every documented terminal outcome', () => {
 	const terminalLines = [
 		'gb_restore: restored r1 from abc123 on device/r1',
+		'gb_restore: the following paths were NOT written:\n  /etc/hosts: could not write',
 		'this backup was taken on a different board',
 		'sha256 mismatch, refusing to write anything to disk',
 		'devices/r1/manifest.json does not exist on origin yet -- nothing to restore',
 		'commit abc123 was not found on device/r1 at origin',
 		'could not read manifest.json from abc123 on device/r1: fetch failed',
 		'git fetch origin device/r1 failed',
-		'writing one or more files failed',
 		'cannot create a work directory',
 		'repository url is required'
 	];
@@ -199,4 +210,45 @@ test('gbRestoreLogSuccess is true only for the actual success line', () => {
 	assert.equal(H.gbRestoreLogSuccess('gb_restore: restored r1 from abc123 on device/r1'), true);
 	assert.equal(H.gbRestoreLogSuccess('gb_restore: starting restore of r1'), false);
 	assert.equal(H.gbRestoreLogSuccess('this backup was taken on a different board'), false);
+});
+
+// gbClassifyRestoreLog -- ticket 23's own three-way outcome for the
+// restore confirmation modal (spec: "Частичный успех restore... обязан
+// быть виден и отличаться от полного"). 'partial' is the one this ticket
+// exists for: ticket 19's restore.sh always applies permissions to
+// whatever DID get written even when a path failed, and this must not
+// read as either a clean success or an outright failure.
+test('gbClassifyRestoreLog reports the clean-success line as "success"', () => {
+	const cls = H.gbClassifyRestoreLog('gb_restore: restored r1 from abc123 on device/r1');
+	assert.equal(cls.kind, 'success');
+});
+
+test('gbClassifyRestoreLog reports a partial write as "partial", not "success" or plain failure', () => {
+	const cls = H.gbClassifyRestoreLog('gb_restore: the following paths were NOT written:\n  /etc/hosts: could not write');
+	assert.equal(cls.kind, 'partial');
+	assert.notEqual(cls.kind, 'success');
+});
+
+test('gbClassifyRestoreLog reports a board mismatch refusal as "blocked", not a generic error', () => {
+	const cls = H.gbClassifyRestoreLog('this backup was taken on a different board');
+	assert.equal(cls.kind, 'blocked');
+});
+
+test('gbClassifyRestoreLog reports a network/fetch failure as "error"', () => {
+	assert.equal(H.gbClassifyRestoreLog('git fetch origin device/r1 failed').kind, 'error');
+	assert.equal(H.gbClassifyRestoreLog('cannot create a work directory').kind, 'error');
+});
+
+// gbRestoreSeverity -- the display-severity gbClassifyRestoreLog's four
+// kinds collapse to. Worked out by hand from the spec's own three visible
+// states (идёт/хорошо/плохо), not by re-deriving the function's own
+// mapping: success is the only "ok", partial and blocked both need a
+// second look without being the same "something is broken" as a real
+// error.
+test('gbRestoreSeverity maps every gbClassifyRestoreLog kind to one of three severities', () => {
+	assert.equal(H.gbRestoreSeverity('success'), 'ok');
+	assert.equal(H.gbRestoreSeverity('partial'), 'warn');
+	assert.equal(H.gbRestoreSeverity('blocked'), 'warn');
+	assert.equal(H.gbRestoreSeverity('error'), 'error');
+	assert.equal(H.gbRestoreSeverity('unknown'), 'error');
 });

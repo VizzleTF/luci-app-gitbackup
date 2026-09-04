@@ -2,8 +2,12 @@
 'require view';
 'require form';
 'require rpc';
-'require poll';
 'require ui';
+'require view.gitbackup.oplog as oplog';
+/* global oplog */
+// See overview.js's own identical comment: the project's eslint config
+// (openwrt/luci's own) only knows a fixed list of stock LuCI module names
+// as globals, not this app's own oplog.js alias.
 
 // gitbackup -- Settings (ticket 12, spec "Решения по реализации -> LuCI ->
 // Settings", "UCI-схема", "Аутентификация", "Парсер remote URL",
@@ -444,6 +448,21 @@ function gbClassifyTestLog(text) {
 	return { kind: 'pending', message: _('Waiting for the test to finish…') };
 }
 
+// gbTestSeverity <kind> -- ticket 23's own three visible states applied to
+// gbClassifyTestLog's own six terminal kinds: 'ok' only for a real success,
+// 'error' for the two outcomes that mean the remote flatly refused or could
+// not be reached at all, 'warn' for everything else a completed test can
+// report ("could not verify", "needs a host key accepted first") -- none of
+// which are a plain success, but none of which are the same dead end as
+// "network unreachable" either.
+function gbTestSeverity(kind) {
+	if (kind === 'ok')
+		return 'ok';
+	if (kind === 'public' || kind === 'network' || kind === 'auth')
+		return 'error';
+	return 'warn';
+}
+
 // Terminal markers for the live-log poller below -- same convention and
 // same reasoning as overview.js's own GB_LOG_TERMINAL_RE: one regex so the
 // "did this just finish" check and gbClassifyTestLog's own "what happened"
@@ -501,6 +520,14 @@ function gbBuildDeployKeyBody(view) {
 		]));
 	}
 
+	// Ticket 23: the one status line shared by "Generate deploy key" and
+	// "Regenerate key" -- 'busy' (spinning) the instant either is clicked,
+	// then an explicit success/error message once keygen actually answers
+	// (handleGenerateKey below). Rebuilt along with the rest of this
+	// subtree on every call, so it always starts empty/hidden on a fresh
+	// paint and never shows a stale result from a previous click.
+	wrap.appendChild(E('p', { 'class': 'gitbackup-hint', 'id': 'gitbackup-keygen-status', 'hidden': true }));
+
 	return wrap;
 }
 
@@ -517,6 +544,7 @@ var GB_CSS = [
 	'.gitbackup-warn-text { color: var(--warn-color-high, #b45f06); font-weight: bold; }',
 	'.gitbackup-hint { font-size: .85em; color: var(--text-color-medium, #666); margin-top: .3em; }',
 	'.gitbackup-hint-ok { color: var(--success-color-high, #2e7d32); }',
+	'.gitbackup-hint-warn { color: var(--warn-color-high, #b45f06); }',
 	'.gitbackup-hint-error { color: var(--error-color-high, #c62828); }',
 	'.gitbackup-log { max-height: 220px; overflow: auto; background: var(--background-color-low, #f5f5f5); color: var(--text-color-high, #333); border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .5em .7em; font-family: monospace; font-size: .8em; white-space: pre-wrap; margin-top: .5em; }',
 	'.gitbackup-test-result { font-weight: bold; margin-top: .4em; }'
@@ -976,8 +1004,9 @@ return view.extend({
 		// query -- every color already comes from a token (rule 8),
 		// `@container` rather than `@media` for the one place layout reacts
 		// to width (rule 9), no window.onload/document.body/absurd z-index
-		// and this view's one custom poller (the test-connection live log)
-		// is bounded and explicitly stopped (rule 10), stock Save/Apply/
+		// and this view's one poller against `log` (the test-connection
+		// live log, oplog.js's shared instance) is bounded and explicitly
+		// stopped by that shared module itself (rule 10), stock Save/Apply/
 		// Reset left alone rather than hidden with CSS (rule 11 -- see the
 		// file header comment for why this view, unlike the other three,
 		// does not null them out at all).
@@ -1001,11 +1030,11 @@ return view.extend({
 		var btn = ev.target;
 
 		btn.disabled = true;
+		self.setKeygenStatus('busy', force ? _('Regenerating…') : _('Generating…'));
 
 		return callKeygen(force ? true : undefined).then(function(res) {
 			if (!res || res.ok !== true) {
-				ui.addNotification(null, E('p', {},
-					_('Could not generate a deploy key: %s').format((res && res.reason) || _('unknown error'))), 'error');
+				self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format((res && res.reason) || _('unknown error')));
 				btn.disabled = false;
 				return;
 			}
@@ -1016,11 +1045,29 @@ return view.extend({
 
 				if (old && old.parentNode)
 					old.parentNode.replaceChild(gbBuildDeployKeyBody(self), old);
+
+				// The rebuilt subtree above starts with a fresh, hidden
+				// status line (gbBuildDeployKeyBody's own comment) -- the
+				// explicit success message ticket 23 asks for ("кончилось
+				// хорошо") is set on THAT new node, not the one just
+				// replaced.
+				self.setKeygenStatus('ok', force ? _('Deploy key regenerated.') : _('Deploy key generated.'));
 			});
 		}, function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not generate a deploy key: %s').format(e.message)), 'error');
+			self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format(e.message));
 			btn.disabled = false;
 		});
+	},
+
+	setKeygenStatus: function(kind, text) {
+		var el = document.getElementById('gitbackup-keygen-status');
+
+		if (!el)
+			return;
+
+		el.hidden = false;
+		el.className = 'gitbackup-hint' + (kind === 'busy' ? ' spinning' : ' gitbackup-hint-' + kind);
+		el.textContent = text;
 	},
 
 	// handleCopyPubkey -- spec, verbatim: "Скопировано" показывается
@@ -1042,115 +1089,50 @@ return view.extend({
 		});
 	},
 
-	// setTestBusy/startTestLog/pollTestLog/stopTestLog -- overview.js's own
-	// startLiveLog/pollLiveLog/stopLiveLog, adapted to `test`'s own
-	// terminal-line set (GB_TEST_TERMINAL_RE above) instead of run/test's
-	// combined one, and rendering gbClassifyTestLog's own human-readable
-	// outcome into a dedicated result line rather than only a raw log tail.
-	// Same bounds for the same reason: this poller must never outlive the
-	// operation it watches (stopped on a matching terminal log line, after
-	// 60s with no new output at all, or after a hard 5-minute ceiling
-	// regardless), and it is torn down on navigating away from this view
-	// the same way every poller in this project is -- LuCI's own view
-	// lifecycle discards this whole JS context on tab switch, but a
-	// poller left running while the operator stays on this same page long
-	// after the test finished would still be a leak this view owns.
+	// setTestResult <kind> <text> -- ticket 23's own three visible states
+	// for "Test connection": 'busy' (spinning, shown the instant the
+	// button is clicked), or one of gbTestSeverity's three severities once
+	// oplog.js's shared poller below actually knows the outcome.
+	setTestResult: function(kind, text) {
+		var el = document.getElementById('gitbackup-test-result');
+
+		if (!el)
+			return;
+
+		el.className = 'gitbackup-test-result' + (kind === 'busy' ? ' spinning' : ' gitbackup-hint-' + kind);
+		el.textContent = text;
+	},
+
+	// handleTestConnection -- backed by oplog.js's shared bounded live-log
+	// poller (ticket 23: "не изобретать четвёртый механизм"), adapted to
+	// `test`'s own terminal-line set (GB_TEST_TERMINAL_RE above) and
+	// rendering gbClassifyTestLog's own human-readable outcome into the
+	// dedicated result line above rather than only a raw log tail.
 	handleTestConnection: function(ev) {
 		var self = this;
 		var btn = document.getElementById('gitbackup-btn-test');
-		var resultEl = document.getElementById('gitbackup-test-result');
+		var pre = document.getElementById('gitbackup-test-log');
 
 		if (btn)
 			btn.disabled = true;
-		if (resultEl)
-			resultEl.textContent = _('Testing…');
-		self.hideHostkeyPrompt();
-
-		return self.startTestLog().then(function() {
-			return callTest();
-		}).then(function(res) {
-			if (!res || res.started !== true) {
-				ui.addNotification(null, E('p', {}, _('Could not start a connection test.')), 'error');
-				self.stopTestLog();
-				if (btn)
-					btn.disabled = false;
-			}
-		}).catch(function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not start a connection test: %s').format(e.message)), 'error');
-			self.stopTestLog();
-			if (btn)
-				btn.disabled = false;
-		});
-	},
-
-	startTestLog: function() {
-		var self = this;
-		var pre = document.getElementById('gitbackup-test-log');
-
+		self.setTestResult('busy', _('Testing…'));
 		if (pre) {
 			pre.hidden = false;
 			pre.textContent = '';
 		}
+		self.hideHostkeyPrompt();
 
-		self._testLogIdle = 0;
-		self._testLogTicks = 0;
+		return oplog.start({
+			fetch: function() { return L.resolveDefault(callLog(500), null).then(function(res) { return (res && res.text) || ''; }); },
+			terminalRe: GB_TEST_TERMINAL_RE,
+			onProgress: function(add) { self.appendTestLog(add); },
+			onFinish: function(line) {
+				var cls = gbClassifyTestLog(line);
 
-		return L.resolveDefault(callLog(500), null).then(function(res) {
-			var text = (res && res.text) || '';
-			self._testLogLines = text ? text.split('\n').length : 0;
-
-			if (!self._boundTestLogPoll)
-				self._boundTestLogPoll = L.bind(self.pollTestLog, self);
-
-			poll.remove(self._boundTestLogPoll);
-			poll.add(self._boundTestLogPoll, 2);
-		});
-	},
-
-	stopTestLog: function() {
-		if (this._boundTestLogPoll)
-			poll.remove(this._boundTestLogPoll);
-	},
-
-	pollTestLog: function() {
-		var self = this;
-
-		self._testLogTicks = (self._testLogTicks || 0) + 1;
-
-		return callLog(500).then(function(res) {
-			var text = (res && res.text) || '';
-			var lines = text.split('\n');
-			var newLines = (lines.length >= self._testLogLines) ? lines.slice(self._testLogLines) : lines;
-			var pre = document.getElementById('gitbackup-test-log');
-			var resultEl = document.getElementById('gitbackup-test-result');
-			var btn = document.getElementById('gitbackup-btn-test');
-			var add = newLines.filter(function(l) { return l; }).join('\n');
-			var finished = false;
-			var i;
-
-			self._testLogLines = lines.length;
-
-			if (add) {
-				self._testLogIdle = 0;
-				if (pre) {
-					pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
-					pre.scrollTop = pre.scrollHeight;
-				}
-				for (i = 0; i < newLines.length; i++) {
-					if (GB_TEST_TERMINAL_RE.test(newLines[i]))
-						finished = true;
-				}
-			} else {
-				self._testLogIdle = (self._testLogIdle || 0) + 1;
-			}
-
-			if (finished) {
-				var cls = gbClassifyTestLog(text);
-				self.stopTestLog();
 				if (btn)
 					btn.disabled = false;
-				if (resultEl)
-					resultEl.textContent = cls.message;
+				self.setTestResult(gbTestSeverity(cls.kind), cls.message);
+
 				// Ticket 20: the one outcome with an actual next step this
 				// view can offer -- see showHostkeyPrompt below. Every
 				// other outcome (including a plain success) makes sure any
@@ -1159,21 +1141,37 @@ return view.extend({
 					self.showHostkeyPrompt();
 				else
 					self.hideHostkeyPrompt();
-			} else if (self._testLogIdle >= 30 || self._testLogTicks >= 150) {
-				self.stopTestLog();
+			},
+			onTimeout: function() {
 				if (btn)
 					btn.disabled = false;
-				if (resultEl)
-					resultEl.textContent = _('No result after a while -- check the log below or the syslog by hand.');
+				self.setTestResult('warn', _('No result after a while -- check the log below or the syslog by hand.'));
 			}
-		}, function() {
-			self._testLogIdle = (self._testLogIdle || 0) + 30;
-			if (self._testLogIdle >= 30) {
-				self.stopTestLog();
-				if (document.getElementById('gitbackup-btn-test'))
-					document.getElementById('gitbackup-btn-test').disabled = false;
+		}).then(function() {
+			return callTest();
+		}).then(function(res) {
+			if (!res || res.started !== true) {
+				oplog.stop();
+				if (btn)
+					btn.disabled = false;
+				self.setTestResult('error', _('Could not start a connection test.'));
 			}
+		}).catch(function(e) {
+			oplog.stop();
+			if (btn)
+				btn.disabled = false;
+			self.setTestResult('error', _('Could not start a connection test: %s').format(e.message));
 		});
+	},
+
+	appendTestLog: function(add) {
+		var pre = document.getElementById('gitbackup-test-log');
+
+		if (!pre)
+			return;
+
+		pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
+		pre.scrollTop = pre.scrollHeight;
 	},
 
 	// showHostkeyPrompt/hideHostkeyPrompt/handleAcceptHostkey -- ticket 20's
@@ -1200,7 +1198,7 @@ return view.extend({
 		wrap.hidden = false;
 		while (wrap.firstChild)
 			wrap.removeChild(wrap.firstChild);
-		wrap.appendChild(E('p', {}, _('Fetching the remote’s SSH host key…')));
+		wrap.appendChild(E('p', { 'class': 'spinning' }, _('Fetching the remote’s SSH host key…')));
 
 		return callHostkey().then(function(res) {
 			while (wrap.firstChild)
@@ -1227,7 +1225,11 @@ return view.extend({
 				E('button', {
 					'class': 'cbi-button cbi-button-positive',
 					'click': ui.createHandlerFn(self, 'handleAcceptHostkey')
-				}, _('Accept and remember this host key'))
+				}, _('Accept and remember this host key')),
+				// Ticket 23: the "идёт" indicator for this one click --
+				// hidden until handleAcceptHostkey below shows it, empty
+				// text otherwise so it takes up no visible space.
+				E('span', { 'class': 'gitbackup-hint', 'id': 'gitbackup-hostkey-accept-status' }, '')
 			]));
 		}, function(e) {
 			while (wrap.firstChild)
@@ -1259,28 +1261,34 @@ return view.extend({
 		var self = this;
 		var fp = self._hostkeyFingerprint;
 		var btn = ev.target;
+		var statusEl = document.getElementById('gitbackup-hostkey-accept-status');
 
 		if (!fp)
 			return;
 
 		btn.disabled = true;
+		if (statusEl) {
+			statusEl.className = 'gitbackup-hint spinning';
+			statusEl.textContent = _('Accepting…');
+		}
 
 		return callHostkey(fp).then(function(res) {
-			var resultEl;
-
 			if (!res || res.ok !== true) {
-				ui.addNotification(null, E('p', {},
-					_('Could not accept the host key: %s').format((res && res.reason) || _('unknown error'))), 'error');
+				if (statusEl) {
+					statusEl.className = 'gitbackup-hint gitbackup-hint-error';
+					statusEl.textContent = _('Could not accept the host key: %s').format((res && res.reason) || _('unknown error'));
+				}
 				btn.disabled = false;
 				return;
 			}
 
 			self.hideHostkeyPrompt();
-			resultEl = document.getElementById('gitbackup-test-result');
-			if (resultEl)
-				resultEl.textContent = _('Host key accepted. Click “Test connection” again to verify the rest.');
+			self.setTestResult('ok', _('Host key accepted. Click “Test connection” again to verify the rest.'));
 		}, function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not accept the host key: %s').format(e.message)), 'error');
+			if (statusEl) {
+				statusEl.className = 'gitbackup-hint gitbackup-hint-error';
+				statusEl.textContent = _('Could not accept the host key: %s').format(e.message);
+			}
 			btn.disabled = false;
 		});
 	}

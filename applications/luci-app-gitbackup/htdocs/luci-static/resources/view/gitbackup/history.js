@@ -1,8 +1,13 @@
 'use strict';
 'require view';
-'require poll';
 'require rpc';
 'require ui';
+'require view.gitbackup.diffview as diffview';
+'require view.gitbackup.oplog as oplog';
+/* global diffview, oplog */
+// See overview.js's own identical comment: the project's eslint config
+// (openwrt/luci's own) only knows a fixed list of stock LuCI module names
+// as globals, not this app's own diffview.js/oplog.js aliases.
 
 // gitbackup -- History (ticket 14, spec "Решения по реализации -> LuCI ->
 // History", "Формат коммита", "Восстановление"). Client-side JS only,
@@ -266,34 +271,15 @@ function gbRestorePlan(diffText) {
 	return plan;
 }
 
-// gbDiffLineClass <line> -- one prefixed class per line, fed straight into
-// the diff-viewer <pre> below. No highlighting library, own tokens only
-// (spec: "Diff-viewer -- свой <pre> с префиксованными классами и токенами
-// --success-*/--error-*. Никаких внешних библиотек подсветки").
-function gbDiffLineClass(line) {
-	if (line.indexOf('+++') === 0 || line.indexOf('---') === 0)
-		return 'gitbackup-diffline-meta';
-	if (line.charAt(0) === '+')
-		return 'gitbackup-diffline-add';
-	if (line.charAt(0) === '-')
-		return 'gitbackup-diffline-del';
-	if (line.indexOf('@@') === 0)
-		return 'gitbackup-diffline-hunk';
-	if (line.indexOf('diff --git') === 0 || line.indexOf('index ') === 0)
-		return 'gitbackup-diffline-meta';
-	return 'gitbackup-diffline-ctx';
-}
-
-function gbBuildDiffPre(text) {
-	var lines = (text || '').split('\n');
-
-	if (!lines.length || (lines.length === 1 && !lines[0]))
-		return E('p', { 'class': 'gitbackup-card-hint' }, _('No differences.'));
-
-	return E('pre', { 'class': 'gitbackup-diff' }, lines.map(function(line) {
-		return E('span', { 'class': gbDiffLineClass(line) }, line + '\n');
-	}));
-}
+// The colored-<pre> diff viewer itself moved to diffview.js (ticket 23:
+// "не пиши второй просмотрщик diff") once Overview needed one too, for a
+// different diff format (config_diff's manifest-field lines, not a real
+// `git diff`) -- see that file's own header comment for why this is two
+// explicit renderers in one shared place rather than one that guesses.
+// handleViewDiff below calls diffview.unified(res.diff): `diff` (gbrpc_diff,
+// two already-committed shas) is real `git diff --end-of-options <a> <b>`
+// output (usr/sbin/gitbackup's cmd_diff, its two-argument form), exactly
+// what diffview.unified expects.
 
 // ---------------------------------------------------------------------
 // Restore log classification -- restore.sh's own gb_log calls (all of
@@ -307,16 +293,28 @@ function gbBuildDiffPre(text) {
 // restored $device from $target on $branch") is ever visible through this
 // poller -- reason this regex keys on that line, not the printf one.
 // ---------------------------------------------------------------------
+// Ticket 23: 'writing one or more files failed' used to sit here instead of
+// the line below, and never matched anything restore.sh actually logs --
+// found while tracing ticket 19's own change (restore.sh, _gb_restore:
+// "a partially-restored router with correct permissions... always tells
+// the operator the truth (below) with a non-zero exit" prints
+// "gb_restore: the following paths were NOT written:<list>" via gb_log,
+// never the old string) against this poller's own terminal-line set. With
+// the wrong string here, a partial restore (ticket 19's own headline
+// outcome -- content written, permissions applied, exit 1) never matched
+// GB_RESTORE_TERMINAL_RE at all and this poller ran all the way to its own
+// 60s-idle/5-minute ceiling before saying anything, exactly the
+// "непонятно, чем кончилось" ticket 23 exists to fix.
 var GB_RESTORE_TERMINAL_RE = new RegExp(
 	[
 		'gb_restore: restored .+ from .+ on ',
+		'the following paths were NOT written:',
 		'this backup was taken on a different board',
 		'sha256 mismatch, refusing to write anything to disk',
 		'does not exist on .+ yet -- nothing to restore',
 		'was not found on .+ at ',
 		'could not read .+ from .+ on .+:',
 		'git fetch .+ failed',
-		'writing one or more files failed',
 		'cannot create a work directory',
 		'repository url is required'
 	].join('|')
@@ -324,6 +322,68 @@ var GB_RESTORE_TERMINAL_RE = new RegExp(
 
 function gbRestoreLogSuccess(line) {
 	return line.indexOf('gb_restore: restored ') !== -1;
+}
+
+// gbClassifyRestoreLog <line> -- the human-readable, three-severity outcome
+// behind GB_RESTORE_TERMINAL_RE's own match (ticket 23: "каждая долгая
+// операция заканчивается явным сообщением... причина неудачи написана
+// человеческим языком"). 'partial' is its own kind, deliberately distinct
+// from both 'success' and 'error' -- ticket 19's restore.sh always applies
+// permissions to whatever DID get written even when something else did not
+// (spec: "частичный успех... обязан быть виден и отличаться от полного"),
+// and folding it into either extreme would misreport which one actually
+// happened. 'blocked' covers the one refusal that is a safety check working
+// as intended (a board mismatch neither this view's own heuristic nor the
+// operator's confirmation caught), kept apart from a genuine 'error' (a
+// network/fetch/config problem) since the next step for each is different.
+function gbClassifyRestoreLog(line) {
+	if (gbRestoreLogSuccess(line))
+		return { kind: 'success', message: _('Restore finished. This router now matches the backup you selected.') };
+
+	if (line.indexOf('the following paths were NOT written:') !== -1)
+		return {
+			kind: 'partial',
+			message: _('Restore finished, but some files could not be written -- see the log below for which ones and why. Permissions were still applied to every file that DID get written. Consider restoring again once the problem (a busy mount, a read-only path) is resolved.')
+		};
+
+	if (line.indexOf('this backup was taken on a different board') !== -1)
+		return { kind: 'blocked', message: _('Refused: this backup was taken on a different router model -- nothing was restored.') };
+
+	if (line.indexOf('sha256 mismatch, refusing to write anything to disk') !== -1)
+		return { kind: 'error', message: _('Refused: the files in this backup could not be verified (a checksum did not match) -- nothing was written to disk.') };
+
+	if (/does not exist on .+ yet -- nothing to restore/.test(line))
+		return { kind: 'error', message: _('This device has no backup on that branch yet -- nothing was restored.') };
+
+	if (/was not found on .+ at /.test(line))
+		return { kind: 'error', message: _('The selected backup could not be found on the remote -- nothing was restored.') };
+
+	if (/could not read .+ from .+ on .+:/.test(line))
+		return { kind: 'error', message: _('Could not read the backup\'s manifest from the remote -- nothing was restored.') };
+
+	if (/git fetch .+ failed/.test(line))
+		return { kind: 'error', message: _('Could not reach the remote repository -- nothing was restored.') };
+
+	if (line.indexOf('cannot create a work directory') !== -1)
+		return { kind: 'error', message: _('Could not create a temporary work directory on the router -- nothing was restored.') };
+
+	if (line.indexOf('repository url is required') !== -1)
+		return { kind: 'error', message: _('The repository URL is not configured -- nothing was restored.') };
+
+	return { kind: 'error', message: _('Restore failed -- see the log below for details.') };
+}
+
+// gbRestoreSeverity <kind> -- gbClassifyRestoreLog's own four kinds
+// collapsed to the three severities showRestoreResult below actually
+// styles: 'success' -> ok, 'partial'/'blocked' -> warn (something is worth
+// a second look, but this is not the network/config failures 'error'
+// means), 'error' (and anything unrecognized) -> error.
+function gbRestoreSeverity(kind) {
+	if (kind === 'success')
+		return 'ok';
+	if (kind === 'partial' || kind === 'blocked')
+		return 'warn';
+	return 'error';
 }
 
 var GB_CSS = [
@@ -340,12 +400,6 @@ var GB_CSS = [
 	'.gitbackup-history-subject { font-size: .9em; color: var(--text-color-high, #333); margin: .35em 0 0; }',
 	'.gitbackup-history-changed { font-size: .85em; color: var(--text-color-medium, #666); margin: .3em 0 0; word-break: break-word; }',
 	'.gitbackup-history-actions { display: flex; flex-wrap: wrap; gap: .5em; margin-top: .6em; }',
-	'.gitbackup-diff { max-height: 420px; overflow: auto; background: var(--background-color-low, #f5f5f5); border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .6em .8em; font-family: monospace; font-size: .85em; white-space: pre-wrap; }',
-	'.gitbackup-diffline-add { display: block; color: var(--success-color-high, #2e7d32); }',
-	'.gitbackup-diffline-del { display: block; color: var(--error-color-high, #c62828); }',
-	'.gitbackup-diffline-hunk { display: block; color: var(--text-color-medium, #666); }',
-	'.gitbackup-diffline-meta { display: block; font-weight: bold; color: var(--text-color-medium, #666); }',
-	'.gitbackup-diffline-ctx { display: block; color: var(--text-color-high, #333); }',
 	'.gitbackup-restore-files { list-style: none; margin: .5em 0; padding: 0; max-height: 260px; overflow: auto; border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; }',
 	'.gitbackup-restore-file-row { display: flex; gap: .6em; padding: .3em .6em; border-bottom: 1px solid var(--background-color-medium, #ddd); font-family: monospace; font-size: .85em; color: var(--text-color-high, #333); }',
 	'.gitbackup-restore-file-row:last-child { border-bottom: none; }',
@@ -353,7 +407,14 @@ var GB_CSS = [
 	'.gitbackup-restore-action-overwrite { color: var(--warn-color-high, #b45f06); }',
 	'.gitbackup-confirm-input { width: 100%; box-sizing: border-box; margin: .5em 0; }',
 	'.gitbackup-modal-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: 1em; }',
-	'.gitbackup-log { max-height: 320px; overflow: auto; background: var(--background-color-low, #f5f5f5); color: var(--text-color-high, #333); border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .6em .8em; font-family: monospace; font-size: .85em; white-space: pre-wrap; }'
+	'.gitbackup-log { max-height: 320px; overflow: auto; background: var(--background-color-low, #f5f5f5); color: var(--text-color-high, #333); border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .6em .8em; font-family: monospace; font-size: .85em; white-space: pre-wrap; }',
+	// gitbackup-hint-ok/-warn/-error -- same three severities settings.js's
+	// own copy already uses (ticket 12); reused here (ticket 23) for
+	// showRestoreResult's own success/partial-or-blocked/error message.
+	'.gitbackup-hint-ok { color: var(--success-color-high, #2e7d32); }',
+	'.gitbackup-hint-warn { color: var(--warn-color-high, #b45f06); }',
+	'.gitbackup-hint-error { color: var(--error-color-high, #c62828); }',
+	'.gitbackup-restore-outcome { font-weight: bold; }'
 ];
 
 return view.extend({
@@ -386,7 +447,7 @@ return view.extend({
 		self._commits = null;
 
 		view = E('div', { 'class': 'gitbackup-view' }, [
-			E('style', { 'type': 'text/css' }, [ GB_CSS.join('\n') ]),
+			E('style', { 'type': 'text/css' }, [ GB_CSS.concat(diffview.css).join('\n') ]),
 
 			E('h2', {}, _('Git Backup - History / Restore')),
 
@@ -401,9 +462,17 @@ return view.extend({
 
 			E('div', { 'id': 'gitbackup-history-body' }, [
 				E('p', { 'class': 'gitbackup-card-hint' }, _('Loading…'))
-			]),
+			])
 
-			E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-restore-log', 'hidden': true }, '')
+			// Ticket 23: the old page-level "#gitbackup-restore-log" <pre>
+			// that used to live here is gone -- the confirmation modal
+			// itself now stays open for the whole restore and shows the
+			// live log and the final outcome in place (see
+			// handleConfirmRestore/showRestoreProgress/showRestoreResult
+			// below), instead of hiding itself immediately and leaving an
+			// operator to notice a page element they were never told to
+			// watch (spec: "модальное окно... не должно просто
+			// закрываться... а в конце говорит, что восстановлено").
 		]);
 
 		// Fired once render() has already returned the tree above, exactly
@@ -513,7 +582,7 @@ return view.extend({
 			}
 
 			ui.showModal(_('Diff: %s').format(gbCommitTime(commit.subject) || commit.sha.substring(0, 12)), [
-				gbBuildDiffPre(res.diff),
+				diffview.unified(res.diff),
 				E('div', { 'class': 'gitbackup-modal-actions' }, [
 					E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
 				])
@@ -622,15 +691,29 @@ return view.extend({
 	},
 
 	// handleConfirmRestore -- fires `restore` (write tier) and switches to
-	// the same bounded, polled live-log pattern overview.js's own
-	// handleRun/handleTest already use for run/test: the call itself only
-	// starts the CLI in the background (gbrpc_restore always answers
-	// `{started:true}` immediately) and can take a while for real
-	// (network fetch of the target commit, sha256 verification of every
-	// file), so this must not block the page (ticket 14 acceptance
-	// criterion: "Долгий restore не вешает страницу: результат забирается
-	// поллингом log"). `force` is passed whenever the board-mismatch
-	// warning fired on the previous screen -- without it restore.sh's own
+	// oplog.js's shared bounded live-log poller (ticket 23: "не изобретать
+	// четвёртый механизм" -- the exact pattern overview.js's own
+	// handleRun/handleTest use for run/test). The call itself only starts
+	// the CLI in the background (gbrpc_restore always answers
+	// `{started:true}` immediately) and can take a while for real (network
+	// fetch of the target commit, sha256 verification of every file), so
+	// this must not block the page.
+	//
+	// Ticket 23's own headline complaint about restore specifically:
+	// the confirmation modal used to call ui.hideModal() right here and
+	// let the page's own <pre> carry the live log silently underneath --
+	// closing the one dialog that had the operator's attention just as an
+	// irreversible, file-system-rewriting operation started, then saying
+	// nothing further unless it failed to even START. It no longer hides
+	// at all: showRestoreProgress below replaces this same dialog's
+	// content in place, and stays open, showing the live log, until
+	// showRestoreResult replaces it again with the actual outcome --
+	// success, partial, or failure, spelled out in words (spec: "пусть
+	// остаётся, показывает ход и в конце говорит, что восстановлено, что
+	// не удалось и что делать дальше").
+	//
+	// `force` is passed whenever the board-mismatch warning fired on the
+	// previous screen -- without it restore.sh's own
 	// _gb_restore_check_board refuses outright (exit 4), which would turn
 	// an operator's informed "restore anyway" into a silent no-op visible
 	// only by reading the log by hand.
@@ -638,112 +721,94 @@ return view.extend({
 		var self = this;
 		var device = self._status.device || '';
 
-		ui.hideModal();
+		self.showRestoreProgress();
 
-		return self.startRestoreLog().then(function() {
+		return oplog.start({
+			fetch: function() { return L.resolveDefault(callLog(500), null).then(function(res) { return (res && res.text) || ''; }); },
+			terminalRe: GB_RESTORE_TERMINAL_RE,
+			onProgress: function(add) { self.appendRestoreProgress(add); },
+			onFinish: function(line) {
+				self.showRestoreResult(gbClassifyRestoreLog(line));
+				self.refreshHistory();
+			},
+			onTimeout: function() {
+				self.showRestoreResult({
+					kind: 'unknown',
+					message: _('No result from the restore after a while -- check the log below or the syslog by hand.')
+				});
+				self.refreshHistory();
+			}
+		}).then(function() {
 			return callRestore(device, commit.sha, undefined, mismatch ? true : undefined);
 		}).then(function(res) {
 			if (!res || res.started !== true) {
-				ui.addNotification(null, E('p', {}, _('Could not start the restore.')), 'error');
-				self.stopRestoreLog();
+				oplog.stop();
+				self.showRestoreResult({ kind: 'error', message: _('Could not start the restore.') });
 			}
 		}).catch(function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not start the restore: %s').format(e.message)), 'error');
-			self.stopRestoreLog();
+			oplog.stop();
+			self.showRestoreResult({ kind: 'error', message: _('Could not start the restore: %s').format(e.message) });
 		});
 	},
 
-	// startRestoreLog/pollRestoreLog/stopRestoreLog -- overview.js's own
-	// startLiveLog/pollLiveLog/stopLiveLog, adapted to restore's own
-	// terminal-line set (GB_RESTORE_TERMINAL_RE above) instead of run/
-	// test's. Same bounds for the same reason: this poller must never
-	// outlive the operation it watches -- stopped on a matching terminal
-	// log line, after 60s with no new output at all, or after a hard
-	// 5-minute ceiling regardless (ticket 14 acceptance criterion: "поллер
-	// снимается при уходе с view" -- classic multi-page LuCI already tears
-	// down this whole JS context on navigation to another tab, but a
-	// poller left running while the operator stays on this same page long
-	// after restore finished would still be a leak this view owns and has
-	// to bound itself).
-	startRestoreLog: function() {
-		var self = this;
-		var pre = document.getElementById('gitbackup-restore-log');
-
-		if (pre) {
-			pre.hidden = false;
-			pre.textContent = '';
-		}
-
-		self._restoreLogIdle = 0;
-		self._restoreLogTicks = 0;
-
-		return L.resolveDefault(callLog(500), null).then(function(res) {
-			var text = (res && res.text) || '';
-			self._restoreLogLines = text ? text.split('\n').length : 0;
-
-			if (!self._boundRestoreLogPoll)
-				self._boundRestoreLogPoll = L.bind(self.pollRestoreLog, self);
-
-			poll.remove(self._boundRestoreLogPoll);
-			poll.add(self._boundRestoreLogPoll, 2);
-		});
+	// showRestoreProgress -- replaces the confirmation modal's own content
+	// with a spinner and an empty live-log pane, IN THE SAME DIALOG (no
+	// ui.hideModal() anywhere in this whole flow) -- see
+	// handleConfirmRestore's own comment for why staying open matters here
+	// specifically. No Close/Cancel control on purpose: restore.sh has no
+	// interrupt handling once it starts writing, so a "Cancel" here could
+	// only ever stop watching, never stop the restore itself, and offering
+	// it would suggest otherwise.
+	showRestoreProgress: function() {
+		ui.showModal(_('Restoring…'), [
+			E('p', { 'class': 'spinning' },
+				_('Restoring the backup -- this can take a while. Do not power off the router.')),
+			E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-restore-modal-log' }, '')
+		]);
 	},
 
-	stopRestoreLog: function() {
-		if (this._boundRestoreLogPoll)
-			poll.remove(this._boundRestoreLogPoll);
+	appendRestoreProgress: function(add) {
+		var pre = document.getElementById('gitbackup-restore-modal-log');
+
+		if (!pre)
+			return;
+
+		pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
+		pre.scrollTop = pre.scrollHeight;
 	},
 
-	pollRestoreLog: function() {
-		var self = this;
+	// showRestoreResult <cls> -- the final screen of the restore flow:
+	// <cls> is gbClassifyRestoreLog's own {kind, message} (or the
+	// onTimeout/could-not-start shapes handleConfirmRestore builds inline
+	// above, both the same shape). Reads the progress pane's own
+	// accumulated text (still in the DOM at this point, since this is the
+	// same ui.showModal call that is about to replace it) rather than
+	// keeping a second copy of it in JS state.
+	//
+	// Ticket 23's own explicit ask beyond "say what happened": "что делать
+	// дальше" for the one outcome that actually has a next step worth
+	// naming -- 'partial' (ticket 19's own headline case: content written,
+	// permissions applied, one or more paths failed) points at the log
+	// right below it, already showing exactly which paths and why.
+	showRestoreResult: function(cls) {
+		var pre = document.getElementById('gitbackup-restore-modal-log');
+		var fullLog = pre ? pre.textContent : '';
+		var severity = gbRestoreSeverity(cls.kind);
+		var title = cls.kind === 'success' ? _('Restore finished') :
+			cls.kind === 'partial' ? _('Restore finished with problems') :
+			cls.kind === 'blocked' ? _('Restore refused') :
+			_('Restore failed');
+		var body = [
+			E('p', { 'class': 'gitbackup-restore-outcome gitbackup-hint-' + severity }, cls.message)
+		];
 
-		self._restoreLogTicks = (self._restoreLogTicks || 0) + 1;
+		if (fullLog)
+			body.push(E('pre', { 'class': 'gitbackup-log' }, fullLog));
 
-		return callLog(500).then(function(res) {
-			var text = (res && res.text) || '';
-			var lines = text.split('\n');
-			var newLines = (lines.length >= self._restoreLogLines) ? lines.slice(self._restoreLogLines) : lines;
-			var pre = document.getElementById('gitbackup-restore-log');
-			var add = newLines.filter(function(l) { return l; }).join('\n');
-			var finished = false;
-			var success = false;
-			var i;
+		body.push(E('div', { 'class': 'gitbackup-modal-actions' }, [
+			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
+		]));
 
-			self._restoreLogLines = lines.length;
-
-			if (add) {
-				self._restoreLogIdle = 0;
-				if (pre) {
-					pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
-					pre.scrollTop = pre.scrollHeight;
-				}
-				for (i = 0; i < newLines.length; i++) {
-					if (GB_RESTORE_TERMINAL_RE.test(newLines[i])) {
-						finished = true;
-						success = gbRestoreLogSuccess(newLines[i]);
-					}
-				}
-			} else {
-				self._restoreLogIdle = (self._restoreLogIdle || 0) + 1;
-			}
-
-			if (finished) {
-				self.stopRestoreLog();
-				if (success) {
-					ui.addNotification(null, E('p', {}, _('Restore finished.')), 'info');
-				} else {
-					ui.addNotification(null, E('p', {}, _('Restore failed or was refused -- see the log below.')), 'error');
-				}
-				self.refreshHistory();
-			} else if (self._restoreLogIdle >= 30 || self._restoreLogTicks >= 150) {
-				self.stopRestoreLog();
-				ui.addNotification(null, E('p', {}, _('No result from the restore after a while -- check the log below or the syslog by hand.')), 'warning');
-			}
-		}, function() {
-			// A single failed poll must not spin forever either.
-			self._restoreLogIdle = (self._restoreLogIdle || 0) + 30;
-			if (self._restoreLogIdle >= 30)
-				self.stopRestoreLog();
-		});
+		ui.showModal(title, body);
 	}
 });

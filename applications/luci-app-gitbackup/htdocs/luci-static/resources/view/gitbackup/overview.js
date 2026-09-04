@@ -4,6 +4,15 @@
 'require rpc';
 'require uci';
 'require ui';
+'require view.gitbackup.diffview as diffview';
+'require view.gitbackup.oplog as oplog';
+/* global diffview, oplog */
+// The eslint config this project lints against (tools/fetch-eslint-config.sh,
+// openwrt/luci's own eslint.config.mjs) hardcodes `readonly` globals for a
+// fixed list of stock LuCI module names ("poll", "rpc", "ui", ...) -- it has
+// no way to know about an app's own custom module aliases, so it flags
+// `diffview`/`oplog` above as no-undef otherwise. Declaring them here is the
+// standard ESLint mechanism for exactly this case, scoped to this file only.
 
 // gitbackup -- Overview (ticket 11, spec "Решения по реализации -> LuCI ->
 // Overview"). Client-side JS only, luci-base only -- no Lua, no
@@ -253,12 +262,12 @@ function gbClassifyLog(text) {
 	return { kind: 'unknown', synced: null, message: _('No completed run recorded yet.') };
 }
 
-// Terminal markers for the live-log poller (handleRun/handleTest):
-// matching any one of these on a freshly-arrived log line means the
-// backgrounded CLI invocation has finished, one way or another. Kept as
-// one regex so the "did this just finish" check in pollLiveLog and the
-// "what was the outcome" check in gbClassifyLog can never name a
-// different set of endings by accident.
+// Terminal markers for the live-log poller (handleRun/handleTest, via
+// oplog.js's shared bounded poller): matching any one of these on a
+// freshly-arrived log line means the backgrounded CLI invocation has
+// finished, one way or another. Kept as one regex so oplog's own "did this
+// just finish" check and gbClassifyLog's own "what was the outcome" check
+// can never name a different set of endings by accident.
 var GB_LOG_TERMINAL_RE = new RegExp(
 	[
 		'pushed [0-9a-f]+ to ',
@@ -271,6 +280,27 @@ var GB_LOG_TERMINAL_RE = new RegExp(
 		'reachable and authenticated'
 	].join('|')
 );
+
+// gbOutcomeKind <cls> -- ticket 23's own "кончилось хорошо/плохо" severity
+// for the transient op-status banner handleRun/handleTest show right after
+// their own poller finishes (see setOpStatus below): 'ok' for a real
+// success, 'error' for the two outcomes gbStatusView's own dot logic also
+// paints red, 'warn' for everything else a completed run/test can report
+// (skipped for lock/network/visibility, or a bare connection-test success
+// line -- gbClassifyLog's 'test_ok', which is a real success but is not
+// "synced" in the run-outcome sense gbStatusView's card cares about at all).
+// Not gbStatusView's own dot-class expression itself: that one also has a
+// fourth, neutral "no color at all" state for a device that has never
+// completed a run ('unknown'), which cannot happen here -- a terminal log
+// line just matched one of GB_LOG_TERMINAL_RE's alternatives, so cls.kind
+// is never 'unknown' at this call site.
+function gbOutcomeKind(cls) {
+	if (cls.synced === true || cls.kind === 'test_ok')
+		return 'ok';
+	if (cls.kind === 'blocked_public' || cls.kind === 'error_space')
+		return 'error';
+	return 'warn';
+}
 
 function gbMissingText(key) {
 	switch (key) {
@@ -454,9 +484,10 @@ function gbRenderBanner(text) {
 // this view's own container width via `@container`, not `@media` (rule
 // 9): the sidebar eats real width a viewport-wide media query cannot see.
 // No `window.onload`, no node appended to document.body, no absurd
-// z-index (rule 10) -- and the one custom poller this view owns
-// (pollLiveLog) is bounded and explicitly stopped, see stopLiveLog below
-// and its own call sites. Stock Save/Apply/Reset buttons are switched off
+// z-index (rule 10) -- and the one poller this view runs against `log`
+// (oplog.js's shared instance, started from handleRun/handleTest) is
+// bounded and explicitly stopped by that shared module itself. Stock
+// Save/Apply/Reset buttons are switched off
 // through handleSaveApply/handleSave/handleReset below, never hidden with
 // CSS (rule 11).
 //
@@ -474,10 +505,28 @@ var GB_CSS = [
 	'.gitbackup-view { container-type: inline-size; }',
 	'.gitbackup-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75em; margin: .75em 0; }',
 	'@container (max-width: 700px) { .gitbackup-cards { grid-template-columns: 1fr; } }',
-	'.gitbackup-card { border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .75em 1em; background: var(--background-color-low, #f5f5f5); }',
+	'.gitbackup-card, .gitbackup-card-clickable { border: 1px solid var(--background-color-medium, #ddd); border-radius: 4px; padding: .75em 1em; background: var(--background-color-low, #f5f5f5); }',
+	// The "Configuration" card is a real <button>, not a <div> (ticket 23:
+	// "по нажатию открывается расхождение") -- this undoes the browser's
+	// own button chrome (font/color/alignment/full-width) while keeping
+	// the box styling every other card already gets from the shared rule
+	// just above, and adds back the pointer/focus affordances a clickable
+	// card needs that a plain informational one does not.
+	'.gitbackup-card-clickable { display: block; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }',
+	'.gitbackup-card-clickable:hover, .gitbackup-card-clickable:focus-visible { border-color: var(--text-color-medium, #666); }',
 	'.gitbackup-card-title { font-size: .85em; text-transform: uppercase; letter-spacing: .04em; color: var(--text-color-medium, #666); margin: 0 0 .35em; }',
 	'.gitbackup-card-value { font-size: 1.05em; color: var(--text-color-high, #333); word-break: break-word; }',
 	'.gitbackup-card-hint { font-size: .85em; color: var(--text-color-medium, #666); margin-top: .35em; }',
+	// gitbackup-hint-ok/-warn/-error -- the same three severities
+	// settings.js's own copy of these two already uses (ticket 12),
+	// reused here (plus a "warn" middle severity settings.js's own
+	// connection test never needed) for the op-status line handleRun/
+	// handleTest show under the action buttons (ticket 23, spec "Три
+	// состояния... кончилось хорошо... кончилось плохо").
+	'.gitbackup-hint-ok { color: var(--success-color-high, #2e7d32); }',
+	'.gitbackup-hint-warn { color: var(--warn-color-high, #b45f06); }',
+	'.gitbackup-hint-error { color: var(--error-color-high, #c62828); }',
+	'.gitbackup-op-status { font-weight: bold; }',
 	'.gitbackup-link { color: var(--text-color-high, #333); }',
 	'.gitbackup-banner { border-radius: 4px; padding: .6em 1em; margin: 0 0 .75em; background: var(--error-color-medium, #f44336); color: var(--on-error-color, #fff); }',
 	'.gitbackup-banner p { margin: .2em 0; }',
@@ -489,7 +538,8 @@ var GB_CSS = [
 	'.gitbackup-dot { display: inline-block; width: .6em; height: .6em; border-radius: 50%; margin-right: .4em; background: var(--text-color-medium, #999); }',
 	'.gitbackup-dot-ok { background: var(--success-color-medium, #4caf50); }',
 	'.gitbackup-dot-warn { background: var(--warn-color-medium, #f0c629); }',
-	'.gitbackup-dot-error { background: var(--error-color-medium, #f44336); }'
+	'.gitbackup-dot-error { background: var(--error-color-medium, #f44336); }',
+	'.gitbackup-modal-actions { display: flex; justify-content: flex-end; gap: .5em; margin-top: 1em; }'
 ];
 
 return view.extend({
@@ -560,7 +610,7 @@ return view.extend({
 		sv = gbStatusView(status, logRes, serviceRes, self._schedule, self._cronExpr, self._cronNext);
 
 		view = E('div', { 'class': 'gitbackup-view' }, [
-			E('style', { 'type': 'text/css' }, [ GB_CSS.join('\n') ]),
+			E('style', { 'type': 'text/css' }, [ GB_CSS.concat(diffview.css).join('\n') ]),
 
 			E('h2', {}, _('Git Backup')),
 
@@ -585,14 +635,24 @@ return view.extend({
 					]),
 					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-run-hint' }, sv.resultHint)
 				]),
-				E('div', { 'class': 'gitbackup-card' }, [
+				// A real <button>, not a <div> like the three cards above
+				// (ticket 23: "Блок «Configuration»... по ней можно
+				// посмотреть diff") -- gbConfigDiffView's own text already
+				// answers "did it drift"; clicking the whole card answers
+				// the natural follow-up, "what exactly changed", without a
+				// second, separate control competing for the same space.
+				E('button', {
+					'class': 'gitbackup-card gitbackup-card-clickable',
+					'id': 'gitbackup-configdiff-card',
+					'click': ui.createHandlerFn(self, 'handleShowConfigDiff')
+				}, [
 					E('div', { 'class': 'gitbackup-card-title' }, _('Configuration')),
 					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-configdiff-result' }, [
 						E('span', { 'class': 'gitbackup-dot', 'id': 'gitbackup-configdiff-dot' }),
 						E('span', { 'id': 'gitbackup-configdiff-text' }, _('Checking…'))
 					]),
 					E('div', { 'class': 'gitbackup-card-hint' },
-						_('Compared against the last commit right now, not just the last run.'))
+						_('Compared against the last commit right now, not just the last run. Click to view the diff.'))
 				])
 			]),
 
@@ -628,6 +688,17 @@ return view.extend({
 				}, _('Download recovery card'))
 			]),
 
+			// The one status line shared by "Backup now" and "Test
+			// connection" (ticket 23: "по клику... сразу появляется
+			// видимый индикатор хода... каждая долгая операция
+			// заканчивается явным сообщением"). "spinning" is stock LuCI
+			// CSS (confirmed in every theme's own cascade.css, stock
+			// bootstrap included -- not this project's own invention): an
+			// actually-animated icon, which is what tells an operator
+			// "still working" apart from "stuck" the way static text
+			// alone cannot.
+			E('p', { 'class': 'gitbackup-op-status', 'id': 'gitbackup-op-status', 'hidden': true }),
+
 			E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-live-log', 'hidden': true }, '')
 		]);
 
@@ -653,7 +724,8 @@ return view.extend({
 		// that every 5 seconds would hammer both the router's flash and
 		// the remote for no reason. Refreshed here once the page is
 		// already on screen, and again after a run/test this view itself
-		// triggered finishes (pollLiveLog below).
+		// triggered finishes (handleRun/handleTest's own oplog.start() onFinish
+		// callback).
 		self.refreshConfigDiff();
 
 		return view;
@@ -665,7 +737,7 @@ return view.extend({
 	// luci.gitbackup's own _gb_rpc_full_fetch), and polling it every 5
 	// seconds would hammer the remote for no reason. `history` is
 	// refreshed once on load and again right after a run/test this view
-	// itself triggered finishes (see pollLiveLog). Both of these run only
+	// itself triggered finishes (see handleRun/handleTest). Both of these run only
 	// after the view is already attached (poll ticks always fire well
 	// after render() has returned), so applyStatusDom/applyHistoryDom's
 	// own getElementById calls are safe here -- unlike inside render()
@@ -703,6 +775,14 @@ return view.extend({
 		var self = this;
 
 		return L.resolveDefault(callConfigDiff(), null).then(function(res) {
+			// Cached for handleShowConfigDiff below, so a click can open
+			// the modal instantly with whatever this view already knows
+			// instead of waiting on a fresh round trip through uhttpd's own
+			// "-n 3" concurrent-call ceiling (interfaces.md, ticket 13) --
+			// the modal itself always re-fetches anyway (see that handler's
+			// own comment), this only avoids a blank "Loading…" flash for
+			// the common case where nothing has changed since this ran.
+			self._configDiffRes = res;
 			self.applyConfigDiffDom(gbConfigDiffView(res));
 		});
 	},
@@ -777,109 +857,95 @@ return view.extend({
 		});
 	},
 
-	// Live log for `Backup now` / `Test connection` (spec: "Backup now"
-	// показывает живой лог через polling rpcd-метода log"). Both rpcd
-	// methods (run/test) background the CLI and answer immediately with
-	// `{started:true}` (usr/libexec/rpcd/luci.gitbackup's own gbrpc_run/
-	// gbrpc_test) -- the only way to see how it went is to tail the same
-	// syslog-backed `log` method, so this starts a faster, bounded poll
-	// of it and stops itself: on a matching terminal log line (see
-	// GB_LOG_TERMINAL_RE), after 60s with no new output at all, or after
-	// a hard 5-minute ceiling regardless -- this poller must never
-	// outlive the operation it is watching, and this view's own periodic
-	// `refreshStatus` poll (5s, started in render()) keeps running
-	// independently the whole time either way.
-	startLiveLog: function() {
-		var self = this;
+	// setOpStatus <kind> <text> -- the one line shared by "Backup now" and
+	// "Test connection" for all three states ticket 23 asks for: 'busy'
+	// (spinning, shown the instant the button is clicked, before the rpcd
+	// call has even answered), 'ok'/'warn'/'error' (shown once the poller
+	// below actually knows how the operation went). 'warn' covers every
+	// completed-but-not-a-clean-success outcome gbOutcomeKind can report
+	// (skipped for lock/network/visibility) as well as "no result after a
+	// while" -- none of those are the emphatic red "error" gbStatusView's
+	// own dot reserves for a refused/failed push.
+	setOpStatus: function(kind, text) {
+		var el = document.getElementById('gitbackup-op-status');
+
+		if (!el)
+			return;
+
+		el.hidden = false;
+		el.className = 'gitbackup-op-status' + (kind === 'busy' ? ' spinning' : ' gitbackup-hint-' + kind);
+		el.textContent = text;
+	},
+
+	// showLiveLog -- unhides and clears the raw log tail under the status
+	// line above; kept separate from setOpStatus so a caller can show the
+	// "busy" status and reset the log pane in one obvious pair of calls
+	// (see handleRun/handleTest below).
+	showLiveLog: function() {
 		var pre = document.getElementById('gitbackup-live-log');
 
 		if (pre) {
 			pre.hidden = false;
 			pre.textContent = '';
 		}
-
-		self._liveLogIdle = 0;
-		self._liveLogTicks = 0;
-
-		return L.resolveDefault(callLog(500), null).then(function(res) {
-			var text = (res && res.text) || '';
-			self._liveLogLines = text ? text.split('\n').length : 0;
-
-			if (!self._boundLiveLogPoll)
-				self._boundLiveLogPoll = L.bind(self.pollLiveLog, self);
-
-			poll.remove(self._boundLiveLogPoll);
-			poll.add(self._boundLiveLogPoll, 2);
-		});
 	},
 
-	stopLiveLog: function() {
-		if (this._boundLiveLogPoll)
-			poll.remove(this._boundLiveLogPoll);
+	appendLiveLog: function(add) {
+		var pre = document.getElementById('gitbackup-live-log');
+
+		if (!pre)
+			return;
+
+		pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
+		pre.scrollTop = pre.scrollHeight;
 	},
 
-	pollLiveLog: function() {
-		var self = this;
-
-		self._liveLogTicks = (self._liveLogTicks || 0) + 1;
-
-		return callLog(500).then(function(res) {
-			var text = (res && res.text) || '';
-			var lines = text.split('\n');
-			var newLines = (lines.length >= self._liveLogLines) ? lines.slice(self._liveLogLines) : lines;
-			var pre = document.getElementById('gitbackup-live-log');
-			var add = newLines.filter(function(l) { return l; }).join('\n');
-			var finished = false;
-			var i;
-
-			self._liveLogLines = lines.length;
-
-			if (add) {
-				self._liveLogIdle = 0;
-				if (pre) {
-					pre.textContent = pre.textContent ? pre.textContent + '\n' + add : add;
-					pre.scrollTop = pre.scrollHeight;
-				}
-				for (i = 0; i < newLines.length; i++) {
-					if (GB_LOG_TERMINAL_RE.test(newLines[i]))
-						finished = true;
-				}
-			} else {
-				self._liveLogIdle = (self._liveLogIdle || 0) + 1;
-			}
-
-			if (finished || self._liveLogIdle >= 30 || self._liveLogTicks >= 150) {
-				self.stopLiveLog();
-				self.setBusy(false);
-				self.refreshStatus();
-				self.refreshHistory();
-				self.refreshConfigDiff();
-			}
-		}, function() {
-			// A single failed poll must not spin forever either.
-			self._liveLogIdle = (self._liveLogIdle || 0) + 30;
-			if (self._liveLogIdle >= 30) {
-				self.stopLiveLog();
-				self.setBusy(false);
-			}
-		});
-	},
-
+	// handleRun/handleTest -- both back "Backup now"/"Test connection" with
+	// oplog.js's shared bounded live-log poller (ticket 23: "не изобретать
+	// четвёртый механизм"; oplog.js's own header comment explains why one
+	// shared, auto-instantiated instance is safe for every view here to
+	// reuse). Both rpcd methods (run/test) background the CLI and answer
+	// immediately with `{started:true}` (usr/libexec/rpcd/luci.gitbackup's
+	// own gbrpc_run/gbrpc_test) -- the only way to see how it went is to
+	// tail the same syslog-backed `log` method, so the poller is started
+	// FIRST (establishing the current line count) and the rpcd call second,
+	// so a very fast operation's own first output line is never missed.
 	handleRun: function(ev) {
 		var self = this;
 
 		self.setBusy(true);
+		self.setOpStatus('busy', _('Running a backup…'));
+		self.showLiveLog();
 
-		return self.startLiveLog().then(function() {
+		return oplog.start({
+			fetch: function() { return L.resolveDefault(callLog(500), null).then(function(res) { return (res && res.text) || ''; }); },
+			terminalRe: GB_LOG_TERMINAL_RE,
+			onProgress: function(add) { self.appendLiveLog(add); },
+			onFinish: function(line) {
+				var cls = gbClassifyLog(line);
+				self.setBusy(false);
+				self.setOpStatus(gbOutcomeKind(cls), cls.message);
+				self.refreshStatus();
+				self.refreshHistory();
+				self.refreshConfigDiff();
+			},
+			onTimeout: function() {
+				self.setBusy(false);
+				self.setOpStatus('warn', _('No result after a while -- check the log below or the syslog by hand.'));
+				self.refreshStatus();
+			}
+		}).then(function() {
 			return callRun();
 		}).then(function(res) {
 			if (!res || res.started !== true) {
-				ui.addNotification(null, E('p', {}, _('Could not start a backup run.')), 'error');
+				oplog.stop();
 				self.setBusy(false);
+				self.setOpStatus('error', _('Could not start a backup run.'));
 			}
 		}).catch(function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not start a backup run: %s').format(e.message)), 'error');
+			oplog.stop();
 			self.setBusy(false);
+			self.setOpStatus('error', _('Could not start a backup run: %s').format(e.message));
 		});
 	},
 
@@ -887,18 +953,88 @@ return view.extend({
 		var self = this;
 
 		self.setBusy(true);
+		self.setOpStatus('busy', _('Testing the connection…'));
+		self.showLiveLog();
 
-		return self.startLiveLog().then(function() {
+		return oplog.start({
+			fetch: function() { return L.resolveDefault(callLog(500), null).then(function(res) { return (res && res.text) || ''; }); },
+			terminalRe: GB_LOG_TERMINAL_RE,
+			onProgress: function(add) { self.appendLiveLog(add); },
+			onFinish: function(line) {
+				var cls = gbClassifyLog(line);
+				self.setBusy(false);
+				self.setOpStatus(gbOutcomeKind(cls), cls.message);
+				self.refreshStatus();
+			},
+			onTimeout: function() {
+				self.setBusy(false);
+				self.setOpStatus('warn', _('No result after a while -- check the log below or the syslog by hand.'));
+			}
+		}).then(function() {
 			return callTest();
 		}).then(function(res) {
 			if (!res || res.started !== true) {
-				ui.addNotification(null, E('p', {}, _('Could not start a connection test.')), 'error');
+				oplog.stop();
 				self.setBusy(false);
+				self.setOpStatus('error', _('Could not start a connection test.'));
 			}
 		}).catch(function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not start a connection test: %s').format(e.message)), 'error');
+			oplog.stop();
 			self.setBusy(false);
+			self.setOpStatus('error', _('Could not start a connection test: %s').format(e.message));
 		});
+	},
+
+	// handleShowConfigDiff -- ticket 23: the "Configuration" card is now a
+	// button (render() above); this is its click handler. Always re-fetches
+	// (never trusts refreshConfigDiff's own cached self._configDiffRes
+	// alone, though that IS used as the modal's very first paint, to avoid
+	// a blank flash) -- config_diff re-collects the whole backup set on
+	// every call (gbrpc_config_diff, usr/libexec/rpcd/luci.gitbackup), so
+	// the config could easily have changed again since the last periodic
+	// refresh, and this is the one place an operator explicitly asked to
+	// see the current truth, not a five-seconds-old approximation of it.
+	handleShowConfigDiff: function(ev) {
+		var self = this;
+
+		ui.showModal(_('Configuration diff'), [
+			E('p', { 'class': 'spinning' }, _('Checking the current configuration against the last commit…'))
+		]);
+
+		if (self._configDiffRes)
+			self.renderConfigDiffModal(self._configDiffRes);
+
+		return L.resolveDefault(callConfigDiff(), null).then(function(res) {
+			self._configDiffRes = res;
+			self.applyConfigDiffDom(gbConfigDiffView(res));
+			self.renderConfigDiffModal(res);
+		});
+	},
+
+	// renderConfigDiffModal <res> -- <res> is gbrpc_config_diff's own raw
+	// answer (`{differs, text}` or `{reason}`), not gbConfigDiffView's
+	// view-model: the manifest-format text itself (diffview.manifest) is
+	// exactly the one field that model deliberately throws away (see that
+	// function's own comment), and this is the one place it is shown.
+	renderConfigDiffModal: function(res) {
+		var body;
+
+		if (!res || typeof res.differs !== 'boolean') {
+			body = [ E('p', { 'class': 'gitbackup-hint-error' },
+				(res && res.reason) ?
+					_('Could not check: %s').format(res.reason) :
+					_('Could not check whether the configuration has changed.')) ];
+		} else if (!res.differs) {
+			body = [ E('p', { 'class': 'gitbackup-hint-ok' }, _('The configuration matches the last commit.')) ];
+		} else {
+			body = [ diffview.manifest(res.text) ];
+		}
+
+		body.push(E('div', { 'class': 'gitbackup-modal-actions' }, [
+			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
+		]));
+
+		ui.showModal(_('Configuration diff'), body);
 	},
 
 	handleDownloadCard: function(ev) {
