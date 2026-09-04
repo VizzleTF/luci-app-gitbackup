@@ -299,6 +299,11 @@ msgstr "Не удалось связаться с удалённым узлом,
 msgid "Could not read the backup's manifest from the remote -- nothing was restored."
 msgstr "Не удалось прочитать манифест бэкапа с удалённого репозитория — ничего не восстановлено."
 
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1142
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1167
+msgid "Could not read the current key: %s"
+msgstr "Не удалось прочитать текущий ключ: %s"
+
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/paths.js:485
 msgid "Could not save the path list: %s"
 msgstr "Не удалось сохранить список путей: %s"
@@ -381,9 +386,13 @@ msgstr "Deploy-ключ создан."
 msgid "Deploy key path"
 msgstr "Путь к deploy-ключу"
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1054
-msgid "Deploy key regenerated."
-msgstr "Deploy-ключ пересоздан."
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1255
+msgid "Deploy key regenerated. Add the new public key above at your provider."
+msgstr "Deploy-ключ пересоздан. Добавьте новый публичный ключ выше у вашего провайдера."
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1156
+msgid "Destroy it and regenerate"
+msgstr "Уничтожить и пересоздать"
 
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:584
 msgid "Device identifier"
@@ -520,6 +529,10 @@ msgstr "Я принимаю риск и подтверждаю, что этот 
 msgid "Keep a local archive"
 msgstr "Хранить локальный архив"
 
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1150
+msgid "Key currently in use (fingerprint):"
+msgstr "Ключ, используемый сейчас (отпечаток):"
+
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/overview.js:626
 msgid "Last commit"
 msgstr "Последний коммит"
@@ -652,6 +665,10 @@ msgstr "Публичный"
 msgid "Pushed a new commit on the last run."
 msgstr "При последнем запуске отправлен (push) новый коммит."
 
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1121
+msgid "Reading the current key’s fingerprint…"
+msgstr "Чтение отпечатка текущего ключа…"
+
 #: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/history.js:353
 msgid "Refused: the files in this backup could not be verified (a checksum did not match) -- nothing was written to disk."
 msgstr "Отказано: файлы в этом бэкапе не прошли проверку (контрольная сумма не совпала) — на диск ничего не записано."
@@ -664,7 +681,19 @@ msgstr "Отказано: этот бэкап снят на другой мод�
 msgid "Regenerate key"
 msgstr "Перегенерировать ключ"
 
-#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1033
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1149
+msgid ""
+"Regenerating destroys this key beyond recovery, and the deploy key already "
+"added at your git provider stops working the instant it does. This cannot be "
+"undone from here -- after regenerating, add the NEW public key at the "
+"provider before the next backup runs."
+msgstr ""
+"Пересоздание безвозвратно уничтожает этот ключ, и deploy-ключ, уже "
+"добавленный у вашего git-провайдера, перестаёт работать в тот же момент. "
+"Отменить это отсюда нельзя — после пересоздания добавьте НОВЫЙ публичный "
+"ключ у провайдера до следующего запуска бэкапа."
+
+#: applications/luci-app-gitbackup/htdocs/luci-static/resources/view/gitbackup/settings.js:1207
 msgid "Regenerating…"
 msgstr "Пересоздание…"
 

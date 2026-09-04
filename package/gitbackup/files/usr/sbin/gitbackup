@@ -56,7 +56,9 @@ Commands:
   diff       show what changed since the last successful run, or [from to]
              (two full commit shas) for the diff between two backups
   history    list this device's own backup commits as JSON
-  keygen     generate the SSH deploy key
+  keygen     generate the SSH deploy key ([--force [--confirm <fingerprint>]]
+             to replace an existing one -- --force alone only shows its
+             fingerprint and refuses; naming it back with --confirm proceeds)
   pubkey     print the deploy key's public key
   test       verify connectivity and remote configuration
   hostkey    show|accept <fingerprint> -- confirm the remote's SSH host key
@@ -283,6 +285,14 @@ cmd_test() {
 	eval "$(gb_git_env)"
 	if _gb_err=$(git ls-remote "$GB_URL" 2>&1 >/dev/null); then
 		gb_log notice "gitbackup test: $GB_URL is reachable and authenticated"
+		# Ticket 25: a successful ls-remote against the configured remote is
+		# proof the key currently at key_file (if any) is accepted by the
+		# provider right now -- exactly the event gb_keygen's own
+		# "id_ed25519.old" is being kept around to wait for (auth.sh, see
+		# gb_keygen's header comment). A no-op whenever nothing was ever
+		# kept, which is every `test` run that was not preceded by a
+		# `keygen --force`.
+		gb_keygen_forget_old
 		printf 'ok: %s is reachable and authenticated\n' "$GB_URL"
 		return 0
 	fi
@@ -1472,11 +1482,39 @@ case "$cmd" in
 		# GB_URL or the device name -- in the real bootstrap order the key
 		# is generated and its public half handed to the provider BEFORE a
 		# remote url even exists to validate.
+		#
+		# Ticket 25: --force alone is no longer enough to overwrite an
+		# existing key (see gb_keygen's own header comment, auth.sh) --
+		# --confirm <fingerprint> must additionally name back the exact
+		# fingerprint gb_keygen prints when it refuses. This loop only
+		# collects the two flags; gb_keygen itself is what decides whether
+		# what was named actually matches.
 		_gb_force=''
-		for _gb_a in "$@"; do
-			[ "$_gb_a" = '--force' ] && _gb_force=1
+		_gb_confirm=''
+		while [ "$#" -gt 0 ]; do
+			case "$1" in
+				--force) _gb_force=1; shift ;;
+				--confirm) shift; _gb_confirm="${1:-}"; shift ;;
+				--confirm=*) _gb_confirm="${1#--confirm=}"; shift ;;
+				*) shift ;;
+			esac
 		done
-		gb_keygen "$_gb_force" || exit 1
+		_gb_kg_out=$(gb_keygen "$_gb_force" "$_gb_confirm")
+		_gb_kg_rc=$?
+		if [ "$_gb_kg_rc" -eq 4 ]; then
+			# The exact "confirm-required <fingerprint>" line gb_keygen
+			# printed is relayed to stdout unchanged first (rpcd's own
+			# gbrpc_keygen parses this first line back out to hand the
+			# fingerprint to the web UI, the same way cmd_hostkey's "show"
+			# output already does for the host-key flow) -- then a
+			# human-readable explanation follows on stderr via gb_die.
+			printf '%s\n' "$_gb_kg_out"
+			# shellcheck disable=SC2086  # word-splitting is the point: the fixed leading token, then the fingerprint text
+			set -- $_gb_kg_out
+			shift
+			gb_die 4 "$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519) already exists (fingerprint: $*) -- keygen --force destroys the private half beyond recovery, and the deploy key already added at your git provider stops working the instant it does; re-run 'gitbackup keygen --force --confirm \"$*\"' to proceed, then add the NEW public key at the provider"
+		fi
+		[ "$_gb_kg_rc" -eq 0 ] || exit 1
 		printf 'generated %s\n' "$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)"
 		;;
 	pubkey)

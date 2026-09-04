@@ -383,18 +383,40 @@ gbrpc_hostkey() {
 	fi
 }
 
+# gbrpc_keygen -- ticket 25. "force" with no "confirm" (or the wrong one)
+# no longer regenerates anything over an existing key: `gitbackup keygen
+# --force` now only prints the current key's fingerprint and refuses (exit
+# 4, cmd_keygen's own gb_die message) -- exactly the same show-then-name-
+# it-back shape gbrpc_hostkey above already uses for the host-key prompt.
+# The fingerprint is pulled back out of cmd_keygen's own first stdout line
+# ("confirm-required <fingerprint>", relayed verbatim ahead of its
+# stderr explanation) rather than out of the human-readable message text,
+# so a future wording change to that message cannot silently break this
+# parse.
 gbrpc_keygen() {
 	_gb_rpc_force=$(_gb_rpc_param "$1" '@.force')
+	_gb_rpc_confirm=$(_gb_rpc_param "$1" '@.confirm')
 	_gb_rpc_args=''
 	case "$_gb_rpc_force" in true | 1) _gb_rpc_args='--force' ;; esac
-	# shellcheck disable=SC2086  # $_gb_rpc_args is empty or exactly one flag token
-	_gb_rpc_out=$("$GB_BIN" keygen $_gb_rpc_args 2>&1)
+	if [ -n "$_gb_rpc_confirm" ]; then
+		# shellcheck disable=SC2086  # $_gb_rpc_args is empty or exactly one flag token
+		_gb_rpc_out=$("$GB_BIN" keygen $_gb_rpc_args --confirm "$_gb_rpc_confirm" 2>&1)
+	else
+		# shellcheck disable=SC2086  # $_gb_rpc_args is empty or exactly one flag token
+		_gb_rpc_out=$("$GB_BIN" keygen $_gb_rpc_args 2>&1)
+	fi
 	_gb_rpc_rc=$?
 	if [ "$_gb_rpc_rc" -eq 0 ]; then
 		printf '{ "ok": true, "message": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
-	else
-		printf '{ "ok": false, "reason": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
+		return
 	fi
+	if [ "$_gb_rpc_rc" -eq 4 ]; then
+		_gb_rpc_fp=$(printf '%s\n' "$_gb_rpc_out" | sed -n '1s/^confirm-required //p')
+		printf '{ "ok": false, "confirm_required": true, "fingerprint": %s, "reason": %s }\n' \
+			"$(gb_json_str "$_gb_rpc_fp")" "$(gb_json_str "$_gb_rpc_out")"
+		return
+	fi
+	printf '{ "ok": false, "reason": %s }\n' "$(gb_json_str "$_gb_rpc_out")"
 }
 
 # gbrpc_set_secret -- writes gitbackup.origin.token_file directly (there is
@@ -569,7 +591,7 @@ case "${1:-}" in
 	"audit_paths": {},
 	"validate_cron": { "expr": "" },
 	"run": {},
-	"keygen": { "force": true },
+	"keygen": { "force": true, "confirm": "" },
 	"test": {},
 	"hostkey": { "fingerprint": "" },
 	"set_secret": { "value": "" },

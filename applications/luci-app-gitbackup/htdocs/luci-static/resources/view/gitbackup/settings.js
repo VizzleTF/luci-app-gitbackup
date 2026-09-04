@@ -43,10 +43,18 @@ var callPubkey = rpc.declare({
 	method: 'pubkey'
 });
 
+// callKeygen([force[, confirm]]) -- ticket 25. `force` with no `confirm`
+// (or a `confirm` that does not match) no longer regenerates anything over
+// an existing key: gbrpc_keygen answers with `confirm_required: true` and
+// the current key's own `fingerprint` instead (gb_keygen's own "show,
+// then name it back" shape, auth.sh, out of this ticket's zone) -- the
+// same two-call round trip callHostkey below already uses for the host-key
+// prompt. `confirm` is only ever the exact fingerprint text a previous
+// call answered with.
 var callKeygen = rpc.declare({
 	object: 'luci.gitbackup',
 	method: 'keygen',
-	params: [ 'force' ]
+	params: [ 'force', 'confirm' ]
 });
 
 var callSetSecret = rpc.declare({
@@ -200,6 +208,32 @@ function gbDeeplinkInfo(url, providerOption) {
 	default:
 		return { kind: 'generic', host: parsed.host };
 	}
+}
+
+// gbFieldValue <section> <section_id> <name> -- formvalue() when <name>'s
+// own form widget already exists in the DOM, falling back to the SAVED
+// cfgvalue() otherwise.
+//
+// Ticket 25's second defect: form.js's own AbstractValue.formvalue
+// (modules/luci-base/htdocs/luci-static/resources/form.js) returns null
+// whenever getUIElement() finds nothing yet -- which is exactly the case
+// the very first checkDepends/renderWidget pass runs under, before this
+// section's own widgets have been created at all. Every checkDepends/
+// renderWidget below that reads 'url' or 'provider' with a bare
+// `this.section.formvalue(section_id, ...)` therefore saw an empty url on
+// that very first paint, always resolved to the "generic" provider
+// (gbResolveProvider's own default case), and stayed on that first,
+// wrong answer until some LATER field edit made checkDepends run again --
+// confirmed live on the owlab stand for the deploy-key link specifically:
+// 0 links on a freshly loaded Settings page, 1 the instant any field in
+// the "origin" section was merely touched (no value even had to change).
+// A saved config is exactly the case where cfgvalue() already has the
+// real answer sitting there before any widget exists, so falling back to
+// it -- rather than to a hardcoded default -- fixes the very first paint
+// without waiting for the framework's own later re-check.
+function gbFieldValue(section, section_id, name) {
+	var v = section.formvalue(section_id, name);
+	return (v != null) ? v : section.cfgvalue(section_id, name);
 }
 
 // ---------------------------------------------------------------------
@@ -506,6 +540,7 @@ function gbBuildDeployKeyBody(view) {
 			}, _('Copy')),
 			E('button', {
 				'class': 'cbi-button cbi-button-neutral',
+				'id': 'gitbackup-btn-regenerate',
 				'click': ui.createHandlerFn(view, 'handleGenerateKey', true)
 			}, _('Regenerate key')),
 			E('span', { 'class': 'gitbackup-copy-status', 'id': 'gitbackup-copy-status' }, '')
@@ -519,6 +554,14 @@ function gbBuildDeployKeyBody(view) {
 			}, _('Generate deploy key'))
 		]));
 	}
+
+	// Ticket 25: the confirmation box between clicking "Regenerate key" and
+	// actually calling keygen with a matching "confirm" -- see
+	// showKeygenConfirm/handleConfirmRegenerateKey below. Built once here,
+	// alongside the rest of this subtree, so a fresh, hidden one is
+	// guaranteed to exist across every "Regenerate key" click this subtree
+	// ever sees, not only the very first one.
+	wrap.appendChild(E('div', { 'id': 'gitbackup-keygen-confirm', 'class': 'gitbackup-box', 'hidden': true }));
 
 	// Ticket 23: the one status line shared by "Generate deploy key" and
 	// "Regenerate key" -- 'busy' (spinning) the instant either is clicked,
@@ -796,9 +839,9 @@ return view.extend({
 		o.rawhtml = true;
 		o.cfgvalue = function() { return null; };
 		o.checkDepends = function(section_id) {
-			var auth = this.section.formvalue(section_id, 'auth');
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var auth = gbFieldValue(this.section, section_id, 'auth');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			var resolved = gbResolveProvider(url, provider);
 			var active = auth === 'sshkey' && resolved !== 'generic';
 			var old = document.getElementById('gitbackup-deploylink-body');
@@ -809,8 +852,8 @@ return view.extend({
 			return active;
 		};
 		o.renderWidget = function(section_id) {
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			var info = gbDeeplinkInfo(url, provider);
 			var wrap = E('div', { 'id': 'gitbackup-deploylink-body', 'class': 'gitbackup-box' }, [
 				E('p', { 'class': 'gitbackup-warn-text' },
@@ -844,9 +887,9 @@ return view.extend({
 		o.rawhtml = true;
 		o.cfgvalue = function() { return null; };
 		o.checkDepends = function(section_id) {
-			var auth = this.section.formvalue(section_id, 'auth');
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var auth = gbFieldValue(this.section, section_id, 'auth');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			var resolved = gbResolveProvider(url, provider);
 			var active = auth === 'sshkey' && resolved === 'generic';
 			var old = document.getElementById('gitbackup-deploygeneric-body');
@@ -857,8 +900,8 @@ return view.extend({
 			return active;
 		};
 		o.renderWidget = function(section_id) {
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			var info = gbDeeplinkInfo(url, provider);
 			var host = (info.kind === 'generic') ? info.host : _('the server');
 			var pubkeyText = self._pubkey ? self._pubkey.replace(/\s+$/, '') : 'ssh-ed25519 AAAA... gitbackup';
@@ -945,13 +988,13 @@ return view.extend({
 
 		o = s.option(form.Flag, 'acknowledged', _('I accept the risk and confirm this repository is actually private'));
 		o.checkDepends = function(section_id) {
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			return gbResolveProvider(url, provider) === 'generic';
 		};
 		o.validate = function(section_id, value) {
-			var url = this.section.formvalue(section_id, 'url');
-			var provider = this.section.formvalue(section_id, 'provider');
+			var url = gbFieldValue(this.section, section_id, 'url');
+			var provider = gbFieldValue(this.section, section_id, 'provider');
 			if (gbResolveProvider(url, provider) !== 'generic')
 				return true;
 			if (value === this.enabled)
@@ -1022,40 +1065,195 @@ return view.extend({
 	// "#gitbackup-deploykey-body" subtree in place (gbBuildDeployKeyBody
 	// above) rather than re-rendering the whole form.Map, so an edit the
 	// operator has mid-typed anywhere else on this page survives. <force>
-	// is only ever true from the "Regenerate key" button (an existing key
-	// is otherwise left alone by gb_keygen itself, which refuses to
-	// overwrite one without it -- auth.sh, out of this ticket's zone).
+	// is only ever true from the "Regenerate key" button, only ever shown
+	// when a key already exists (gbBuildDeployKeyBody's own `if (pubkey)`
+	// branch).
+	//
+	// Ticket 25: <force> true no longer calls keygen straight away --
+	// destroying the working key with one click and no warning is exactly
+	// the bug this ticket exists to close. It goes through
+	// showKeygenConfirm below instead, the same "show what would be
+	// destroyed, then require it to be named back" flow gb_keygen itself
+	// now enforces server-side (auth.sh) and this page's own host-key
+	// prompt already uses lower down. <force> false ("Generate deploy
+	// key", shown only when there is no key yet) still calls keygen
+	// immediately -- there is nothing to destroy, so nothing to confirm.
 	handleGenerateKey: function(force, ev) {
 		var self = this;
 		var btn = ev.target;
 
 		btn.disabled = true;
-		self.setKeygenStatus('busy', force ? _('Regenerating…') : _('Generating…'));
 
-		return callKeygen(force ? true : undefined).then(function(res) {
-			if (!res || res.ok !== true) {
-				self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format((res && res.reason) || _('unknown error')));
-				btn.disabled = false;
-				return;
-			}
-			return L.resolveDefault(callPubkey(), null).then(function(pk) {
-				var old = document.getElementById('gitbackup-deploykey-body');
+		if (force)
+			return self.showKeygenConfirm(btn);
 
-				self._pubkey = (pk && typeof pk.pubkey === 'string') ? pk.pubkey : null;
-
-				if (old && old.parentNode)
-					old.parentNode.replaceChild(gbBuildDeployKeyBody(self), old);
-
-				// The rebuilt subtree above starts with a fresh, hidden
-				// status line (gbBuildDeployKeyBody's own comment) -- the
-				// explicit success message ticket 23 asks for ("кончилось
-				// хорошо") is set on THAT new node, not the one just
-				// replaced.
-				self.setKeygenStatus('ok', force ? _('Deploy key regenerated.') : _('Deploy key generated.'));
-			});
+		self.setKeygenStatus('busy', _('Generating…'));
+		return callKeygen().then(function(res) {
+			return self.applyKeygenResult(res, false, btn);
 		}, function(e) {
 			self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format(e.message));
 			btn.disabled = false;
+		});
+	},
+
+	// showKeygenConfirm <button> -- ticket 25. Asks gbrpc_keygen for the
+	// key currently in use (`callKeygen(true)` with no `confirm` never
+	// destroys anything -- gb_keygen answers `confirm_required: true` plus
+	// the current key's own fingerprint instead, auth.sh, out of this
+	// ticket's zone) and shows it in the box gbBuildDeployKeyBody already
+	// reserves, with the exact warning the ticket requires: this is
+	// irreversible, and the deploy key already at the provider stops
+	// authenticating the moment a new key replaces it. Only a click on
+	// "Destroy it and regenerate" below (handleConfirmRegenerateKey) can
+	// actually go through with it.
+	showKeygenConfirm: function(btn) {
+		var self = this;
+		var box = document.getElementById('gitbackup-keygen-confirm');
+
+		if (!box) {
+			btn.disabled = false;
+			return;
+		}
+
+		box.hidden = false;
+		while (box.firstChild)
+			box.removeChild(box.firstChild);
+		box.appendChild(E('p', { 'class': 'spinning' }, _('Reading the current key’s fingerprint…')));
+
+		return callKeygen(true).then(function(res) {
+			// A key already existed the instant this page loaded (only
+			// then does gbBuildDeployKeyBody show "Regenerate key" at
+			// all), so the ordinary outcome here is always
+			// confirm_required. `ok: true` only happens if that key was
+			// removed out of band since the page loaded -- gb_keygen found
+			// nothing to confirm and generated a fresh one immediately,
+			// same as `force` false would have. Either way nothing was
+			// destroyed without the operator seeing it first.
+			if (res && res.ok === true) {
+				self.hideKeygenConfirm();
+				return self.applyKeygenResult(res, true, btn);
+			}
+
+			while (box.firstChild)
+				box.removeChild(box.firstChild);
+
+			if (!res || res.confirm_required !== true || !res.fingerprint) {
+				box.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
+					_('Could not read the current key: %s').format((res && res.reason) || _('unknown error'))));
+				btn.disabled = false;
+				return;
+			}
+
+			self._keygenFingerprint = res.fingerprint;
+			box.appendChild(E('p', { 'class': 'gitbackup-warn-text' },
+				_('Regenerating destroys this key beyond recovery, and the deploy key already added at your git provider stops working the instant it does. This cannot be undone from here -- after regenerating, add the NEW public key at the provider before the next backup runs.')));
+			box.appendChild(E('p', {}, _('Key currently in use (fingerprint):')));
+			box.appendChild(E('pre', { 'class': 'gitbackup-log' }, res.fingerprint));
+			box.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
+				E('button', {
+					'class': 'cbi-button cbi-button-negative',
+					'click': ui.createHandlerFn(self, 'handleConfirmRegenerateKey')
+				}, _('Destroy it and regenerate')),
+				E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'click': ui.createHandlerFn(self, 'handleCancelRegenerateKey')
+				}, _('Cancel'))
+			]));
+			btn.disabled = false;
+		}, function(e) {
+			while (box.firstChild)
+				box.removeChild(box.firstChild);
+			box.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
+				_('Could not read the current key: %s').format(e.message)));
+			btn.disabled = false;
+		});
+	},
+
+	hideKeygenConfirm: function() {
+		var box = document.getElementById('gitbackup-keygen-confirm');
+
+		if (!box)
+			return;
+
+		box.hidden = true;
+		while (box.firstChild)
+			box.removeChild(box.firstChild);
+		this._keygenFingerprint = null;
+	},
+
+	handleCancelRegenerateKey: function(ev) {
+		var btn = document.getElementById('gitbackup-btn-regenerate');
+
+		this.hideKeygenConfirm();
+		if (btn)
+			btn.disabled = false;
+	},
+
+	// handleConfirmRegenerateKey -- sends back EXACTLY the fingerprint text
+	// showKeygenConfirm cached, never a value re-read from anywhere else,
+	// same reasoning as handleAcceptHostkey below: gb_keygen only ever
+	// destroys the current key when "confirm" matches precisely what its
+	// own "force, no confirm" call reported; anything else is refused
+	// server-side (exit 4) rather than silently trusted.
+	handleConfirmRegenerateKey: function(ev) {
+		var self = this;
+		var fp = self._keygenFingerprint;
+		var btn = ev.target;
+
+		if (!fp)
+			return;
+
+		btn.disabled = true;
+		self.setKeygenStatus('busy', _('Regenerating…'));
+
+		return callKeygen(true, fp).then(function(res) {
+			self.hideKeygenConfirm();
+			return self.applyKeygenResult(res, true, btn);
+		}, function(e) {
+			self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format(e.message));
+			btn.disabled = false;
+		});
+	},
+
+	// applyKeygenResult <res> <force> <button> -- the one place that
+	// reacts to keygen actually succeeding, shared by "Generate deploy
+	// key" and both ends of the "Regenerate key" confirmation flow above:
+	// fetches the fresh public key and rebuilds "#gitbackup-deploykey-body"
+	// in place.
+	applyKeygenResult: function(res, force, btn) {
+		var self = this;
+
+		if (!res || res.ok !== true) {
+			self.setKeygenStatus('error', _('Could not generate a deploy key: %s').format((res && res.reason) || _('unknown error')));
+			if (btn)
+				btn.disabled = false;
+			return;
+		}
+
+		return L.resolveDefault(callPubkey(), null).then(function(pk) {
+			var old = document.getElementById('gitbackup-deploykey-body');
+
+			self._pubkey = (pk && typeof pk.pubkey === 'string') ? pk.pubkey : null;
+
+			if (old && old.parentNode)
+				old.parentNode.replaceChild(gbBuildDeployKeyBody(self), old);
+
+			// The rebuilt subtree above starts with a fresh, hidden status
+			// line (gbBuildDeployKeyBody's own comment) -- the explicit
+			// success message ticket 23 asks for ("кончилось хорошо") is
+			// set on THAT new node, not the one just replaced. Ticket 25:
+			// that same rebuilt subtree already shows the NEW public key
+			// (the textarea above it) and -- once ticket 25's other fix
+			// keeps the deploy-key link visible from the very first
+			// render instead of only after a field is touched -- the "add
+			// it at the provider" link right below it, both in the one
+			// place the operator is already looking. The message below
+			// says so explicitly for the regenerate case, where acting on
+			// it immediately actually matters (access is broken until
+			// the provider is updated).
+			self.setKeygenStatus('ok', force ?
+				_('Deploy key regenerated. Add the new public key above at your provider.') :
+				_('Deploy key generated.'));
 		});
 	},
 

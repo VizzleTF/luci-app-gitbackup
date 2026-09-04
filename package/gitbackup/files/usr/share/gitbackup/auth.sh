@@ -106,7 +106,24 @@ _gb_auth_shquote() {
 	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-# gb_keygen [force]
+# _gb_auth_key_fingerprint <key-path>
+#
+# ssh-keygen -lf's own fingerprint line for whichever half of the pair is
+# actually readable, preferring the public half (same preference order
+# gb_pubkey below already uses) -- unlike gb_pubkey, this never needs the
+# `-y` derivation fallback: `ssh-keygen -lf` accepts either a private or a
+# public key file directly and prints the identical fingerprint for
+# either, since the fingerprint is a hash of the public half alone.
+_gb_auth_key_fingerprint() {
+	_gb_akf_key="$1"
+	if [ -r "$_gb_akf_key.pub" ]; then
+		ssh-keygen -lf "$_gb_akf_key.pub" 2>/dev/null
+	elif [ -r "$_gb_akf_key" ]; then
+		ssh-keygen -lf "$_gb_akf_key" 2>/dev/null
+	fi
+}
+
+# gb_keygen [force] [confirm-fingerprint]
 #
 # Generates the deploy key at gitbackup.origin.key_file (default
 # /etc/gitbackup/id_ed25519): ed25519, no passphrase. No passphrase is
@@ -118,7 +135,64 @@ _gb_auth_shquote() {
 # Refuses to overwrite a key that already exists unless <force> is a
 # non-empty argument: losing the only copy of a deploy key locks every
 # remote it was already added to until the operator notices and re-adds
-# the new public half everywhere (ticket 04 acceptance criterion).
+# the new public half everywhere (ticket 04 acceptance criterion). This
+# part of the contract is unchanged by ticket 25 below: `gitbackup keygen`
+# with no `force` at all on an existing key behaves exactly as before.
+#
+# Ticket 25: `force` alone used to be enough to destroy the working key on
+# the spot, no warning, no way back -- reported live from a real router
+# where `keygen --force`, run only to see where the operation writes,
+# silently ate the key a working deploy relied on. The private half is
+# gone the instant the `rm -f` below runs, and every remote it had been
+# added to as a deploy key stops authenticating that same instant, with
+# nothing on this router able to undo either side of that.
+#
+# gb_hostkey_show/gb_hostkey_accept above already solved the equivalent
+# problem for a different irreversible decision -- "confirm by naming
+# exactly what was shown", not a bare y/N -- and this reuses that same
+# shape instead of adding a `read` prompt here: a `read`-based prompt
+# would need a second, separate branch for "no controlling terminal at
+# all" (ticket 20's own EOF-is-neither-yes-nor-no lesson, gb_accept_hostkey
+# above), and that branch would need testing on its own. Requiring the
+# caller to name the fingerprint back sidesteps the distinction entirely --
+# an interactive operator and a non-interactive script take the identical
+# path, and there is no `read` anywhere in this function to hang or
+# misread an EOF as a decision nobody made:
+#
+#   force set, no existing key            -- generates immediately, exactly
+#                                             as before (nothing to confirm)
+#   force unset, existing key             -- refused, exit 1, unchanged
+#   force set, existing key, confirm      -- prints "confirm-required
+#     empty or not matching the current   <fingerprint>" to stdout (nothing
+#     key's own fingerprint               destroyed) and returns 4
+#   force set, existing key, confirm      -- proceeds: the old key is kept
+#     matches the current fingerprint     aside (see below) and a fresh one
+#     exactly                             is generated; returns 0
+#
+# A caller that never asks (only ever passes `force`) gets told what is
+# missing on every single call -- it can never destroy anything by
+# accident, and it is never met with a bare, unexplained refusal either.
+#
+# Decision (ticket 25 leaves this to the implementer, either answer
+# acceptable if justified): the key about to be destroyed is copied aside
+# as "<key>.old"/"<key>.old.pub" before anything is removed, left there
+# until gb_keygen_forget_old below is called. Nothing on this router ever
+# reads ".old" back automatically -- there is deliberately no "fall back
+# to the old key if the new one fails" logic, which would make a failed
+# push ambiguous about which key actually ran and silently reintroduce the
+# very key this whole flow just told the operator to stop using. The
+# reason to keep it anyway is narrower: the one step this flow cannot
+# verify from the router is whether the operator actually went to the
+# provider and added the NEW public key before the next push runs. If they
+# forgot, or pasted the wrong key, the router itself becomes unreachable
+# over the only channel this package uses, and the file this comment is
+# justifying is then the difference between "cp it back and try again" and
+# "nothing, the old private half is just gone" -- for the cost of one
+# extra ~400-byte file that a successful `gitbackup test` (cmd_test,
+# usr/sbin/gitbackup) removes on its own the first time the NEW key is
+# actually proven to work. Deleting outright instead (the spec's other
+# sanctioned answer) would not shorten the provider trip either way; it
+# would only remove this one way an already-bad day gets worse.
 #
 # Creates the key's directory at 0700 if it does not exist yet (uci-
 # defaults/99-gitbackup already does this for the default /etc/gitbackup,
@@ -129,15 +203,35 @@ _gb_auth_shquote() {
 # code change on this side to catch it.
 gb_keygen() {
 	_gb_force="${1:-}"
+	_gb_confirm="${2:-}"
 	_gb_key=$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)
 	if [ -z "$_gb_key" ]; then
 		gb_log err 'gb_keygen: gitbackup.origin.key_file is empty'
 		return 1
 	fi
 
-	if [ -e "$_gb_key" ] && [ -z "$_gb_force" ]; then
-		gb_log err "gb_keygen: $_gb_key already exists; pass a non-empty force argument to replace it"
-		return 1
+	if [ -e "$_gb_key" ]; then
+		if [ -z "$_gb_force" ]; then
+			gb_log err "gb_keygen: $_gb_key already exists; pass a non-empty force argument to replace it"
+			return 1
+		fi
+
+		_gb_fp=$(_gb_auth_key_fingerprint "$_gb_key")
+		if [ -z "$_gb_confirm" ] || [ "$_gb_confirm" != "$_gb_fp" ]; then
+			if [ -n "$_gb_confirm" ]; then
+				gb_log err "gb_keygen: confirmation fingerprint does not match the key currently at $_gb_key; refusing"
+			fi
+			printf 'confirm-required %s\n' "$_gb_fp"
+			return 4
+		fi
+
+		# Confirmed: keep the outgoing key's own copy before touching
+		# anything -- see this function's header comment for why. Best
+		# effort on purpose (2>/dev/null): a failure to write the backup
+		# copy must never block the regeneration the operator explicitly
+		# confirmed, only mean there is nothing to roll back to.
+		cp -f "$_gb_key" "$_gb_key.old" 2>/dev/null && chmod 0600 "$_gb_key.old" 2>/dev/null
+		[ -e "$_gb_key.pub" ] && cp -f "$_gb_key.pub" "$_gb_key.old.pub" 2>/dev/null
 	fi
 
 	_gb_dir=$(dirname "$_gb_key")
@@ -153,6 +247,24 @@ gb_keygen() {
 	[ -e "$_gb_key.pub" ] && chmod 0644 "$_gb_key.pub"
 	gb_log notice "gb_keygen: generated $_gb_key"
 	return 0
+}
+
+# gb_keygen_forget_old
+#
+# Ticket 25's other half of the id_ed25519.old decision above (gb_keygen's
+# own header comment): removes the pre-regeneration copy once something has
+# actually proven the CURRENT key works end to end. Called from cmd_test's
+# own success path (usr/sbin/gitbackup) -- a successful `git ls-remote`
+# against the configured remote is the one signal this package already
+# computes that means "the key at key_file is accepted by the provider
+# right now", which is exactly the event this flow is waiting for. A no-op
+# whenever there is nothing to forget (the overwhelming majority of
+# successful `test` runs never followed a keygen at all), so this is safe
+# to call unconditionally on every success rather than tracking anywhere
+# whether a keygen happened first.
+gb_keygen_forget_old() {
+	_gb_key=$(gb_uci_get gitbackup.origin.key_file /etc/gitbackup/id_ed25519)
+	rm -f "$_gb_key.old" "$_gb_key.old.pub"
 }
 
 # gb_pubkey

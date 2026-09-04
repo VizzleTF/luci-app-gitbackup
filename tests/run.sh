@@ -2149,14 +2149,83 @@ t_auth_keygen() {
 		gb_keygen >/dev/null 2>&1
 		eq 'calling gb_keygen again with no force argument refuses' '1' "$?"
 		eq 'and the existing key is left untouched' "$_gb_before" "$(cat "$_gb_key")"
+	)
+}
 
-		gb_keygen force >/dev/null 2>&1
-		eq 'a non-empty force argument regenerates the key' '0' "$?"
+# t_auth_keygen_force_needs_confirm -- ticket 25's own headline bug: `keygen
+# --force` alone used to destroy the working key on the spot. Now it must
+# only ever show the current key's fingerprint (never a bare y/N prompt --
+# no `read` anywhere in this path at all, sidestepping ticket 20's own
+# EOF-is-neither-yes-nor-no trap entirely) and refuse, exactly the same
+# whether a human or a script is calling it, until a SECOND call names that
+# exact fingerprint back with `confirm`.
+t_auth_keygen_force_needs_confirm() {
+	(
+		. "$share/lib.sh"; . "$share/auth.sh"
+		_gb_key="$work/authkeys-force/id_ed25519"
+		fixture "gitbackup.origin.key_file=$_gb_key"
+
+		gb_keygen >/dev/null 2>&1
+		_gb_before=$(cat "$_gb_key")
+		_gb_before_fp=$(ssh-keygen -lf "$_gb_key.pub" 2>/dev/null)
+
+		out=$(gb_keygen force 2>/dev/null)
+		eq 'force with no confirmation at all refuses to destroy anything' '4' "$?"
+		eq 'and the existing key is left untouched' "$_gb_before" "$(cat "$_gb_key")"
+		eq 'and prints the fingerprint of the current key, nothing more' \
+			"confirm-required $_gb_before_fp" "$out"
+
+		out=$(gb_keygen force 'not the right fingerprint' 2>/dev/null)
+		eq 'a wrong confirmation is refused the same way as none at all' '4' "$?"
+		eq 'and still leaves the key untouched' "$_gb_before" "$(cat "$_gb_key")"
+
+		_gb_fp=$(printf '%s\n' "$out" | cut -d' ' -f2-)
+		gb_keygen force "$_gb_fp" >/dev/null 2>&1
+		eq 'naming back the exact fingerprint shown regenerates the key' '0' "$?"
 		if [ "$(cat "$_gb_key")" = "$_gb_before" ]; then
-			no 'the key actually changed after force' 'identical bytes as before'
+			no 'and the key actually changed' 'identical bytes as before'
 		else
-			ok 'the key actually changed after force'
+			ok 'and the key actually changed'
 		fi
+	)
+}
+
+# t_auth_keygen_keeps_old -- ticket 25's decision: the key a confirmed
+# `--force` just replaced is kept aside as "<key>.old" rather than deleted
+# outright, until gb_keygen_forget_old below is told the new one works.
+t_auth_keygen_keeps_old() {
+	(
+		. "$share/lib.sh"; . "$share/auth.sh"
+		_gb_key="$work/authkeys-old/id_ed25519"
+		fixture "gitbackup.origin.key_file=$_gb_key"
+
+		gb_keygen >/dev/null 2>&1
+		_gb_before=$(cat "$_gb_key")
+		_gb_before_pub=$(cat "$_gb_key.pub")
+
+		_gb_fp=$(gb_keygen force 2>/dev/null | cut -d' ' -f2-)
+		gb_keygen force "$_gb_fp" >/dev/null 2>&1
+
+		eq 'the previous private key survives as .old' "$_gb_before" "$(cat "$_gb_key.old" 2>/dev/null)"
+		eq 'the previous public key survives as .old.pub' "$_gb_before_pub" "$(cat "$_gb_key.old.pub" 2>/dev/null)"
+
+		_gb_omug=$(stat -c '%a %u %g' "$_gb_key.old" 2>/dev/null)
+		# shellcheck disable=SC2086
+		set -- $_gb_omug
+		eq 'the .old private key is 0600, same as a fresh one' '600' "$1"
+
+		gb_keygen_forget_old
+		if [ -e "$_gb_key.old" ] || [ -e "$_gb_key.old.pub" ]; then
+			no 'gb_keygen_forget_old removes both .old files' 'still present'
+		else
+			ok 'gb_keygen_forget_old removes both .old files'
+		fi
+
+		# No-op when there is nothing to forget -- must not fail or touch
+		# the actual, current key.
+		gb_keygen_forget_old
+		eq 'and calling it again with nothing to forget does not fail' '0' "$?"
+		if [ -f "$_gb_key" ]; then ok 'the current key is untouched by forgetting .old'; else no 'the current key is untouched by forgetting .old' 'missing'; fi
 	)
 }
 
@@ -4188,6 +4257,93 @@ t_cli_keygen_pubkey() {
 	unset GB_ETC_DIR
 }
 
+# t_cli_keygen_force_confirm -- ticket 25, end to end through the CLI: a
+# bare `--force` on an existing key only ever shows its fingerprint and
+# refuses (exit 4) -- never a `read` prompt, so there is no separate
+# non-interactive branch to get wrong the way ticket 20 found for hostkey.
+# Only a second call that names that exact fingerprint back with
+# `--confirm` actually regenerates.
+t_cli_keygen_force_confirm() {
+	GB_ETC_DIR="$work/etc-kfc"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.key_file=$work/etc-kfc/id_ed25519" \
+		'gitbackup.origin.url='
+
+	cli keygen >/dev/null 2>&1
+	_gb_before=$(cat "$work/etc-kfc/id_ed25519")
+
+	out=$(cli keygen --force 2>&1)
+	eq 'keygen --force with no confirmation exits 4' '4' "$?"
+	eq 'and the key is left untouched' "$_gb_before" "$(cat "$work/etc-kfc/id_ed25519")"
+	contains 'and says this is irreversible' 'beyond recovery' "$out"
+	contains 'and says the provider needs a new deploy key afterward' 'add the NEW public key at the provider' "$out"
+
+	_gb_fp=$(printf '%s\n' "$out" | sed -n '1s/^confirm-required //p')
+	if [ -n "$_gb_fp" ]; then
+		ok 'and its first line names a non-empty fingerprint to confirm with'
+	else
+		no 'and its first line names a non-empty fingerprint to confirm with' "$out"
+	fi
+
+	out=$(cli keygen --force --confirm 'not the right fingerprint' 2>&1)
+	eq 'a wrong --confirm is refused the same way as none at all' '4' "$?"
+	eq 'and the key is still untouched' "$_gb_before" "$(cat "$work/etc-kfc/id_ed25519")"
+
+	out=$(cli keygen --force --confirm "$_gb_fp" 2>&1)
+	eq 'the exact fingerprint shown regenerates the key' '0' "$?"
+	if [ "$(cat "$work/etc-kfc/id_ed25519")" = "$_gb_before" ]; then
+		no 'and the key actually changed' 'identical bytes as before'
+	else
+		ok 'and the key actually changed'
+	fi
+	eq 'and the previous key survives as .old' "$_gb_before" "$(cat "$work/etc-kfc/id_ed25519.old" 2>/dev/null)"
+
+	unset GB_ETC_DIR
+}
+
+# t_cli_test_forgets_old_key_on_success -- ticket 25's decision half:
+# id_ed25519.old must disappear once (and only once) a `gitbackup test` run
+# actually proves the CURRENT key works, never before. A real key pair
+# stands in for the remote's own SSH host key here (a different concern
+# from the deploy key this test is regenerating -- GB_TEST_SSH_HOSTKEY is
+# the far end's host identity, key_file is this router's own credential),
+# same fixture shape t_cli_hostkey_show_accept_roundtrip already uses.
+t_cli_test_forgets_old_key_on_success() {
+	GB_ETC_DIR="$work/etc-kfo"; export GB_ETC_DIR
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.key_file=$GB_ETC_DIR/id_ed25519" \
+		'gitbackup.origin.url=git@example.com:o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+
+	cli keygen >/dev/null 2>&1
+	_gb_fp=$(cli keygen --force 2>&1 | sed -n '1s/^confirm-required //p')
+	cli keygen --force --confirm "$_gb_fp" >/dev/null 2>&1
+	if [ -e "$GB_ETC_DIR/id_ed25519.old" ]; then
+		ok 'the .old key exists right after a confirmed regeneration'
+	else
+		no 'the .old key exists right after a confirmed regeneration' 'missing'
+	fi
+
+	_gb_hk_key="$work/kfo-hostkey"
+	rm -f "$_gb_hk_key" "$_gb_hk_key.pub"
+	ssh-keygen -t ed25519 -N '' -f "$_gb_hk_key" >/dev/null
+	GB_TEST_SSH_HOSTKEY="example.com $(cat "$_gb_hk_key.pub")"; export GB_TEST_SSH_HOSTKEY
+	GB_TEST_GIT_RC=0; export GB_TEST_GIT_RC
+
+	out=$(cli hostkey accept "$(cli hostkey show </dev/null 2>&1 | sed -n 's/.*"fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')" </dev/null 2>&1)
+	out=$(cli test </dev/null 2>&1)
+	eq 'test now succeeds' '0' "$?"
+	contains 'and reports success' 'reachable and authenticated' "$out"
+
+	if [ -e "$GB_ETC_DIR/id_ed25519.old" ] || [ -e "$GB_ETC_DIR/id_ed25519.old.pub" ]; then
+		no 'a successful test forgets the .old key' 'still present'
+	else
+		ok 'a successful test forgets the .old key'
+	fi
+
+	unset GB_TEST_SSH_HOSTKEY GB_TEST_GIT_RC GB_ETC_DIR
+}
+
 # gb_listener -- a background TCP listener on 127.0.0.1, on an OS-assigned
 # free port, for `run` tests that need gb_have_net's real connect to
 # succeed with no real git/HTTP protocol behind it. Sets GB_LISTENER_PID
@@ -5161,6 +5317,47 @@ t_rpcd_pubkey_before_and_after_keygen() {
 	unset GB_ETC_DIR
 }
 
+# t_rpcd_keygen_force_requires_confirm -- ticket 25's web path: "force"
+# with no "confirm" (or the wrong one) must come back as a structured
+# refusal the Settings page can act on (confirm_required + fingerprint),
+# never a silent regeneration and never a bare, unparseable error string.
+# Only the fingerprint named back exactly is accepted.
+t_rpcd_keygen_force_requires_confirm() {
+	GB_ETC_DIR="$work/rpcd-etc-kfc"; export GB_ETC_DIR
+	fixture "gitbackup.origin.key_file=$GB_ETC_DIR/id_ed25519"
+
+	rpcd_call keygen >/dev/null
+	_gb_before=$(cat "$GB_ETC_DIR/id_ed25519")
+
+	out=$(rpcd_call keygen '{ "force": true }')
+	assert_json 'keygen (force, no confirm) is valid JSON' "$out"
+	contains 'and reports confirm_required: true' '"confirm_required": true' "$out"
+	eq 'and the key is left untouched' "$_gb_before" "$(cat "$GB_ETC_DIR/id_ed25519")"
+
+	_gb_fp=$(printf '%s' "$out" | sed -n 's/.*"fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	if [ -n "$_gb_fp" ]; then
+		ok 'and carries a non-empty fingerprint to confirm with'
+	else
+		no 'and carries a non-empty fingerprint to confirm with' "$out"
+	fi
+
+	out=$(rpcd_call keygen '{ "force": true, "confirm": "not the right fingerprint" }')
+	assert_json 'keygen (wrong confirm) is valid JSON' "$out"
+	contains 'a mismatched confirmation is refused with a reason' '"reason"' "$out"
+	eq 'and the key is still untouched' "$_gb_before" "$(cat "$GB_ETC_DIR/id_ed25519")"
+
+	out=$(rpcd_call keygen "$(printf '{ "force": true, "confirm": "%s" }' "$_gb_fp")")
+	assert_json 'keygen (exact confirm) is valid JSON' "$out"
+	contains 'the exact fingerprint shown regenerates the key' '"ok": true' "$out"
+	if [ "$(cat "$GB_ETC_DIR/id_ed25519")" = "$_gb_before" ]; then
+		no 'and the key actually changed' 'identical bytes as before'
+	else
+		ok 'and the key actually changed'
+	fi
+
+	unset GB_ETC_DIR
+}
+
 t_rpcd_list_paths() {
 	printf '/etc/config/network\n/etc/config/dhcp\n' >"$work/rpcd-sysupgrade-l"
 	GB_TEST_SYSUPGRADE_L="$work/rpcd-sysupgrade-l"; export GB_TEST_SYSUPGRADE_L
@@ -5719,6 +5916,8 @@ run_test 'visibility.sh: cache is honored for a day and expires after' t_visibil
 run_test 'visibility.sh: generic remote requires acknowledgement' t_visibility_generic_needs_acknowledgement
 run_test 'auth.sh: gb_git_env' t_auth_git_env
 run_test 'auth.sh: gb_keygen' t_auth_keygen
+run_test 'auth.sh: gb_keygen -- force needs a matching confirmation' t_auth_keygen_force_needs_confirm
+run_test 'auth.sh: gb_keygen keeps the previous key as .old until forgotten' t_auth_keygen_keeps_old
 run_test 'auth.sh: gb_pubkey' t_auth_pubkey
 run_test 'auth.sh: gb_accept_hostkey' t_auth_accept_hostkey
 run_test 'auth.sh: gb_accept_hostkey -- EOF is not a decline' t_auth_accept_hostkey_eof
@@ -5772,6 +5971,8 @@ run_test 'cli: hostkey -- show/accept round trip, no stdin' t_cli_hostkey_show_a
 run_test 'cli: test -- accepted host key and working remote' t_cli_test_ok
 run_test 'cli: test -- credentials rejected' t_cli_test_auth_rejected
 run_test 'cli: keygen and pubkey need no remote configuration' t_cli_keygen_pubkey
+run_test 'cli: keygen --force needs --confirm with the exact fingerprint shown' t_cli_keygen_force_confirm
+run_test 'cli: a successful test forgets a kept .old key' t_cli_test_forgets_old_key_on_success
 run_test 'cli: run -- a busy lock is skipped, not an error' t_cli_run_flock_busy
 run_test 'cli: run -- not enough space in /tmp' t_cli_run_space_check_fails
 run_test 'run: integration on a real local bare repository (3 runs)' t_run_integration_bare_repo
@@ -5795,6 +5996,7 @@ run_test 'rpcd: history/diff/list_paths/audit_paths call only $GB_BIN, never git
 run_test 'rpcd: status never leaks the secret, only token_set' t_rpcd_status_hides_secret
 run_test 'rpcd: log wraps the CLI'\''s own text' t_rpcd_log_wraps_cli_text
 run_test 'rpcd: pubkey before and after keygen' t_rpcd_pubkey_before_and_after_keygen
+run_test 'rpcd: keygen force requires a matching confirm' t_rpcd_keygen_force_requires_confirm
 run_test 'rpcd: list_paths' t_rpcd_list_paths
 run_test 'rpcd: list_paths keeps raw sysupgrade.conf separate from the expanded effective set' t_rpcd_list_paths_raw_vs_effective
 run_test 'rpcd: validate_cron -- valid and invalid' t_rpcd_validate_cron
