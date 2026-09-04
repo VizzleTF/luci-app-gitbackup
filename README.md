@@ -1,186 +1,180 @@
-# gitbackup
+# LUCI-APP-GITBACKUP
 
-Automatic configuration backup for OpenWrt routers, pushed straight into a Git repository —
-no clone, no working copy on the router, no separate backup server. Each device gets its own
-branch, its own path prefix, and a manifest that records file modes and ownership as well as
-content, so a restore can put files back exactly as they were, not just with the right bytes.
+[![CI](https://github.com/VizzleTF/luci-app-gitbackup/actions/workflows/ci.yml/badge.svg)](https://github.com/VizzleTF/luci-app-gitbackup/actions/workflows/ci.yml)
 
-Two packages: `gitbackup` (the CLI, the scheduler, the rpcd backend) and `luci-app-gitbackup`
-(the four-tab web UI: Overview, Settings, Paths, History). Either works alone; most people want
-both.
+Your router's configuration, committed to a **private** Git repository on a schedule, and put back
+onto a bare device with one command. The repository is never cloned and no working copy is ever
+written to the router: a run reads the files, builds a tree with git's plumbing, and pushes it.
+OpenWrt **25.12** and newer.
 
-<!-- TODO(screenshot): docs/screenshot-overview.png is not yet captured. Take it from a running
-     router: System -> Git Backup -> Overview, at default width, after a successful run so the
-     status cards are populated. This README references the file below on purpose, before it
-     exists, so the gap is visible instead of silently missing. -->
+Two packages: `gitbackup` — the CLI, the scheduler and the rpcd backend, POSIX shell for busybox
+`ash` — and `luci-app-gitbackup`, four tabs of client-side JS on `luci-base` and nothing else.
+Plus `bootstrap.sh`, which is not a package: it is the line you paste into a router that has just
+been reset.
 
-![Overview tab screenshot — not yet captured, see docs/screenshot-overview.png](docs/screenshot-overview.png)
+<picture>
+  <source media="(max-width: 767px)" srcset="assets/readme/overview-mobile.png">
+  <img src="assets/readme/overview.png" width="100%" alt="The Overview tab: four cards across the top -- Status (enabled, daily in a randomized night window, per device), Last commit with its short hash and date, Last run reporting that a new commit was pushed, and Configuration reporting that the live config has diverged since then, clickable to see the diff. Below them a bordered list of everything that reaches the repository in plain text, and the three buttons: Backup now, Test connection, Download recovery card.">
+</picture>
 
-**Screenshot pending.** The image above will not render until `docs/screenshot-overview.png` is
-added; it has not been faked or replaced with a stock image. See the `TODO(screenshot)` comment
-in this file's own source for what to capture and from where.
+<details>
+<summary>Settings, Paths, History / Restore</summary>
 
-## Does this fit your router?
+<img src="assets/readme/settings.png" width="100%" alt="The Settings tab: General with the enable switch, the device identifier picker, the path prefix, the config-change trigger with its debounce, and the schedule; Remote with the repository URL, the per-device branch, the authentication method, the provider, Test connection, the generated deploy key with Copy and Regenerate, a highlighted warning to tick Allow write access, and a button opening the provider's own deploy-key page; Security with the scrub switch and the list of UCI options blanked before every commit.">
 
-Read this before installing anything. `gitbackup` depends on a real `git` client, not a
-reimplementation, and a full git-over-https stack is not small on an embedded router.
+<img src="assets/readme/paths.png" width="100%" alt="The Paths tab: a field to add an absolute path, the running size of the backup set, the list of paths this router adds itself, a read-only section listing everything sysupgrade already covers on its own, and an audit section listing files changed on this router but not covered by the backup set.">
 
-Measured on a live OpenWrt 25.12.4 stand (`tools/size-report.sh`, one clean install of both
-packages together; see `dist/size-report.json` for the raw numbers this table is built from):
+<img src="assets/readme/history.png" width="100%" alt="The History / Restore tab: one row per backup, newest first, each with the backup's date as its title, the commit hash, the files that changed in it, and its own View diff and Restore buttons.">
 
-| state | installed | packages |
-|---|---|---|
-| clean 25.12.4 image | 21.0 MiB | 137 |
-| + `gitbackup` | 45.7 MiB | 147 |
-| + `gitbackup` + `luci-app-gitbackup` | 45.9 MiB | 148 |
+</details>
 
-An earlier, separate measurement of the same clean image put it at 15.9 MiB — that run used a
-plainer stand than this one, which carries a few extra owlab test fixtures on top of stock
-25.12.4; either baseline is fine to reason from as long as it is not mixed with the other one's
-delta, which is why this table sticks to numbers from a single `size-report.sh` run.
+## Install
 
-`gitbackup` itself is 226 KiB and `luci-app-gitbackup` is 139 KiB (`apk info -s`); essentially
-everything else in that ~25 MiB delta is dependencies pulled in once, on the first install:
-
-- **`git` + `git-http`** — the actual git-over-https stack, pulling in `libopenssl3` (for `git`)
-  and `libcurl4` + `libnghttp2` (for `git-http`, required for `git fetch https://` at all —
-  without it git fails outright with `remote-https is not a git command`). This is the bulk of
-  the delta, roughly 22 MiB on its own.
-- **`openssh-client` + `openssh-keygen`** — about 1.3 MiB. Busybox's own `dbclient` was tried and
-  rejected: it cannot read OpenSSH-format private keys, does not honor `UserKnownHostsFile`, and
-  — measured on a 25.12.4 stand with `GIT_TRACE=1`, dropbear 2025.89, git 2.50.1, see the comment
-  above `gb_git_env` in `auth.sh` — git silently drops `-o StrictHostKeyChecking=yes` (and every
-  other `-o` option) when it falls back to dbclient's `simple` mode. None of that is acceptable
-  for a tool whose whole job is not silently failing open.
-- **`coreutils-stat`** — about 100 KiB. The base image ships no `stat` at all, and the backup
-  manifest (which records file modes and ownership) depends on it.
-
-**This means a device with 16 MB of flash cannot run this package at all**, and shouldn't try —
-there is no partial install that fits. Treat 128 MB of flash as the practical minimum before
-going any further. If your router has less, stop here; see `docs/COMPARISON.md` for lighter
-alternatives and their own trade-offs.
-
-## Quick start
-
-You need a **private** Git repository before you start — see [Security model](#security-model)
-below for why this is not optional.
-
-1. Install both packages (from a feed that carries them, or `apk add --allow-untrusted` a
-   locally built `.apk` during development).
-2. Open **System → Git Backup → Settings**. Set the repository URL
-   (`git@host:owner/repo.git` or `https://host/owner/repo.git`) and choose an auth method:
-   - **SSH deploy key** (recommended): click **Generate deploy key**, then **Add the key to the
-     repository** — this opens the provider's own deploy-key page pre-filled where the provider
-     supports it. Tick "Allow write access" on the provider's side; without it every push fails
-     silently.
-   - **API token**: paste a personal access token. Prefer a token scoped to this one repository
-     over a broad account-wide one — see Security model.
-3. Click **Test connection**. This is also where an unknown SSH host key is shown and accepted,
-   once, with its fingerprint on screen.
-4. Pick a **Schedule** (hourly/daily/weekly presets stagger themselves per device on purpose, so
-   a whole fleet does not hit the provider's API in the same second) or a custom cron expression.
-5. Save. Go to **Overview** and click **Backup now** to confirm the whole path works end to end.
-
-Equivalent from the CLI, if you'd rather not touch the UI at all:
+On OpenWrt 25.12 or newer, subscribe to the feed that carries these packages and install by name:
 
 ```sh
-uci set gitbackup.origin.url='git@github.com:you/routers.git'
-uci commit gitbackup
-gitbackup keygen
-gitbackup pubkey        # paste this into the repo's deploy keys, with write access
-gitbackup test          # accepts the host key, verifies auth and visibility
-gitbackup run           # first backup
+wget -qO- https://repo.owfeed.org/subscribe.sh | sh
+apk add gitbackup luci-app-gitbackup
 ```
 
-Recovering a router later is a separate document — see **[docs/RESTORE.md](docs/RESTORE.md)**.
+`luci-i18n-gitbackup-ru` installs itself alongside on a router that already reads Russian.
 
-## Security model
+Installing the feed's key trusts that feed for every package name, so read `subscribe.sh` before
+running it as root — it is generated from the feed's own layout and cannot document a URL the feed
+does not serve. What proves *these* packages were built here is a second signature, made with this
+repository's own key inside each `.apk`; the feed pins its public half as
+[`keys/luci-app-gitbackup.pub.pem`](https://github.com/owfeed/owfeed-packages/tree/main/keys).
 
-**Read this before you push anything.** This tool has no encryption of any kind. Everything it
-backs up goes into the repository as plain text, exactly as it sits on the router's filesystem,
-except for the specific UCI options `gitbackup` is configured to scrub. Depending on what lives
-in your configuration, that plain text can include:
+Then open **System → Git Backup**.
 
-- `/etc/shadow` (the root password hash)
-- dropbear's private host keys
-- `authorized_keys`
-- WPA pre-shared keys (Wi-Fi passwords)
-- WireGuard private keys
-- PPPoE credentials
-- `uhttpd.key` (the router's own HTTPS private key)
+## Setting it up
 
-**A private repository is not a suggestion — it is the only thing standing between this list and
-the public internet.** `gitbackup` refuses to push to a repository it can confirm is public (an
-anonymous API check runs before every push), but a provider it cannot query at all (a self-hosted
-`generic` remote) is pushed to on trust, with an explicit confirmation checkbox precisely because
-that trust cannot be verified by the tool itself.
+You need a **private** repository before you start. Read [Nothing here is encrypted](#nothing-here-is-encrypted) first — that is not a formality.
 
-Two separate compromise scenarios follow from this, and they are not the same risk:
+1. **Settings** → repository URL (`git@host:owner/repo.git` or `https://host/owner/repo.git`) and
+   an authentication method.
+   - **SSH deploy key** — click *Generate deploy key*, then *Open the repository's deploy-key
+     page*, which goes straight to the right page on GitHub, GitLab, Gitea/Forgejo or Codeberg.
+     **Tick "Allow write access"**: without it the key can read the repository and every push
+     fails silently.
+   - **API token** — paste a token scoped to this one repository.
+2. **Test connection.** This is also where an unknown SSH host key is shown with its fingerprint
+   and accepted once, from the browser, with no ssh session needed.
+3. Pick a **schedule**. The hourly/daily/weekly presets deliberately do not fire at the same
+   wall-clock time on every device: the minute, and for daily and weekly the hour, are derived
+   from the router's own identifier, so a fleet on one preset does not wake up in the same second.
+4. **Overview → Backup now**, and watch the log.
 
-- **Compromise the Git hosting account, and every router in the fleet is compromised.** One
-  leaked provider credential (weak password, phished 2FA-less login, a leaked PAT) hands over
-  root password hashes, host keys and Wi-Fi passwords for the whole fleet in one place. This is
-  a deliberate trade for simplicity — see `docs/COMPARISON.md` for tools built around a different
-  trade-off.
-- **Compromise a single router, and the attacker gets write access to the *entire* fleet's
-  repository.** The deploy key `gitbackup` generates is a repository-wide credential; nothing in
-  Git's own access model scopes an SSH deploy key to "only this device's branch and path." A
-  router that is otherwise a minor target (weak LAN exposure, an unrelated exploit) becomes a way
-  to rewrite or delete every other router's backup history.
+## What it does
 
-**If this repository is ever switched from private to public, the entire history leaks** —
-not just the current state, every value that was ever committed, including passwords rotated
-years ago. Forks made while it was public keep their own copy forever, and services like the
-GitHub Archive Program that mirror public repositories do not un-mirror anything after the fact.
-There is no "undo" for this; treat the private/public toggle as a one-way door.
+- **Never clones.** A run fetches only its own branch's tip metadata (`--depth=1
+  --filter=blob:none`), hashes the files it collected, writes a tree and pushes a commit built
+  with `git commit-tree`. Nothing is checked out, and nothing is written to flash.
+- **One branch per device.** `device/<id>`, with the identifier taken from the hostname, the
+  model plus MAC, or whatever you type. Twenty routers share one repository and never collide.
+- **Records what git does not.** Git stores content and an executable bit. A `manifest.json`
+  beside the files carries the type, mode, owner, group and sha256 of every path, so a restore
+  puts them back as they were rather than merely with the right bytes.
+- **Restores to any backup, from the browser.** Every row on **History / Restore** has its own
+  Restore button, with a diff first, a double confirmation, the list of files that will be
+  overwritten, and a warning when the backup came from a different board.
+- **Refuses to push to a public repository.** Before every push the repository's visibility is
+  checked anonymously against the provider's API — no token needed for the check itself. A
+  repository that answers "public" is refused outright, not warned about.
+- **Widens `sysupgrade` while it is at it.** A path added under **Paths** is written into
+  `/etc/sysupgrade.conf`, the file the router's own `sysupgrade` reads. One list, both jobs.
+- **Puts the recovery instructions where you will look for them.** Every device branch carries a
+  `README.md` with the exact command to bring that router back — GitHub renders it when you open
+  the branch on a phone, which is the situation this tool exists for.
 
-Recommended mitigations, roughly in order of how much they matter:
+## Recovering a router that has been reset
 
-- Keep the repository under an **organization or account dedicated to infrastructure**, not a
-  personal account also used for anything else.
-- Turn on **2FA, unconditionally**, on that account.
-- Provision a **separate deploy key per device** rather than one shared account-wide token —
-  a leaked deploy key from one router can be revoked on its own without touching every other
-  device's credential.
+One line, and the router pulls its own configuration back:
 
-## `/etc/sysupgrade.conf` is a feature, not a side effect
+```sh
+wget -qO- https://raw.githubusercontent.com/VizzleTF/luci-app-gitbackup/main/bootstrap.sh \
+  | sh -s -- --repo https://github.com/you/routers --device r1 --token <token>
+```
 
-Any path added under **Paths** is written directly into `/etc/sysupgrade.conf` — the same file
-the router's own `sysupgrade` reads for `-l`/`-b`/`-r`. This is deliberate: a path added here to
-widen what `gitbackup` backs up **also** automatically widens what a real firmware `sysupgrade`
-preserves across the upgrade, for free, with no second list to keep in sync. A directory added
-here stays a directory in that file too — anything created under it later is covered by both
-tools without editing anything again.
+It installs the package with a real signature check (never `--allow-untrusted`), writes the one
+credential you gave it, restores the newest backup for that device, and tells you what it did.
+`--commit` picks an older one, `--dry-run` performs none of it and prints the plan.
 
-## What restoring does *not* do
+Two other routes exist and are described in **[docs/RESTORE.md](docs/RESTORE.md)** — including the
+one that needs no network at all: download `backup.tar.gz` from the repository's web UI and feed
+it to LuCI's own restore.
 
-Restoring a configuration backup — through any of the three paths in
-[docs/RESTORE.md](docs/RESTORE.md) — puts back configuration files, not installed packages.
-**It does not reinstall the packages that were present when the backup was made.** If the
-device's package feeds or the OpenWrt release itself have moved on since then, a plain
-`apk add <package>` for something the backup's configuration now references can simply fail —
-version or feed mismatches are not something a config restore can paper over. `gitbackup restore
---with-packages` makes a best-effort attempt to reinstall recorded packages, but "best effort"
-is the operative phrase: it is not a guarantee, and a firmware reinstalled from scratch on a
-different release is the case most likely to hit this.
+## Nothing here is encrypted
 
-## Theme compatibility
+Everything this tool backs up reaches the repository as plain text, exactly as it sits on the
+router — except the specific UCI options you tell it to scrub. Depending on your configuration
+that includes `/etc/shadow`, dropbear's private host keys, `authorized_keys`, WPA pre-shared
+keys, WireGuard private keys, PPPoE credentials and `uhttpd.key`.
 
-`luci-app-gitbackup` depends only on `luci-base` — it does not require, import, or read
-private tokens from any specific theme — and is styled to render correctly under any of them,
-footstrap included. This was checked, not assumed: on 2026-09-04, the CSS actually shipped in
-all four views (`overview.js`, `settings.js`, `paths.js`, `history.js`) was run through the
-"Fix my styles" checker at https://vizzletf.github.io/luci-theme-footstrap/#fix (the eleven
-rules on that page — CSS scoped inside the view tree, no `:root`/`*` selectors, only the
-`--*-color-*` export tokens with literal fallbacks, no `prefers-color-scheme`, no
-`window.onload`, container queries instead of viewport media queries, and so on), which
-reported "Nothing flagged — this already follows the rules." A manual grep for the rules that
-checker cannot see from pasted CSS alone (`document.head.appendChild`, `window.onload`,
-`prefers-color-scheme`, stray `!important`) found none in the shipped JS either.
+**A private repository is the only thing between that list and the internet.** Two consequences
+worth stating plainly:
 
-## Further reading
+- Compromise the Git account and you compromise every router in it, at once.
+- Compromise one router and the attacker holds a repository-wide deploy key. Nothing in git's
+  access model scopes a key to "this device's branch only".
+- **Switching the repository from private to public leaks the entire history**, including every
+  value ever committed and rotated since. Forks and public-repository mirrors keep their copies.
+  Treat that toggle as a one-way door.
+
+Use an account dedicated to infrastructure, turn on 2FA, and give each device its own deploy key
+so one can be revoked without touching the rest.
+
+## Measured, not claimed
+
+Numbers, not adjectives. Every one of these was taken from a running system.
+
+**It is not a small package, and the reason is `git`.** Measured with `du -sx /` on a stock
+`openwrt/rootfs:x86_64-25.12.4` image, one package at a time:
+
+| state | flash used | packages |
+|---|---:|---:|
+| stock 25.12.4 | 14.7 MiB | 136 |
+| + `gitbackup` | 42.1 MiB | 146 |
+| + `luci-app-gitbackup` | 42.3 MiB | 147 |
+
+Our own two packages are **282 KiB** and **182 KiB** (`apk info -s`). Everything else in that
+27.6 MiB is a real git client, installed once:
+
+| dependency | installed | why it is not optional |
+|---|---:|---|
+| `git` | 11 MiB | the actual git, not a reimplementation |
+| `libopenssl3` | 6.3 MiB | pulled in by `git` |
+| `git-http` | 5.0 MiB | without it `git fetch https://` fails with `remote-https is not a git command` |
+| `openssh-client` | 898 KiB | busybox's `dbclient` cannot read OpenSSH keys, ignores `UserKnownHostsFile`, and git silently drops `-o StrictHostKeyChecking=yes` when it falls back to it — measured with `GIT_TRACE=1`, see [ADR 0006](docs/adr/0006-openssh-client-over-dbclient.md) |
+| `libcurl4` + `libnghttp2` | 606 KiB | required by `git-http` |
+| `openssh-keygen` | 352 KiB | generates the deploy key |
+| `ca-bundle` | 177 KiB | https to the provider |
+| `coreutils-stat` | 100 KiB | the base image ships no `stat` at all, and the manifest records modes and ownership |
+| `jsonfilter` | 24 KiB | parsing the manifest in shell |
+
+**A device with 16 MB of flash cannot run this**, and there is no partial install that fits.
+Treat 128 MB as the practical floor. [docs/COMPARISON.md](docs/COMPARISON.md) covers what to use
+instead.
+
+**A backup writes nothing to flash.** Every file under `/etc`, `/usr`, `/lib`, `/www` and `/root`
+was hashed before and after a `gitbackup run` on a configured router: **0 of 1056 files changed.**
+The collected copy lives in `/tmp`, and the free space needed for it is checked before the run
+starts.
+
+**What CI holds this to:** 734 shell unit tests, 55 for `bootstrap.sh`, 16 for the History view,
+and 41 cron expressions checked against the *same fixture file* by both the shell validator and
+the JavaScript one, so the two cannot drift apart. Plus `shellcheck` over a file list derived from
+the tree rather than typed by hand, `eslint` with `openwrt/luci`'s own config, a `msgcmp` gate on
+the translations, and a round trip through the buildbot's own `jsmin.c` that compares the token
+stream before and after — because that minifier silently eats the rest of a file after `return
+/re/` and exits 0 while doing it.
+
+
+## Documentation
 
 - **[docs/RESTORE.md](docs/RESTORE.md)** — the three ways to get a router's configuration back,
-  in the order you should actually reach for them.
+  in the order you should reach for them.
 - **[docs/COMPARISON.md](docs/COMPARISON.md)** — an honest comparison with restic, borg and
   etckeeper, including who this tool is the wrong choice for.
+- **[docs/adr/](docs/adr/)** — why the load-bearing decisions are what they are: pushing without
+  a clone, the manifest, the visibility gate, `openssh-client` over dbclient.
