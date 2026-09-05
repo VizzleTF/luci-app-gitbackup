@@ -106,6 +106,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node tests/settings_cron_fixture.test.js
+      # Ticket 29. Without this step the fixture exists and proves nothing:
+      # the shell side is checked by tests/run.sh, but the three view regexes
+      # are only read here.
+      - run: node tests/terminal_markers_fixture.test.js
       - run: node --test tests/history_view.test.mjs
 
   # ------------------------------------------------------------------
