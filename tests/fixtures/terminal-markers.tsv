@@ -1,0 +1,109 @@
+# Shared fixture for gitbackup's three live-log "is this operation over yet"
+# regexes (ticket 29, D11). Unlike cron.tsv (ticket 06/12), there is no
+# shell-side implementation of "is this line terminal" to compare against --
+# only the three JS regexes below decide that. What drifts instead is the
+# TEXT: shell prints a message, JS matches a literal fragment of it, and the
+# two sides used to know that fragment independently (ticket 19 renamed a
+# restore.sh message and the JS regex kept the old text -- the poller never
+# noticed the operation had finished at all).
+#
+# So this file is read two different ways, proving two different things:
+#
+#   - tests/run.sh ("terminal-markers.tsv: <regexvar> lines are real",
+#     schedule-adjacent section) greps the <anchor> column against the
+#     actual shell sources (usr/sbin/gitbackup, usr/share/gitbackup/*.sh) --
+#     proof that every <line> here is not invented, it is what gb_log/
+#     gb_die/printf in the shell actually emit. A subset of rows (see that
+#     test's own comment for which) is additionally driven through the REAL
+#     CLI/functions against a real local bare git repository and the actual
+#     captured output is checked against <line> -- stronger than a grep,
+#     because it proves the message survives quoting/interpolation intact,
+#     not just that the literal fragment appears somewhere in the source
+#     file.
+#   - tests/terminal_markers_fixture.test.js extracts the three RegExp
+#     literals (GB_LOG_TERMINAL_RE from overview.js, GB_TEST_TERMINAL_RE
+#     from settings.js, GB_RESTORE_TERMINAL_RE from history.js) and checks
+#     each <line> against the regexvar it names, asserting .test(line)
+#     equals <terminal>.
+#
+# Neither test alone catches every drift. Together: a shell rename not
+# reflected here fails the grep (or the real-code-path) half; a rename
+# reflected here but not mirrored in the regex fails the JS half. See the
+# ticket 29 report for exactly what each half does and does not prove.
+#
+# Format: tab-separated, four columns, one case per line.
+#   <regexvar>	<terminal>	<line>	<anchor>
+# <regexvar> is one of GB_LOG_TERMINAL_RE / GB_TEST_TERMINAL_RE /
+# GB_RESTORE_TERMINAL_RE -- the exact variable name, because GB_LOG_TERMINAL_RE
+# is shared by Overview's own handleRun AND handleTest (see overview.js's own
+# comment above that regex); it is not "one row per shell subcommand".
+# <terminal> is "yes" or "no". <line> is a plausible real log line (dynamic
+# values like commit ids/branches/urls are realistic placeholders, not the
+# literal shell source). <anchor> is a short fixed substring of <line> that
+# appears byte-for-byte in the shell source that emits it -- i.e. <line>
+# minus the interpolated ($_gb_*) parts. None of the four fields ever
+# contains a literal tab.
+
+# ============================== GB_LOG_TERMINAL_RE ==============================
+# overview.js: Overview's own "Backup now" AND "Test connection" buttons
+# both poll against this one regex.
+
+# -- terminal: yes (one row per alternative in the regex) --
+GB_LOG_TERMINAL_RE	yes	gitbackup run: pushed a1b2c3d to device/rt1	gitbackup run: pushed
+GB_LOG_TERMINAL_RE	yes	gitbackup run: no changes since the last backup on device/rt1	gitbackup run: no changes since the last backup on
+GB_LOG_TERMINAL_RE	yes	gitbackup run: another run already holds the lock, skipped	gitbackup run: another run already holds the lock, skipped
+GB_LOG_TERMINAL_RE	yes	gitbackup run: 127.0.0.1:1 unreachable, skipped	unreachable, skipped
+GB_LOG_TERMINAL_RE	yes	gitbackup run: could not verify whether https://example.org/o/r.git is public, skipped	is public, skipped
+GB_LOG_TERMINAL_RE	yes	gitbackup run: not enough space in /tmp -- need ~1224 KB (backup set ~100 KB x2 + 1024 KB headroom), have 100 KB free; reduce the backup set (e.g. gitbackup.main.archive='0', or trim the sysupgrade path list) or free up /tmp	not enough space in /tmp -- need ~
+GB_LOG_TERMINAL_RE	yes	https://example.org/o/r.git is publicly visible to an anonymous request; push refused	is publicly visible to an anonymous request; push refused
+GB_LOG_TERMINAL_RE	yes	gitbackup test: https://example.org/o/r.git is reachable and authenticated	is reachable and authenticated
+
+# -- terminal: no -- real intermediate lines a run/test prints along the way --
+GB_LOG_TERMINAL_RE	no	gitbackup run: timings -- collect 3s, compare 1s, push 2s	gitbackup run: timings -- collect
+GB_LOG_TERMINAL_RE	no	gitbackup run: scrubbed network.wan.username	gitbackup run: scrubbed
+GB_LOG_TERMINAL_RE	no	gitbackup.origin.provider=generic: visibility cannot be verified automatically, proceeding on the operator's acknowledgement (gitbackup.origin.acknowledged=1)	visibility cannot be verified automatically, proceeding on the operator's acknowledgement
+GB_LOG_TERMINAL_RE	no	https://example.org/o/r.git is visible to an anonymous request (https://api.example.org/repos/o/r -> HTTP 200); push refused	is visible to an anonymous request (
+GB_LOG_TERMINAL_RE	no	gitbackup visibility check: https://api.example.org/repos/o/r unreachable (Connection refused)	gitbackup visibility check:
+
+# ============================== GB_TEST_TERMINAL_RE ==============================
+# settings.js: the Settings screen's own "Test Connection" button. A
+# DIFFERENT regex from GB_LOG_TERMINAL_RE above even though both watch the
+# output of the same `gitbackup test` -- this one also knows the host-key
+# and network/auth branches Overview's own regex does not.
+
+# -- terminal: yes --
+GB_TEST_TERMINAL_RE	yes	gitbackup test: https://example.org/o/r.git is reachable and authenticated	is reachable and authenticated
+GB_TEST_TERMINAL_RE	yes	https://example.org/o/r.git is publicly visible to an anonymous request; push refused	is publicly visible to an anonymous request; push refused
+GB_TEST_TERMINAL_RE	yes	could not verify whether https://example.org/o/r.git is public (network or provider API unreachable); try again once connectivity is confirmed	is public (network or provider API unreachable); try again once connectivity is confirmed
+GB_TEST_TERMINAL_RE	yes	cannot reach example.org: fatal: unable to access 'https://example.org/o/r.git/': Failed to connect to example.org port 443: Connection refused	cannot reach
+GB_TEST_TERMINAL_RE	yes	authentication to https://example.org/o/r.git failed: Permission denied (publickey).	authentication to
+GB_TEST_TERMINAL_RE	yes	example.org:22 host key was not accepted	host key was not accepted
+GB_TEST_TERMINAL_RE	yes	example.org:22 host key needs confirmation before this can proceed -- run 'gitbackup hostkey show' (or use the web UI) to see its fingerprint, then 'gitbackup hostkey accept <fingerprint>' to trust it	host key needs confirmation before this can proceed
+GB_TEST_TERMINAL_RE	yes	example.org:22 host key could not be obtained -- is the network reachable?	host key could not be obtained -- is the network reachable?
+
+# -- terminal: no -- real intermediate/unrelated lines that must not stop this poller --
+GB_TEST_TERMINAL_RE	no	gitbackup.origin.provider=generic: visibility cannot be verified automatically, proceeding on the operator's acknowledgement (gitbackup.origin.acknowledged=1)	visibility cannot be verified automatically, proceeding on the operator's acknowledgement
+GB_TEST_TERMINAL_RE	no	askpass: no readable token at /etc/gitbackup/token (gitbackup.origin.token_file)	askpass: no readable token at
+GB_TEST_TERMINAL_RE	no	gb_accept_hostkey: example.org:22 accepted and recorded in /etc/gitbackup/known_hosts	accepted and recorded in
+
+# ============================== GB_RESTORE_TERMINAL_RE ==============================
+# history.js: the Restore modal's own poller.
+
+# -- terminal: yes --
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: restored rt1 from a1b2c3d4 on device/rt1	gb_restore: restored
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: the following paths were NOT written:	the following paths were NOT written:
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: this backup was taken on a different board (model 'Test Board' vs 'Other Board', target 'testarch/generic' vs 'other/generic') -- interface names and wireless radios from that hardware will not match this one; pass --force to restore anyway	this backup was taken on a different board (
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: sha256 mismatch, refusing to write anything to disk: /etc/config/network	sha256 mismatch, refusing to write anything to disk:
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: device/rt1 does not exist on https://example.org/o/r.git yet -- nothing to restore	yet -- nothing to restore
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: commit deadbeef was not found on device/rt1 at https://example.org/o/r.git	gb_restore: commit
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: could not read devices/rt1 from deadbeef on device/rt1: fatal: unable to access 'https://example.org/o/r.git/'	gb_restore: could not read
+GB_RESTORE_TERMINAL_RE	yes	gb_fetch_meta: git fetch https://example.org/o/r.git device/rt1 failed: fatal: could not read Username for 'https://example.org'	gb_fetch_meta: git fetch
+GB_RESTORE_TERMINAL_RE	yes	gb_restore: cannot create a work directory under /tmp	gb_restore: cannot create a work directory under /tmp
+GB_RESTORE_TERMINAL_RE	yes	gitbackup.origin.url: empty, a repository url is required	gitbackup.origin.url: empty, a repository url is required
+
+# -- terminal: no -- real intermediate/near-miss lines from the same module --
+GB_RESTORE_TERMINAL_RE	no	gb_restore: declined by the operator	gb_restore: declined by the operator
+GB_RESTORE_TERMINAL_RE	no	gb_restore: board mismatch (model 'Test Board' -> 'Other Board', target 'testarch/generic' -> 'other/generic'), proceeding: --force	board mismatch (model
+GB_RESTORE_TERMINAL_RE	no	gb_restore: no meta/board.json in this backup, skipping the board check	no meta/board.json in this backup, skipping the board check
+GB_RESTORE_TERMINAL_RE	no	gb_restore: this backup was taken on OpenWrt 21.02.3, this router runs 25.12.4 -- config options from a different major release may not apply cleanly	this backup was taken on OpenWrt
+GB_RESTORE_TERMINAL_RE	no	gb_restore: device is required	gb_restore: device is required

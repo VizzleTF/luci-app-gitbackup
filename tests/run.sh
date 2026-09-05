@@ -1076,10 +1076,23 @@ t_have_net_no_leaked_watchdog() {
 			skip 'gb_have_net leaves no orphaned watchdog process behind' 'pgrep not found on PATH'
 			return 0
 		fi
+		# The pids of any "sleep 5" ALREADY running before this test, so a
+		# foreign one is not read as ours. `pgrep -f '^sleep 5$'` is
+		# host-global, and a leaked watchdog is orphaned by definition --
+		# reparented, so its parentage cannot identify it either. This test
+		# failed once on a developer machine because an unrelated process
+		# elsewhere on the host was sitting in `until ...; do sleep 5; done`;
+		# the leak this guards against is a NEW pid appearing across the
+		# call, which is what is compared here.
+		_hn_before=$(pgrep -f '^sleep 5$' 2>/dev/null | sort)
 		gb_have_net 127.0.0.1 1
 		sleep 0.3
-		if pgrep -f '^sleep 5$' >/dev/null 2>&1; then
-			no 'gb_have_net leaves no orphaned watchdog process behind' 'found a leftover "sleep 5" process'
+		_hn_after=$(pgrep -f '^sleep 5$' 2>/dev/null | sort)
+		_hn_new=$(printf '%s\n' "$_hn_after" | grep -vxF -e "$_hn_before" 2>/dev/null || true)
+		[ -n "$_hn_before" ] || _hn_new="$_hn_after"
+		if [ -n "$_hn_new" ]; then
+			no 'gb_have_net leaves no orphaned watchdog process behind' \
+				"found a leftover \"sleep 5\" process ($(printf '%s' "$_hn_new" | tr '\n' ' '))"
 		else
 			ok 'gb_have_net leaves no orphaned watchdog process behind'
 		fi
@@ -6167,6 +6180,361 @@ t_no_bashisms() {
 }
 
 # --------------------------------------------------------------------------
+# terminal marker fixture (ticket 29, D11)
+#
+# tests/fixtures/terminal-markers.tsv is the shared source of truth for the
+# three "is this operation over" regexes the LuCI views poll the live log
+# with (overview.js's GB_LOG_TERMINAL_RE, settings.js's GB_TEST_TERMINAL_RE,
+# history.js's GB_RESTORE_TERMINAL_RE). tests/terminal_markers_fixture.
+# test.js reads the same file and proves the three regexes classify every
+# row the way the fixture says to; what belongs here, on the shell side, is
+# proving the fixture's own <line> text is not invented -- ticket 19's own
+# failure mode was a shell message renamed with the JS regex left on the old
+# text, and nothing caught it because neither side ever compared notes.
+#
+# Two different strengths of proof, both against the SAME fixture file:
+#
+#   - t_terminal_markers_fixture_anchors_are_real (below) walks every row
+#     and greps its <anchor> column -- literal text taken from <line> with
+#     the interpolated ($_gb_*) parts removed -- against the actual shell
+#     sources. Catches a straight rename or typo in the source; does NOT
+#     catch a rename applied to <anchor> at the same time without also
+#     fixing the regex (that is the JS test's job) and does not prove the
+#     message is reachable at runtime with exactly this wording, only that
+#     the fragment exists somewhere in the source text.
+#   - The handful of t_terminal_markers_driven_* tests that follow drive
+#     the real CLI/gb_restore against a real flock, a real unreachable
+#     port, or a real local bare git repository (same convention gitio.sh/
+#     restore.sh's own tests already use) and grep the ACTUAL captured
+#     logger() output -- the exact channel `gitbackup log`/logread hands
+#     the LuCI poller -- for the fixture's own line. Stronger: proves the
+#     message survives quoting and variable interpolation intact, not just
+#     that a fragment of it sits in the source file. Only a representative
+#     subset of the fixture's branches are driven this way (the ones with
+#     existing integration harnesses this file already keeps working) --
+#     see each test's own comment for which, and the ticket 29 report for
+#     the honest accounting of what is and is not covered by real code.
+
+t_terminal_markers_fixture_anchors_are_real() {
+	(
+		_tm_fixtures="$root/tests/fixtures/terminal-markers.tsv"
+		if [ ! -r "$_tm_fixtures" ]; then
+			no 'tests/fixtures/terminal-markers.tsv is readable' "missing: $_tm_fixtures"
+			return
+		fi
+		_tm_tab=$(printf '\t')
+		_tm_n=0
+		while IFS="$_tm_tab" read -r _tm_var _tm_terminal _tm_line _tm_anchor; do
+			case "$_tm_var" in ''|'#'*) continue ;; esac
+			_tm_n=$((_tm_n + 1))
+			if grep -qF -- "$_tm_anchor" \
+				"$files/usr/sbin/gitbackup" \
+				"$share/visibility.sh" \
+				"$share/auth.sh" \
+				"$share/askpass.sh" \
+				"$share/restore.sh" \
+				"$share/gitio.sh" 2>/dev/null
+			then
+				ok "terminal-markers.tsv: [$_tm_var/$_tm_terminal] \"$_tm_line\" is real shell text"
+			else
+				no "terminal-markers.tsv: [$_tm_var/$_tm_terminal] \"$_tm_line\" is real shell text" \
+					"anchor [$_tm_anchor] not found in any shell source -- fixture text may be stale (ticket 19's own failure mode)"
+			fi
+		done <"$_tm_fixtures"
+		if [ "$_tm_n" -eq 0 ]; then
+			no 'the fixture file actually contains cases' 'read zero rows -- the loop or the file is broken'
+		fi
+	)
+}
+
+# t_terminal_markers_driven_run -- GB_LOG_TERMINAL_RE's own "skipped"
+# branches, driven through the real `cli run` dispatch (flock, then the
+# network precheck, then the space check -- steps 1/3/5 of cmd_run), with
+# the raw logger() text captured via GB_TEST_LOG and checked against the
+# exact fixture lines, not just their stdout summaries (t_cli_run_flock_busy/
+# t_cli_run_space_check_fails above already cover the stdout side).
+t_terminal_markers_driven_run() {
+	GB_TEST_LOG="$work/tm-run-lock.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git'
+	GB_TEST_FLOCK_LOCKED=1; export GB_TEST_FLOCK_LOCKED
+	cli run >/dev/null 2>&1
+	contains 'run: a busy lock logs the exact GB_LOG_TERMINAL_RE fixture line' \
+		'gitbackup run: another run already holds the lock, skipped' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_FLOCK_LOCKED GB_TEST_LOG
+
+	GB_TEST_LOG="$work/tm-run-unreachable.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://127.0.0.1:1/o/r.git'
+	cli run >/dev/null 2>&1
+	contains 'run: an unreachable remote logs a line matching the GB_LOG_TERMINAL_RE fixture shape' \
+		'unreachable, skipped' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_LOG
+
+	gb_listener
+	_tm_pid="$GB_LISTENER_PID"
+	if [ -z "$_tm_pid" ]; then
+		skip 'run: not enough space in /tmp logs a line matching the GB_LOG_TERMINAL_RE fixture shape' \
+			'python3 not found on PATH -- gb_listener needs it for a real listening socket'
+		return 0
+	fi
+	GB_TEST_LOG="$work/tm-run-space.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=https://127.0.0.1:$GB_LISTENER_PORT/o/r.git" \
+		'gitbackup.origin.acknowledged=1'
+	GB_TEST_DF_KB=100; export GB_TEST_DF_KB
+	cli run >/dev/null 2>&1
+	contains 'run: not enough space in /tmp logs a line matching the GB_LOG_TERMINAL_RE fixture shape' \
+		'not enough space in /tmp -- need ~' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_DF_KB GB_TEST_LOG
+	kill "$_tm_pid" 2>/dev/null
+	wait "$_tm_pid" 2>/dev/null
+}
+
+# t_terminal_markers_driven_run_success -- the "pushed"/"no changes" pair,
+# driven against a real local bare git repository, same mechanism
+# t_run_integration_bare_repo above already relies on. Captures the ACTUAL
+# commit sha `run` just pushed and checks the logged line against it
+# verbatim, not just a substring -- proof the fixture's own
+# 'pushed [0-9a-f]+ to ' shape is not aspirational.
+t_terminal_markers_driven_run_success() {
+	gb_listener
+	_tm_pid="$GB_LISTENER_PID"
+	if [ -z "$_tm_pid" ]; then
+		skip 'run: pushed/no-changes log the exact GB_LOG_TERMINAL_RE fixture lines' \
+			'python3 not found on PATH -- gb_listener needs it for a real listening socket'
+		return 0
+	fi
+
+	collect_fixture
+	GB_DEVICE=rt1
+	mkdir -p "$work/froot/etc/config"
+	printf 'config interface lan\n\toption proto static\n' >"$work/froot/etc/config/network"
+	sysupgrade_list '/etc/config/network'
+	printf "DISTRIB_RELEASE='25.12.4'\nDISTRIB_REVISION='r1'\n" >"$work/froot/etc/openwrt_release"
+
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+	_tm_bare="$work/tm-run-success-bare.git"
+	rm -rf "$_tm_bare"
+	git init --bare -q "$_tm_bare"
+	GB_TEST_GIT_REMOTE_URL="https://127.0.0.1:$GB_LISTENER_PORT/o/r.git"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_tm_bare"; export GB_TEST_GIT_REMOTE_PATH
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL" \
+		'gitbackup.origin.acknowledged=1'
+
+	GB_TEST_LOG="$work/tm-run-pushed.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	cli run >/dev/null 2>&1
+	_tm_commit=$(git --git-dir="$_tm_bare" log -1 --format=%H device/rt1 2>/dev/null)
+	if [ -n "$_tm_commit" ]; then
+		contains 'run: a real push logs the exact GB_LOG_TERMINAL_RE "pushed" fixture line' \
+			"gitbackup run: pushed $_tm_commit to device/rt1" "$(cat "$GB_TEST_LOG")"
+	else
+		no 'run: a real push logs the exact GB_LOG_TERMINAL_RE "pushed" fixture line' \
+			'run 1 produced no commit on device/rt1 at all'
+	fi
+
+	GB_TEST_LOG="$work/tm-run-nochange.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	cli run >/dev/null 2>&1
+	contains 'run: an idempotent second run logs the exact GB_LOG_TERMINAL_RE "no changes" fixture line' \
+		'gitbackup run: no changes since the last backup on device/rt1' "$(cat "$GB_TEST_LOG")"
+
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_LOG
+	kill "$_tm_pid" 2>/dev/null
+	wait "$_tm_pid" 2>/dev/null
+}
+
+# t_terminal_markers_driven_test -- GB_TEST_TERMINAL_RE's own success/
+# network/auth branches, driven through the real `cli test` dispatch. https
+# only (no ssh host key step involved) -- the host key trio below is its
+# own, separate ssh-only test.
+t_terminal_markers_driven_test() {
+	GB_TEST_LOG="$work/tm-test-ok.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=https://example.org/o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+	GB_TEST_GIT_RC=0; export GB_TEST_GIT_RC
+	cli test >/dev/null 2>&1
+	contains 'test: success logs the exact GB_TEST_TERMINAL_RE fixture line' \
+		'gitbackup test: https://example.org/o/r.git is reachable and authenticated' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_GIT_RC GB_TEST_LOG
+
+	GB_TEST_LOG="$work/tm-test-network.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	GB_TEST_GIT_RC=128; export GB_TEST_GIT_RC
+	GB_TEST_GIT_ERR="Failed to connect to example.org port 443: Connection refused"; export GB_TEST_GIT_ERR
+	cli test >/dev/null 2>&1
+	contains 'test: an unreachable remote logs the exact GB_TEST_TERMINAL_RE "cannot reach" fixture line' \
+		"cannot reach example.org: Failed to connect to example.org port 443: Connection refused" "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_GIT_RC GB_TEST_GIT_ERR GB_TEST_LOG
+
+	GB_TEST_LOG="$work/tm-test-auth.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	GB_TEST_GIT_RC=128; export GB_TEST_GIT_RC
+	GB_TEST_GIT_ERR='Permission denied (publickey).'; export GB_TEST_GIT_ERR
+	cli test >/dev/null 2>&1
+	contains 'test: rejected credentials log the exact GB_TEST_TERMINAL_RE "authentication" fixture line' \
+		'authentication to https://example.org/o/r.git failed: Permission denied (publickey).' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_GIT_RC GB_TEST_GIT_ERR GB_TEST_LOG
+}
+
+# t_terminal_markers_driven_test_hostkey -- GB_TEST_TERMINAL_RE's own
+# host-key trio, ssh-only (cmd_test's host key step never runs for https).
+# Same three shapes t_cli_test_hostkey_declined/needs_confirmation/
+# unreachable above already prove at the stdout/exit-code level; this adds
+# the GB_TEST_LOG check against the fixture's own exact text.
+t_terminal_markers_driven_test_hostkey() {
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		'gitbackup.origin.url=git@example.org:o/r.git' \
+		'gitbackup.origin.provider=generic' 'gitbackup.origin.acknowledged=1'
+
+	GB_TEST_LOG="$work/tm-test-hk-declined.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	GB_TEST_SSH_HOSTKEY='example.org ssh-ed25519 AAAAtestkey'; export GB_TEST_SSH_HOSTKEY
+	printf 'n\n' | cli test >/dev/null 2>&1
+	contains 'test: a declined host key logs the exact GB_TEST_TERMINAL_RE fixture line' \
+		'example.org:22 host key was not accepted' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_SSH_HOSTKEY GB_TEST_LOG
+
+	GB_TEST_LOG="$work/tm-test-hk-noask.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	GB_TEST_SSH_HOSTKEY='example.org ssh-ed25519 AAAAtestkey'; export GB_TEST_SSH_HOSTKEY
+	cli test </dev/null >/dev/null 2>&1
+	contains 'test: no stdin to confirm a host key logs the exact GB_TEST_TERMINAL_RE fixture line' \
+		"example.org:22 host key needs confirmation before this can proceed -- run 'gitbackup hostkey show'" \
+		"$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_SSH_HOSTKEY GB_TEST_LOG
+
+	GB_TEST_LOG="$work/tm-test-hk-unreachable.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+	unset GB_TEST_SSH_HOSTKEY
+	cli test </dev/null >/dev/null 2>&1
+	contains 'test: an unreachable host key logs the exact GB_TEST_TERMINAL_RE fixture line' \
+		'example.org:22 host key could not be obtained -- is the network reachable?' "$(cat "$GB_TEST_LOG")"
+	unset GB_TEST_LOG
+}
+
+# t_terminal_markers_driven_restore_success -- GB_RESTORE_TERMINAL_RE's own
+# success line, driven against a real local bare git repository, same
+# restore_setup/restore_seed_push harness t_restore_* above already uses.
+t_terminal_markers_driven_restore_success() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		GB_TEST_LOG="$work/tm-restore-success.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_tm_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_tm_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_tm_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_tm_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'gb_restore exits 0' '0' "$?"
+		_tm_commit=$(git -C "$work/restore-seed" log -1 --format=%H 2>/dev/null)
+		if [ -n "$_tm_commit" ]; then
+			contains 'restore: success logs the exact GB_RESTORE_TERMINAL_RE fixture line' \
+				"gb_restore: restored rt1 from $_tm_commit on device/rt1" "$(cat "$GB_TEST_LOG")"
+		else
+			no 'restore: success logs the exact GB_RESTORE_TERMINAL_RE fixture line' \
+				'could not read back the seed commit sha'
+		fi
+
+		restore_teardown
+	)
+}
+
+# t_terminal_markers_driven_restore_failures -- the sha-mismatch and
+# board-mismatch refusals, same restore_setup fixtures t_restore_sha_
+# mismatch_stops_before_write/t_restore_board_mismatch above already build,
+# with GB_TEST_LOG added to check the exact fixture text.
+t_terminal_markers_driven_restore_failures() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		GB_TEST_LOG="$work/tm-restore-sha.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_tm_entries=$(restore_entry_file /etc/config/network 640 0 0 \
+			'deadbeef0000000000000000000000000000000000000000000000000000')
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_tm_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		gb_restore rt1 '' --yes >/dev/null 2>&1
+		contains 'restore: a sha256 mismatch logs a line matching the GB_RESTORE_TERMINAL_RE fixture shape' \
+			'gb_restore: sha256 mismatch, refusing to write anything to disk:' "$(cat "$GB_TEST_LOG")"
+
+		restore_teardown
+	)
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		GB_TEST_BOARD='{"model":"Other Board","release":{"target":"otherarch/generic"}}'
+		export GB_TEST_BOARD
+		GB_TEST_LOG="$work/tm-restore-board.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_tm_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_tm_entries=$(restore_entry_file /etc/config/network 640 0 0 "$_tm_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_tm_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		gb_restore rt1 '' --yes >/dev/null 2>&1
+		contains 'restore: a board mismatch logs a line matching the GB_RESTORE_TERMINAL_RE fixture shape' \
+			"this backup was taken on a different board (" "$(cat "$GB_TEST_LOG")"
+
+		restore_teardown
+	)
+}
+
+# t_terminal_markers_driven_restore_write_failure -- the "NOT written"
+# branch, same cp-stub trick t_restore_write_failure_does_not_block_perms
+# above already uses to make one path's write fail on purpose.
+t_terminal_markers_driven_restore_write_failure() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+		GB_TEST_LOG="$work/tm-restore-notwritten.log"; export GB_TEST_LOG; : >"$GB_TEST_LOG"
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc"
+		printf '127.0.0.1 localhost\n' >"$work/restore-seed/devices/rt1/files/etc/hosts"
+		_tm_sha_hosts=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/hosts" | awk '{print $1}')
+		_tm_uid=$(id -u)
+		_tm_gid=$(id -g)
+		_tm_entries=$(restore_entry_file /etc/hosts 644 "$_tm_uid" "$_tm_gid" "$_tm_sha_hosts")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_tm_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		mkdir -p "$work/restore-dest/etc"
+		printf "stale hosts file, e.g. Docker's own bind mount\\n" >"$work/restore-dest/etc/hosts"
+		chmod 644 "$work/restore-dest/etc/hosts"
+
+		mkdir -p "$work/tm-cp-hosts-stuck"
+		cat >"$work/tm-cp-hosts-stuck/cp" <<'STUB'
+#!/bin/sh
+for a in "$@"; do dest="$a"; done
+case "$dest" in
+	*etc/hosts) echo "cp: can't create '$dest': File exists" >&2; exit 1 ;;
+esac
+args=""
+for a in "$@"; do
+	case "$a" in
+		-*) ;;
+		*) args="$args $a" ;;
+	esac
+done
+# shellcheck disable=SC2086
+command -p cp $args
+STUB
+		chmod +x "$work/tm-cp-hosts-stuck/cp"
+
+		PATH="$work/tm-cp-hosts-stuck:$PATH" gb_restore rt1 '' --yes >/dev/null 2>&1
+		contains 'restore: a write failure logs the exact GB_RESTORE_TERMINAL_RE fixture line' \
+			'gb_restore: the following paths were NOT written:' "$(cat "$GB_TEST_LOG")"
+
+		restore_teardown
+	)
+}
+
+# --------------------------------------------------------------------------
 
 run_test 'lib.sh: gb_json_esc' t_json_esc
 run_test 'lib.sh: gb_manifest_field' t_manifest_field
@@ -6328,6 +6696,14 @@ run_test 'packaging: owfeed.yml matches Makefile' t_owfeed_yml_matches_makefile
 run_test 'packaging: owfeed.yml luci-app-gitbackup block matches its Makefile' t_owfeed_yml_matches_luci_makefile
 run_test 'packaging: no bashisms' t_no_bashisms
 run_test 'packaging: no untracked files under package/gitbackup/files (D02)' t_no_untracked_files_in_package_tree
+run_test 'terminal-markers.tsv: every anchor is real shell text' t_terminal_markers_fixture_anchors_are_real
+run_test 'terminal-markers.tsv: run -- lock/unreachable/space log the exact GB_LOG_TERMINAL_RE lines' t_terminal_markers_driven_run
+run_test 'terminal-markers.tsv: run -- pushed/no-changes log the exact GB_LOG_TERMINAL_RE lines' t_terminal_markers_driven_run_success
+run_test 'terminal-markers.tsv: test -- ok/network/auth log the exact GB_TEST_TERMINAL_RE lines' t_terminal_markers_driven_test
+run_test 'terminal-markers.tsv: test -- host key trio logs the exact GB_TEST_TERMINAL_RE lines' t_terminal_markers_driven_test_hostkey
+run_test 'terminal-markers.tsv: restore -- success logs the exact GB_RESTORE_TERMINAL_RE line' t_terminal_markers_driven_restore_success
+run_test 'terminal-markers.tsv: restore -- sha/board mismatch log the exact GB_RESTORE_TERMINAL_RE lines' t_terminal_markers_driven_restore_failures
+run_test 'terminal-markers.tsv: restore -- write failure logs the exact GB_RESTORE_TERMINAL_RE line' t_terminal_markers_driven_restore_write_failure
 
 passed=$(grep -c '^PASS$' "$results")
 failed=$(grep -c '^FAIL$' "$results")
