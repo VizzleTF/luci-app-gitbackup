@@ -32,3 +32,24 @@ project accepts this and documents it loudly (README Security model, an always-v
 "what leaves in the open" block in the Overview) rather than mitigating it technically. Users
 are pushed toward operational mitigations (separate org, mandatory 2FA, deploy key instead of
 an account-wide PAT), none of which are enforced by the tool itself.
+
+## Revisited, 2026-09-05
+
+The question was reopened and researched in full:
+[docs/research/encrypted-backups.md](../research/encrypted-backups.md). Two things changed
+since this decision was first written, and one did not.
+
+Changed: the tool cost is small (`openssl-util` is +939 KiB on top of the `libopenssl3` that
+`git` already installs), and deterministic — convergent — encryption with an IV derived from
+the plaintext's own sha256 keeps an unchanged file's blob identical, so change detection and
+repository growth are not the obstacles this ADR assumed. "A router has no secure place to
+hold a key" is also weaker than stated: `/etc/gitbackup/` is 0700 and already a hard exclude
+from the backup set, which is where the deploy key lives today.
+
+Unchanged, and still decisive: a git credential that is lost can be regenerated; a decryption
+key for backups already pushed cannot. The one artefact this project built for recovering a
+router from nothing — the recovery card — has a deliberate, tested invariant against carrying
+a secret, and no other place survives a total device loss. The research recommends keeping
+this decision, and names the single call that would reverse it: accepting "no externally
+stored key means permanent data loss" as a consequence documented as loudly as the
+public-repository one above.
