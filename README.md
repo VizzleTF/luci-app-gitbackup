@@ -126,6 +126,7 @@ Use an account dedicated to infrastructure, turn on 2FA, and give each device it
 | The shell and JavaScript cron validators agree | both run against `tests/fixtures/cron.tsv`, 41 cases, in CI |
 | The minifier does not corrupt the views | the token stream of each view is compared before and after the buildbot's own `jsmin.c` |
 | The packages install and work on a real router | CI installs the built `.apk` on an OpenWrt 25.12.4 container and drives it |
+| The styles work under any LuCI theme | the shipped CSS of all six view files, checked against the footstrap devkit's eleven rules: nothing flagged |
 
 Test suites: 734 shell unit tests, 55 for `bootstrap.sh`, 16 for the History view.
 
