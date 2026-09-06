@@ -532,26 +532,26 @@ function gbBuildDeployKeyBody(view) {
 			'id': 'gitbackup-pubkey-text',
 			'rows': '3',
 			'readonly': 'readonly'
-		}, pubkey));
+		}, [ pubkey ]));
 		wrap.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
 			E('button', {
 				'class': 'cbi-button cbi-button-neutral',
 				'click': ui.createHandlerFn(view, 'handleCopyPubkey')
-			}, _('Copy')),
+			}, [ _('Copy') ]),
 			E('button', {
 				'class': 'cbi-button cbi-button-neutral',
 				'id': 'gitbackup-btn-regenerate',
 				'click': ui.createHandlerFn(view, 'handleGenerateKey', true)
-			}, _('Regenerate key')),
-			E('span', { 'class': 'gitbackup-copy-status', 'id': 'gitbackup-copy-status' }, '')
+			}, [ _('Regenerate key') ]),
+			E('span', { 'class': 'gitbackup-copy-status', 'id': 'gitbackup-copy-status' }, [ '' ])
 		]));
 	} else {
-		wrap.appendChild(E('p', {}, _('No deploy key has been generated on this router yet.')));
+		wrap.appendChild(E('p', {}, [ _('No deploy key has been generated on this router yet.') ]));
 		wrap.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
 			E('button', {
 				'class': 'cbi-button cbi-button-action',
 				'click': ui.createHandlerFn(view, 'handleGenerateKey', false)
-			}, _('Generate deploy key'))
+			}, [ _('Generate deploy key') ])
 		]));
 	}
 
@@ -667,7 +667,7 @@ return view.extend({
 		o.renderWidget = function(section_id, option_index, cfgvalue) {
 			var node = form.Value.prototype.renderWidget.apply(this, arguments);
 			var input = node.querySelector('input');
-			var hint = E('div', { 'class': 'gitbackup-hint', 'id': 'gitbackup-cron-hint' }, '');
+			var hint = E('div', { 'class': 'gitbackup-hint', 'id': 'gitbackup-cron-hint' }, [ '' ]);
 			var self2 = this;
 			var timer = null;
 
@@ -783,7 +783,7 @@ return view.extend({
 						'class': 'cbi-button cbi-button-neutral',
 						'id': 'gitbackup-btn-test',
 						'click': ui.createHandlerFn(self, 'handleTestConnection')
-					}, _('Test connection'))
+					}, [ _('Test connection') ])
 				]),
 				E('div', { 'id': 'gitbackup-test-result', 'class': 'gitbackup-test-result' }),
 				// Ticket 20 -- the web-only host key accept flow. Hidden
@@ -794,7 +794,7 @@ return view.extend({
 				// this rpcd-backed view at all (gbrpc_test's stdin is
 				// `</dev/null` by construction).
 				E('div', { 'id': 'gitbackup-hostkey-prompt', 'class': 'gitbackup-box', 'hidden': true }),
-				E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-test-log', 'hidden': true }, '')
+				E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-test-log', 'hidden': true }, [ '' ])
 			]);
 			return wrap;
 		};
@@ -857,7 +857,7 @@ return view.extend({
 			var info = gbDeeplinkInfo(url, provider);
 			var wrap = E('div', { 'id': 'gitbackup-deploylink-body', 'class': 'gitbackup-box' }, [
 				E('p', { 'class': 'gitbackup-warn-text' },
-					_('Before saving the key on the provider, tick "Allow write access" (or the equivalent) -- without it the key can read the repository but every push fails silently.'))
+					[ _('Before saving the key on the provider, tick "Allow write access" (or the equivalent) -- without it the key can read the repository but every push fails silently.') ])
 			]);
 
 			if (info.kind === 'link') {
@@ -867,11 +867,11 @@ return view.extend({
 						'target': '_blank',
 						'rel': 'noopener noreferrer',
 						'class': 'cbi-button cbi-button-action'
-					}, _('Open the repository’s deploy-key page'))
+					}, [ _('Open the repository’s deploy-key page') ])
 				]));
 			} else {
 				wrap.appendChild(E('p', { 'class': 'gitbackup-hint' },
-					_('Enter a valid repository URL above to get a direct link to the provider’s deploy-key page.')));
+					[ _('Enter a valid repository URL above to get a direct link to the provider’s deploy-key page.') ]));
 			}
 
 			return wrap;
@@ -908,9 +908,9 @@ return view.extend({
 
 			return E('div', { 'id': 'gitbackup-deploygeneric-body', 'class': 'gitbackup-box' }, [
 				E('p', {},
-					_('This provider has no API to link to a settings page. On %s, append the public key above to the "git" user’s ~/.ssh/authorized_keys, ideally prefixed with restrict,command="git-shell" so the key can only run git operations, e.g.:').format(host)),
+					[ _('This provider has no API to link to a settings page. On %s, append the public key above to the "git" user’s ~/.ssh/authorized_keys, ideally prefixed with restrict,command="git-shell" so the key can only run git operations, e.g.:').format(host) ]),
 				E('pre', { 'class': 'gitbackup-log' },
-					'restrict,command="git-shell" ' + pubkeyText)
+					[ 'restrict,command="git-shell" ' + pubkeyText ])
 			]);
 		};
 
@@ -967,7 +967,7 @@ return view.extend({
 		o.depends('visibility', 'private');
 		o.renderWidget = function() {
 			return E('div', { 'class': 'gitbackup-box' }, [
-				E('p', {}, _('The remote is expected to be private. Before every push, this is checked anonymously against the provider’s API (no token needed for the check itself) -- if the repository turns out to be publicly visible, the push is refused outright and a red banner appears on the Overview tab. Config scrubbing stays off unless something else requires it.'))
+				E('p', {}, [ _('The remote is expected to be private. Before every push, this is checked anonymously against the provider’s API (no token needed for the check itself) -- if the repository turns out to be publicly visible, the push is refused outright and a red banner appears on the Overview tab. Config scrubbing stays off unless something else requires it.') ])
 			]);
 		};
 
@@ -977,12 +977,12 @@ return view.extend({
 		o.depends('visibility', 'public');
 		o.renderWidget = function() {
 			return E('div', { 'class': 'gitbackup-box' }, [
-				E('p', { 'class': 'gitbackup-warn-text' }, _('Anyone with the URL will be able to read every backup ever pushed.')),
-				E('p', {}, _('Saving this forces config scrubbing on (Security section below): the following are stripped from every config file before it is committed --')),
+				E('p', { 'class': 'gitbackup-warn-text' }, [ _('Anyone with the URL will be able to read every backup ever pushed.') ]),
+				E('p', {}, [ _('Saving this forces config scrubbing on (Security section below): the following are stripped from every config file before it is committed --') ]),
 				E('ul', { 'class': 'gitbackup-leak-list' }, [
-					E('li', {}, _('every value listed under "Scrub these UCI options" below (Wi-Fi pre-shared keys by default)'))
+					E('li', {}, [ _('every value listed under "Scrub these UCI options" below (Wi-Fi pre-shared keys by default)') ])
 				]),
-				E('p', {}, _('Restoring from a public branch will therefore be incomplete: scrubbed values are gone from the backup entirely and have to be re-entered by hand after a restore, the same way a factory-reset router would need them re-entered.'))
+				E('p', {}, [ _('Restoring from a public branch will therefore be incomplete: scrubbed values are gone from the backup entirely and have to be re-entered by hand after a restore, the same way a factory-reset router would need them re-entered.') ])
 			]);
 		};
 
@@ -1005,15 +1005,15 @@ return view.extend({
 			var node = form.Flag.prototype.renderWidget.apply(this, arguments);
 			var wrap = E('div', { 'class': 'gitbackup-box' }, [
 				E('p', { 'class': 'gitbackup-box-title' },
-					_('This provider’s visibility cannot be checked automatically (spec: "generic — проверить нельзя ни при каких условиях"). If this repository is actually public, everything below is exposed in plain text to anyone who can read it:')),
+					[ _('This provider’s visibility cannot be checked automatically (spec: "generic — проверить нельзя ни при каких условиях"). If this repository is actually public, everything below is exposed in plain text to anyone who can read it:') ]),
 				E('ul', { 'class': 'gitbackup-leak-list' }, [
-					E('li', {}, '/etc/shadow'),
-					E('li', {}, _('dropbear private host keys')),
-					E('li', {}, 'authorized_keys'),
-					E('li', {}, _('WPA pre-shared keys (Wi-Fi passwords)')),
-					E('li', {}, _('WireGuard private keys')),
-					E('li', {}, _('PPPoE credentials')),
-					E('li', {}, 'uhttpd.key')
+					E('li', {}, [ '/etc/shadow' ]),
+					E('li', {}, [ _('dropbear private host keys') ]),
+					E('li', {}, [ 'authorized_keys' ]),
+					E('li', {}, [ _('WPA pre-shared keys (Wi-Fi passwords)') ]),
+					E('li', {}, [ _('WireGuard private keys') ]),
+					E('li', {}, [ _('PPPoE credentials') ]),
+					E('li', {}, [ 'uhttpd.key' ])
 				]),
 				node
 			]);
@@ -1118,7 +1118,7 @@ return view.extend({
 		box.hidden = false;
 		while (box.firstChild)
 			box.removeChild(box.firstChild);
-		box.appendChild(E('p', { 'class': 'spinning' }, _('Reading the current key’s fingerprint…')));
+		box.appendChild(E('p', { 'class': 'spinning' }, [ _('Reading the current key’s fingerprint…') ]));
 
 		return callKeygen(true).then(function(res) {
 			// A key already existed the instant this page loaded (only
@@ -1139,32 +1139,32 @@ return view.extend({
 
 			if (!res || res.confirm_required !== true || !res.fingerprint) {
 				box.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
-					_('Could not read the current key: %s').format((res && res.reason) || _('unknown error'))));
+					[ _('Could not read the current key: %s').format((res && res.reason) || _('unknown error')) ]));
 				btn.disabled = false;
 				return;
 			}
 
 			self._keygenFingerprint = res.fingerprint;
 			box.appendChild(E('p', { 'class': 'gitbackup-warn-text' },
-				_('Regenerating destroys this key beyond recovery, and the deploy key already added at your git provider stops working the instant it does. This cannot be undone from here -- after regenerating, add the NEW public key at the provider before the next backup runs.')));
-			box.appendChild(E('p', {}, _('Key currently in use (fingerprint):')));
-			box.appendChild(E('pre', { 'class': 'gitbackup-log' }, res.fingerprint));
+				[ _('Regenerating destroys this key beyond recovery, and the deploy key already added at your git provider stops working the instant it does. This cannot be undone from here -- after regenerating, add the NEW public key at the provider before the next backup runs.') ]));
+			box.appendChild(E('p', {}, [ _('Key currently in use (fingerprint):') ]));
+			box.appendChild(E('pre', { 'class': 'gitbackup-log' }, [ res.fingerprint ]));
 			box.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
 				E('button', {
 					'class': 'cbi-button cbi-button-negative',
 					'click': ui.createHandlerFn(self, 'handleConfirmRegenerateKey')
-				}, _('Destroy it and regenerate')),
+				}, [ _('Destroy it and regenerate') ]),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'click': ui.createHandlerFn(self, 'handleCancelRegenerateKey')
-				}, _('Cancel'))
+				}, [ _('Cancel') ])
 			]));
 			btn.disabled = false;
 		}, function(e) {
 			while (box.firstChild)
 				box.removeChild(box.firstChild);
 			box.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
-				_('Could not read the current key: %s').format(e.message)));
+				[ _('Could not read the current key: %s').format(e.message) ]));
 			btn.disabled = false;
 		});
 	},
@@ -1396,7 +1396,7 @@ return view.extend({
 		wrap.hidden = false;
 		while (wrap.firstChild)
 			wrap.removeChild(wrap.firstChild);
-		wrap.appendChild(E('p', { 'class': 'spinning' }, _('Fetching the remote’s SSH host key…')));
+		wrap.appendChild(E('p', { 'class': 'spinning' }, [ _('Fetching the remote’s SSH host key…') ]));
 
 		return callHostkey().then(function(res) {
 			while (wrap.firstChild)
@@ -1412,28 +1412,28 @@ return view.extend({
 
 			if (!res.fingerprint) {
 				wrap.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
-					_('Could not obtain the host key: %s').format((res && res.reason) || _('unknown error'))));
+					[ _('Could not obtain the host key: %s').format((res && res.reason) || _('unknown error')) ]));
 				return;
 			}
 
 			self._hostkeyFingerprint = res.fingerprint;
-			wrap.appendChild(E('p', {}, _('The remote presented this SSH host key fingerprint. Verify it out of band if you can, then accept it once to continue -- this only has to be done the first time.')));
-			wrap.appendChild(E('pre', { 'class': 'gitbackup-log' }, res.fingerprint));
+			wrap.appendChild(E('p', {}, [ _('The remote presented this SSH host key fingerprint. Verify it out of band if you can, then accept it once to continue -- this only has to be done the first time.') ]));
+			wrap.appendChild(E('pre', { 'class': 'gitbackup-log' }, [ res.fingerprint ]));
 			wrap.appendChild(E('div', { 'class': 'gitbackup-actions' }, [
 				E('button', {
 					'class': 'cbi-button cbi-button-positive',
 					'click': ui.createHandlerFn(self, 'handleAcceptHostkey')
-				}, _('Accept and remember this host key')),
+				}, [ _('Accept and remember this host key') ]),
 				// Ticket 23: the "идёт" indicator for this one click --
 				// hidden until handleAcceptHostkey below shows it, empty
 				// text otherwise so it takes up no visible space.
-				E('span', { 'class': 'gitbackup-hint', 'id': 'gitbackup-hostkey-accept-status' }, '')
+				E('span', { 'class': 'gitbackup-hint', 'id': 'gitbackup-hostkey-accept-status' }, [ '' ])
 			]));
 		}, function(e) {
 			while (wrap.firstChild)
 				wrap.removeChild(wrap.firstChild);
 			wrap.appendChild(E('p', { 'class': 'gitbackup-hint-error' },
-				_('Could not obtain the host key: %s').format(e.message)));
+				[ _('Could not obtain the host key: %s').format(e.message) ]));
 		});
 	},
 

@@ -237,18 +237,18 @@ function gbAutomaticEntries(rawPaths, effectivePaths) {
 }
 
 function gbBuildPathRow(self, path, removable) {
-	var children = [ E('span', { 'class': 'gitbackup-path-text' }, path) ];
+	var children = [ E('span', { 'class': 'gitbackup-path-text' }, [ path ]) ];
 
 	if (removable) {
 		children.push(E('button', {
 			'class': 'cbi-button cbi-button-remove',
 			'click': ui.createHandlerFn(self, 'handleRemovePath', path)
-		}, _('Remove')));
+		}, [ _('Remove') ]));
 	} else {
 		children.push(E('button', {
 			'class': 'cbi-button cbi-button-action',
 			'click': ui.createHandlerFn(self, 'handleAddFromAudit', path)
-		}, _('Add')));
+		}, [ _('Add') ]));
 	}
 
 	return E('li', { 'class': 'gitbackup-path-row' }, children);
@@ -257,7 +257,7 @@ function gbBuildPathRow(self, path, removable) {
 function gbBuildPathsList(self, paths) {
 	if (!paths.length)
 		return E('p', { 'class': 'gitbackup-card-hint' },
-			_('Nothing here yet -- the base image\'s own defaults (%s) usually already list a handful of files.').format('/lib/upgrade/keep.d'));
+			[ _('Nothing here yet -- the base image\'s own defaults (%s) usually already list a handful of files.').format('/lib/upgrade/keep.d') ]);
 
 	return E('ul', { 'class': 'gitbackup-path-list' }, paths.map(function(p) {
 		return gbBuildPathRow(self, p, true);
@@ -276,11 +276,11 @@ function gbBuildSizeBox(kb, unknown) {
 	if (unknown)
 		text += ' ' + _('(some entries could not be measured and are left out of this total)');
 
-	children.push(E('p', { 'class': 'gitbackup-size' }, text));
+	children.push(E('p', { 'class': 'gitbackup-size' }, [ text ]));
 
 	if (kb != null && kb > GB_PATHS_WARN_KB) {
 		children.push(E('div', { 'class': 'gitbackup-warn' }, [
-			E('p', {}, _('This is over 2 MB. A real "sysupgrade -b" builds this archive entirely in RAM, and past this size it can fail on a low-memory device. This is only a warning -- nothing here is blocked, trim the list above if that matters on this device.'))
+			E('p', {}, [ _('This is over 2 MB. A real "sysupgrade -b" builds this archive entirely in RAM, and past this size it can fail on a low-memory device. This is only a warning -- nothing here is blocked, trim the list above if that matters on this device.') ])
 		]));
 	}
 
@@ -289,20 +289,20 @@ function gbBuildSizeBox(kb, unknown) {
 
 function gbBuildAutomaticBox(automatic) {
 	var box = E('div', {}, [
-		E('h3', { 'class': 'gitbackup-section-title' }, _('Also covered automatically')),
+		E('h3', { 'class': 'gitbackup-section-title' }, [ _('Also covered automatically') ]),
 		E('p', { 'class': 'gitbackup-caption' },
-			_('These are not part of the list above -- sysupgrade already backs them up on its own (package config changes, or /lib/upgrade/keep.d), whether or not anything is added here. Read-only.'))
+			[ _('These are not part of the list above -- sysupgrade already backs them up on its own (package config changes, or /lib/upgrade/keep.d), whether or not anything is added here. Read-only.') ])
 	]);
 
 	if (!automatic.length) {
 		box.appendChild(E('p', { 'class': 'gitbackup-card-hint' },
-			_('Nothing outside the list above right now.')));
+			[ _('Nothing outside the list above right now.') ]));
 		return box;
 	}
 
 	box.appendChild(E('ul', { 'class': 'gitbackup-path-list' }, automatic.map(function(p) {
 		return E('li', { 'class': 'gitbackup-path-row' }, [
-			E('span', { 'class': 'gitbackup-path-text' }, p)
+			E('span', { 'class': 'gitbackup-path-text' }, [ p ])
 		]);
 	})));
 
@@ -311,14 +311,14 @@ function gbBuildAutomaticBox(automatic) {
 
 function gbBuildAuditBox(self, audit) {
 	var box = E('div', {}, [
-		E('h3', { 'class': 'gitbackup-section-title' }, _('Audit: changed on this router, but not backed up')),
+		E('h3', { 'class': 'gitbackup-section-title' }, [ _('Audit: changed on this router, but not backed up') ]),
 		E('p', { 'class': 'gitbackup-caption' },
-			_('Everything below is different from what the installed packages shipped and is not covered by the path list above -- add it, or leave it if it does not belong in the backup.'))
+			[ _('Everything below is different from what the installed packages shipped and is not covered by the path list above -- add it, or leave it if it does not belong in the backup.') ])
 	]);
 
 	if (!audit.length) {
 		box.appendChild(E('p', { 'class': 'gitbackup-card-hint' },
-			_('Nothing to show here. Either every local change on this router is already covered by the backup set above, or this environment could not inspect the overlay filesystem to check at all -- an empty list is not, by itself, proof that nothing has changed.')));
+			[ _('Nothing to show here. Either every local change on this router is already covered by the backup set above, or this environment could not inspect the overlay filesystem to check at all -- an empty list is not, by itself, proof that nothing has changed.') ]));
 		return box;
 	}
 
@@ -373,14 +373,14 @@ return view.extend({
 		view = E('div', { 'class': 'gitbackup-view' }, [
 			E('style', { 'type': 'text/css' }, [ GB_CSS.join('\n') ]),
 
-			E('h2', {}, _('Git Backup - Paths')),
+			E('h2', {}, [ _('Git Backup - Paths') ]),
 
 			// Spec, verbatim: the caption is itself a feature, not a footnote
 			// -- this edits the same file the router's own firmware-upgrade
 			// tool reads, so anything listed here survives a real sysupgrade
 			// on its own, whether or not gitbackup itself ever runs again.
 			E('p', { 'class': 'gitbackup-caption' },
-				_('These paths also survive a firmware upgrade: they are written straight into /etc/sysupgrade.conf, the same file the router\'s own sysupgrade reads, not a separate list of this tool\'s own. A directory you add here stays a directory -- anything added to it later is covered too, exactly like a real sysupgrade would.')),
+				[ _('These paths also survive a firmware upgrade: they are written straight into /etc/sysupgrade.conf, the same file the router\'s own sysupgrade reads, not a separate list of this tool\'s own. A directory you add here stays a directory -- anything added to it later is covered too, exactly like a real sysupgrade would.') ]),
 
 			E('div', { 'class': 'gitbackup-actions' }, [
 				E('input', {
@@ -399,7 +399,7 @@ return view.extend({
 					'class': 'cbi-button cbi-button-action',
 					'id': 'gitbackup-paths-add-btn',
 					'click': ui.createHandlerFn(self, 'handleAddPath')
-				}, _('Add path'))
+				}, [ _('Add path') ])
 			]),
 
 			E('div', { 'id': 'gitbackup-paths-body' })
@@ -493,7 +493,7 @@ return view.extend({
 
 			for (i = 0; i < rejected.length; i++) {
 				ui.addNotification(null, E('p', {},
-					_('%s: %s').format(rejected[i].path, rejected[i].reason)), 'error');
+					[ _('%s: %s').format(rejected[i].path, rejected[i].reason) ]), 'error');
 				if (addedPath && rejected[i].path === addedPath)
 					ok = false;
 			}
@@ -501,7 +501,7 @@ return view.extend({
 			return self.refresh().then(function() { return ok; });
 		}, function(e) {
 			ui.addNotification(null, E('p', {},
-				_('Could not save the path list: %s').format(e.message)), 'error');
+				[ _('Could not save the path list: %s').format(e.message) ]), 'error');
 			return false;
 		});
 	},
@@ -520,18 +520,18 @@ return view.extend({
 		var reason;
 
 		if (!path) {
-			ui.addNotification(null, E('p', {}, _('Enter a path first.')), 'error');
+			ui.addNotification(null, E('p', {}, [ _('Enter a path first.') ]), 'error');
 			return;
 		}
 
 		if (self._paths.indexOf(path) !== -1) {
-			ui.addNotification(null, E('p', {}, _('%s is already in the backup set.').format(path)), 'info');
+			ui.addNotification(null, E('p', {}, [ _('%s is already in the backup set.').format(path) ]), 'info');
 			return;
 		}
 
 		reason = gbPathReject(path);
 		if (reason) {
-			ui.addNotification(null, E('p', {}, reason), 'error');
+			ui.addNotification(null, E('p', {}, [ reason ]), 'error');
 			return;
 		}
 
@@ -549,7 +549,7 @@ return view.extend({
 		var reason = gbPathReject(path);
 
 		if (reason) {
-			ui.addNotification(null, E('p', {}, reason), 'error');
+			ui.addNotification(null, E('p', {}, [ reason ]), 'error');
 			return;
 		}
 

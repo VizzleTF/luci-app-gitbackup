@@ -39,6 +39,21 @@
 // становятся разметкой" rule history.js's own diff viewer already followed
 // (that file's own header comment, out of this ticket's zone, read before
 // writing this).
+//
+// That holds only because every child below is handed to E() INSIDE AN
+// ARRAY, and this file originally got that wrong. LuCI's dom.append()
+// branches on the shape of its `children` argument: the Array branch is the
+// one that runs each string through document.createTextNode(), while a bare
+// string falls all the way through to `node.innerHTML = '' + children` and
+// is parsed as markup. `E('span', attrs, line)` therefore rendered a diff
+// line AS HTML -- and the text here is `git diff` output, i.e. the contents
+// of files fetched from the backup remote, which anyone with push access to
+// that repository controls byte for byte. `E('span', attrs, [ line ])` is
+// the fix, and the bracket is load-bearing, not punctuation: nothing else
+// escapes on the way here (gb_json_esc escapes only what JSON needs, LuCI's
+// String.format('%s') does not escape at all, and a LuCI page carries no
+// CSP). tests/dom_text_children.test.mjs holds the whole view directory to
+// this, so a future call site cannot quietly drop the brackets again.
 
 // css -- the class names both renderers below emit, meant to be spliced
 // into each CALLING view's own <style> block (rule 1 of the style guide:
@@ -102,10 +117,10 @@ function gbBuildPre(text, classify, emptyText) {
 	var lines = (text || '').split('\n');
 
 	if (!lines.length || (lines.length === 1 && !lines[0]))
-		return E('p', { 'class': 'gitbackup-card-hint' }, emptyText);
+		return E('p', { 'class': 'gitbackup-card-hint' }, [ emptyText ]);
 
 	return E('pre', { 'class': 'gitbackup-diff' }, lines.map(function(line) {
-		return E('span', { 'class': classify(line) }, line + '\n');
+		return E('span', { 'class': classify(line) }, [ line + '\n' ]);
 	}));
 }
 

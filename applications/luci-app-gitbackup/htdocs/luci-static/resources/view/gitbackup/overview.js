@@ -465,7 +465,7 @@ function gbConfigDiffView(res) {
 }
 
 function gbRenderBanner(text) {
-	return E('div', { 'class': 'gitbackup-banner' }, [ E('p', {}, text) ]);
+	return E('div', { 'class': 'gitbackup-banner' }, [ E('p', {}, [ text ]) ]);
 }
 
 // ---------------------------------------------------------------------
@@ -612,28 +612,28 @@ return view.extend({
 		view = E('div', { 'class': 'gitbackup-view' }, [
 			E('style', { 'type': 'text/css' }, [ GB_CSS.concat(diffview.css).join('\n') ]),
 
-			E('h2', {}, _('Git Backup')),
+			E('h2', {}, [ _('Git Backup') ]),
 
 			E('div', { 'id': 'gitbackup-banners' }, sv.banners.map(gbRenderBanner)),
 
 			E('div', { 'class': 'gitbackup-cards' }, [
 				E('div', { 'class': 'gitbackup-card' }, [
-					E('div', { 'class': 'gitbackup-card-title' }, _('Status')),
-					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-status-enabled' }, sv.enabledText),
-					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-status-schedule' }, sv.scheduleText)
+					E('div', { 'class': 'gitbackup-card-title' }, [ _('Status') ]),
+					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-status-enabled' }, [ sv.enabledText ]),
+					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-status-schedule' }, [ sv.scheduleText ])
 				]),
 				E('div', { 'class': 'gitbackup-card' }, [
-					E('div', { 'class': 'gitbackup-card-title' }, _('Last commit')),
-					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-commit-sha' }, _('Checking…')),
-					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-commit-time' }, '-')
+					E('div', { 'class': 'gitbackup-card-title' }, [ _('Last commit') ]),
+					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-commit-sha' }, [ _('Checking…') ]),
+					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-commit-time' }, [ '-' ])
 				]),
 				E('div', { 'class': 'gitbackup-card' }, [
-					E('div', { 'class': 'gitbackup-card-title' }, _('Last run')),
+					E('div', { 'class': 'gitbackup-card-title' }, [ _('Last run') ]),
 					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-run-result' }, [
 						E('span', { 'class': sv.resultDotClass, 'id': 'gitbackup-run-dot' }),
-						E('span', { 'id': 'gitbackup-run-text' }, sv.resultText)
+						E('span', { 'id': 'gitbackup-run-text' }, [ sv.resultText ])
 					]),
-					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-run-hint' }, sv.resultHint)
+					E('div', { 'class': 'gitbackup-card-hint', 'id': 'gitbackup-run-hint' }, [ sv.resultHint ])
 				]),
 				// A real <button>, not a <div> like the three cards above
 				// (ticket 23: "Блок «Configuration»... по ней можно
@@ -646,27 +646,27 @@ return view.extend({
 					'id': 'gitbackup-configdiff-card',
 					'click': ui.createHandlerFn(self, 'handleShowConfigDiff')
 				}, [
-					E('div', { 'class': 'gitbackup-card-title' }, _('Configuration')),
+					E('div', { 'class': 'gitbackup-card-title' }, [ _('Configuration') ]),
 					E('div', { 'class': 'gitbackup-card-value', 'id': 'gitbackup-configdiff-result' }, [
 						E('span', { 'class': 'gitbackup-dot', 'id': 'gitbackup-configdiff-dot' }),
-						E('span', { 'id': 'gitbackup-configdiff-text' }, _('Checking…'))
+						E('span', { 'id': 'gitbackup-configdiff-text' }, [ _('Checking…') ])
 					]),
 					E('div', { 'class': 'gitbackup-card-hint' },
-						_('Compared against the last commit right now, not just the last run. Click to view the diff.'))
+						[ _('Compared against the last commit right now, not just the last run. Click to view the diff.') ])
 				])
 			]),
 
 			E('div', { 'class': 'gitbackup-leak' }, [
 				E('p', { 'class': 'gitbackup-leak-title' },
-					_('The following ends up in the repository in plain text -- there is no encryption in this tool:')),
+					[ _('The following ends up in the repository in plain text -- there is no encryption in this tool:') ]),
 				E('ul', { 'class': 'gitbackup-leak-list' }, [
-					E('li', {}, '/etc/shadow'),
-					E('li', {}, _('dropbear private host keys')),
-					E('li', {}, 'authorized_keys'),
-					E('li', {}, _('WPA pre-shared keys (Wi-Fi passwords)')),
-					E('li', {}, _('WireGuard private keys')),
-					E('li', {}, _('PPPoE credentials')),
-					E('li', {}, 'uhttpd.key')
+					E('li', {}, [ '/etc/shadow' ]),
+					E('li', {}, [ _('dropbear private host keys') ]),
+					E('li', {}, [ 'authorized_keys' ]),
+					E('li', {}, [ _('WPA pre-shared keys (Wi-Fi passwords)') ]),
+					E('li', {}, [ _('WireGuard private keys') ]),
+					E('li', {}, [ _('PPPoE credentials') ]),
+					E('li', {}, [ 'uhttpd.key' ])
 				])
 			]),
 
@@ -675,17 +675,17 @@ return view.extend({
 					'class': 'cbi-button cbi-button-action',
 					'id': 'gitbackup-btn-run',
 					'click': ui.createHandlerFn(self, 'handleRun')
-				}, _('Backup now')),
+				}, [ _('Backup now') ]),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'id': 'gitbackup-btn-test',
 					'click': ui.createHandlerFn(self, 'handleTest')
-				}, _('Test connection')),
+				}, [ _('Test connection') ]),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'id': 'gitbackup-btn-card',
 					'click': ui.createHandlerFn(self, 'handleDownloadCard')
-				}, _('Download recovery card'))
+				}, [ _('Download recovery card') ])
 			]),
 
 			// The one status line shared by "Backup now" and "Test
@@ -699,7 +699,7 @@ return view.extend({
 			// alone cannot.
 			E('p', { 'class': 'gitbackup-op-status', 'id': 'gitbackup-op-status', 'hidden': true }),
 
-			E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-live-log', 'hidden': true }, '')
+			E('pre', { 'class': 'gitbackup-log', 'id': 'gitbackup-live-log', 'hidden': true }, [ '' ])
 		]);
 
 		self._boundRefresh = L.bind(self.refreshStatus, self);
@@ -830,7 +830,7 @@ return view.extend({
 				'target': '_blank',
 				'rel': 'noopener noreferrer',
 				'class': 'gitbackup-link'
-			}, hv.shaText));
+			}, [ hv.shaText ]));
 		} else {
 			shaEl.appendChild(document.createTextNode(hv.shaText));
 		}
@@ -998,7 +998,7 @@ return view.extend({
 		var self = this;
 
 		ui.showModal(_('Configuration diff'), [
-			E('p', { 'class': 'spinning' }, _('Checking the current configuration against the last commit…'))
+			E('p', { 'class': 'spinning' }, [ _('Checking the current configuration against the last commit…') ])
 		]);
 
 		if (self._configDiffRes)
@@ -1021,17 +1021,17 @@ return view.extend({
 
 		if (!res || typeof res.differs !== 'boolean') {
 			body = [ E('p', { 'class': 'gitbackup-hint-error' },
-				(res && res.reason) ?
+				[ (res && res.reason) ?
 					_('Could not check: %s').format(res.reason) :
-					_('Could not check whether the configuration has changed.')) ];
+					_('Could not check whether the configuration has changed.') ]) ];
 		} else if (!res.differs) {
-			body = [ E('p', { 'class': 'gitbackup-hint-ok' }, _('The configuration matches the last commit.')) ];
+			body = [ E('p', { 'class': 'gitbackup-hint-ok' }, [ _('The configuration matches the last commit.') ]) ];
 		} else {
 			body = [ diffview.manifest(res.text) ];
 		}
 
 		body.push(E('div', { 'class': 'gitbackup-modal-actions' }, [
-			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
+			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, [ _('Close') ])
 		]));
 
 		ui.showModal(_('Configuration diff'), body);
@@ -1046,7 +1046,7 @@ return view.extend({
 		return callCard().then(function(res) {
 			if (!res || typeof res.card !== 'string') {
 				ui.addNotification(null, E('p', {},
-					_('Could not generate the recovery card: %s').format((res && res.reason) || _('unknown error'))), 'error');
+					[ _('Could not generate the recovery card: %s').format((res && res.reason) || _('unknown error')) ]), 'error');
 				return;
 			}
 
@@ -1056,7 +1056,7 @@ return view.extend({
 			link.click();
 			window.URL.revokeObjectURL(link.href);
 		}).catch(function(e) {
-			ui.addNotification(null, E('p', {}, _('Could not generate the recovery card: %s').format(e.message)), 'error');
+			ui.addNotification(null, E('p', {}, [ _('Could not generate the recovery card: %s').format(e.message) ]), 'error');
 		}).finally(function() {
 			btn.disabled = false;
 		});
