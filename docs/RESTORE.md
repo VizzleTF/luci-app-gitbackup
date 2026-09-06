@@ -11,7 +11,7 @@ factory reset, a fresh flash, a device you have never installed `gitbackup` on a
 
 - a file, downloaded from the repository through an ordinary web browser (`backup.tar.gz`,
   written next to the working tree on every run when that option is enabled — see the
-  "Keep a local archive" setting), and
+  "Keep a local archive" setting — **and** the run does not scrub, see below), and
 - **nothing else.** No package, no network reachable from the router at restore time beyond
   whatever it takes to load the LuCI page itself, no deploy key, no token.
 
@@ -26,6 +26,18 @@ Steps:
 This is stock OpenWrt behavior (`sysupgrade -r`), not anything `gitbackup`-specific — which is
 exactly why it is the most reliable of the three paths. It is also the one with the sharpest
 edge, described below.
+
+### When Path 0 is not there
+
+No `backup.tar.gz` is pushed when config scrubbing is on for a run — which includes every run
+against a repository marked public, where scrubbing is forced on whether you asked for it or
+not. `sysupgrade -b` builds its archive from the live filesystem, not from the scrubbed tree,
+so pushing it would put back exactly the secrets scrubbing had just taken out: `/etc/shadow`,
+the dropbear host keys, the Wi-Fi pre-shared keys. Between "the archive is complete" and "the
+repository has no secrets in it", turning scrubbing on is you choosing the second.
+
+The recovery card generated on each run says which of the two applies to that router, so you
+are not left looking for a file that was never there. Path 1 and Path 2 work either way.
 
 ### Why Path 0 is not what the other two paths use internally
 

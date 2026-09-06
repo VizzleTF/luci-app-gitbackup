@@ -50,6 +50,53 @@ gb_uci_get() {
 	printf '%s\n' "$_gb_value"
 }
 
+# gb_path_canon <path>
+#
+# Prints <path> in its one canonical spelling: repeated slashes collapsed,
+# "." components dropped, ".." components resolved lexically, no trailing
+# slash. A relative path is printed back unchanged -- there is nothing to
+# resolve it against here, and every caller checks for absoluteness itself.
+#
+# Lexical, not filesystem-resolving: no realpath(1) on the base image, and
+# `readlink -f` would additionally follow symlinks, which is exactly what
+# this package must NOT do to a backup path (collect.sh's R24.1 -- a
+# symlink is backed up as a symlink, never dereferenced).
+#
+# This exists because two separate decisions in this package are made by
+# matching a path against a fixed pattern -- gb_paths_validate's blacklist
+# and collect.sh's _gb_collect_is_excluded -- and `case` glob matching is
+# purely textual. "/etc/gitbackup", "//etc/gitbackup", "/etc/./gitbackup"
+# and "/etc/../etc/gitbackup" name the same directory to the kernel and to
+# find(1), but only the first one matches a "/etc/gitbackup*" pattern. The
+# package's own exclude.list calls its exclusion of that directory
+# unconditional ("must never end up inside its own backup, no matter how
+# the router is configured", R76); without canonicalization it was not,
+# and an entry spelled "//etc/gitbackup" pushed the deploy private key and
+# the git token into the very repository they authenticate to.
+gb_path_canon() {
+	_gb_pc_rest="${1-}"
+	case "$_gb_pc_rest" in
+		/*) ;;
+		*) printf '%s\n' "$_gb_pc_rest"; return 0 ;;
+	esac
+
+	_gb_pc_out=''
+	while [ -n "$_gb_pc_rest" ]; do
+		_gb_pc_comp="${_gb_pc_rest%%/*}"
+		case "$_gb_pc_rest" in
+			*/*) _gb_pc_rest="${_gb_pc_rest#*/}" ;;
+			*) _gb_pc_rest='' ;;
+		esac
+		case "$_gb_pc_comp" in
+			''|.) ;;
+			..) _gb_pc_out="${_gb_pc_out%/*}" ;;
+			*) _gb_pc_out="$_gb_pc_out/$_gb_pc_comp" ;;
+		esac
+	done
+
+	printf '%s\n' "${_gb_pc_out:-/}"
+}
+
 # gb_json_esc <string>
 #
 # Escapes a string for use inside JSON double quotes. Written out rather than

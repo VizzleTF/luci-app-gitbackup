@@ -98,16 +98,19 @@ gb_paths_size_kb() {
 # 0 when <path> may be added to GB_SYSUPGRADE_CONF; on refusal, prints one
 # human-readable reason to stderr and returns a code from this package's
 # own shared contract (interfaces.md "Коды выхода") -- 2 for a plain bad
-# argument (not absolute, contains a space, does not exist), 4 for a
-# refusal on safety grounds (the fixed blacklist) -- so a caller can pass
-# the return value straight to gb_die without having to reclassify it.
+# argument (not absolute, contains a space, not canonically spelled, does
+# not exist), 4 for a refusal on safety grounds (the fixed blacklist) --
+# so a caller can pass the return value straight to gb_die without having
+# to reclassify it.
 #
 # Checked in the order a human would want to hear about it: absolute
 # first (everything below assumes that), then the one syntactic limit
 # `sysupgrade -l`'s own `find` invocation imposes (spec "Проверенные
 # факты 25.12.4 -> sysupgrade": "пути с пробелами не поддерживаются
-# конструктивно"), then the fixed blacklist (never configurable -- ticket
-# 17's own brief: "запрет на /etc/gitbackup/**, /proc, /sys, /tmp"), and
+# конструктивно"), then the one spelling every textual check below (and
+# collect.sh's own hard-exclude) is able to reason about, then the fixed
+# blacklist (never configurable -- ticket 17's own brief: "запрет на
+# /etc/gitbackup/**, /proc, /sys, /tmp"), and
 # only last whether the path actually exists -- there is no point telling
 # an operator their entry is missing from disk before telling them it was
 # never going to be accepted at all.
@@ -128,6 +131,31 @@ gb_paths_validate() {
 			return 2
 			;;
 	esac
+
+	# The blacklist below is `case` glob matching, i.e. purely textual, so
+	# it only holds for one spelling of each path. "//etc/gitbackup",
+	# "/etc/./gitbackup" and "/etc/../etc/gitbackup" all name the reserved
+	# directory to find(1) -- which is what a sysupgrade.conf line becomes
+	# -- while matching none of the patterns that reserve it, and
+	# collect.sh's own hard-exclude of that directory is textual in the
+	# same way. An entry spelled like that therefore used to sail past
+	# both and put /etc/gitbackup/token and the deploy private key into
+	# the backup repository itself.
+	#
+	# Refused rather than silently rewritten to the canonical spelling:
+	# what lands in sysupgrade.conf is what the operator (or the LuCI
+	# Paths view) asked for, verbatim, everywhere else in this file --
+	# gb_paths_add's idempotence and gb_paths_del's exact-line removal
+	# both depend on that -- and quietly editing an entry on the way in
+	# would break the "add what I typed, remove what I see" contract for
+	# the sake of one accepted keystroke. The canonical spelling is named
+	# in the message instead, and reaches the Paths view as the rejection
+	# reason gbrpc_set_paths already reports per entry.
+	_gb_pv_canon=$(gb_path_canon "$_gb_pv_path")
+	if [ "$_gb_pv_canon" != "$_gb_pv_path" ]; then
+		printf '%s: not a canonical path -- write it as %s\n' "$_gb_pv_path" "$_gb_pv_canon" >&2
+		return 2
+	fi
 
 	case "$_gb_pv_path" in
 		/etc/gitbackup | /etc/gitbackup/*)

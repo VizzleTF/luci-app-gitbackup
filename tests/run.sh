@@ -1426,6 +1426,41 @@ t_collect_hard_exclude() {
 	)
 }
 
+# t_collect_hard_exclude_non_canonical -- the same directory the test above
+# proves is excluded, spelled the three ways that used to slip past
+# _gb_collect_is_excluded's own `case` match. This is the half of the fix
+# that does not depend on gb_paths_validate: `sysupgrade -l` unions in
+# /lib/upgrade/keep.d/* and changed conffiles, neither of which this
+# package validates or even writes, so the exclude matcher has to hold on
+# a path that never went through the paths editor at all. What leaked
+# otherwise was not incidental -- /etc/gitbackup holds the deploy private
+# key and the git token, i.e. exactly the credentials that authenticate
+# the push, committed into the repository they authenticate to.
+t_collect_hard_exclude_non_canonical() {
+	(
+		. "$share/lib.sh"; . "$share/collect.sh"
+		collect_fixture
+		mkdir -p "$work/froot/etc/gitbackup"
+		printf 'shh
+' >"$work/froot/etc/gitbackup/token"
+		printf 'PRIVATE KEY
+' >"$work/froot/etc/gitbackup/id_ed25519"
+		sysupgrade_list '//etc/gitbackup/token' '/etc/./gitbackup/id_ed25519' '/etc/../etc/gitbackup/token'
+
+		gb_collect "$work/out" >/dev/null 2>&1
+
+		if [ -e "$work/out/files/etc/gitbackup" ]; then
+			no 'no spelling of /etc/gitbackup reaches the tree' 'it was collected'
+		else
+			ok 'no spelling of /etc/gitbackup reaches the tree'
+		fi
+		case "$(cat "$(gb_manifest_path "$work/out")")" in
+			*gitbackup*) no 'and none reaches the manifest either' 'found it' ;;
+			*) ok 'and none reaches the manifest either' ;;
+		esac
+	)
+}
+
 t_collect_manifest_equal() {
 	(
 		. "$share/lib.sh"; . "$share/collect.sh"
@@ -3240,6 +3275,107 @@ STUB
 # must refuse outright, and refuse BEFORE touching GB_ROOT at all: the
 # destination is asserted to still not exist, not just that the command
 # exited non-zero.
+# t_restore_refuses_a_hostile_manifest_entry -- the manifest is remote
+# input, and every field in it decides something argv-shaped: `path` picks
+# the destination, `mode`/`uid`/`gid` become chmod/chown arguments. None of
+# them was checked before _gb_restore_check_entries existed.
+#
+# The point of each case below is NOT "this path is forbidden" -- restoring
+# writes back the whole backup set wherever it lived, by design, and there
+# is no allowlist. It is that an entry has to say what it means in the one
+# spelling every pass agrees on, and that a value which is not a mode
+# cannot reach `chmod` as if it were one. Exit 4 (refused for safety), and
+# the whole manifest is refused rather than the one entry skipped: a
+# manifest collect.sh did not write is not a backup worth half-applying.
+t_restore_refuses_a_hostile_manifest_entry() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file '/etc/../etc/config/network' 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'a non-canonical entry path is refused with exit 4' '4' "$?"
+		contains 'and the reason says which entry and why' 'not a canonical path' "$out"
+		if [ -e "$work/restore-dest/etc/config/network" ]; then
+			no 'nothing was written before the refusal' 'the file exists anyway'
+		else
+			ok 'nothing was written before the refusal'
+		fi
+
+		restore_teardown
+	)
+}
+
+# t_restore_refuses_an_option_shaped_mode -- the same gate, on the field
+# that reaches `chmod` argv. "--reference=/etc/shadow" is a real chmod
+# option: left unchecked it copies another file's permission bits onto the
+# destination instead of setting the mode the manifest claims to carry.
+t_restore_refuses_an_option_shaped_mode() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(printf '{"path":"%s","type":"file","mode":"%s","uid":%s,"gid":%s,"sha256":"%s"}' \
+			'/etc/config/network' '--reference=/etc/shadow' 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		out=$(gb_restore rt1 '' --yes 2>&1)
+		eq 'an option-shaped mode is refused with exit 4' '4' "$?"
+		contains 'and the reason names the field' 'is not 3 or 4 octal digits' "$out"
+
+		restore_teardown
+	)
+}
+
+# t_restore_never_writes_through_a_symlink -- a "file" entry whose
+# destination is currently a symlink pointing somewhere else entirely.
+# GNU cp -f opens the destination O_TRUNC, which follows the link and
+# rewrites the target -- a path the manifest never named -- while busybox
+# cp unlinks first; this pins the one behaviour, and pins it on the host
+# whose cp has the following variant. The manifest's own set of paths is
+# the complete set of files a restore may touch.
+t_restore_never_writes_through_a_symlink() {
+	(
+		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
+		restore_setup
+
+		mkdir -p "$work/restore-seed/devices/rt1/files/etc/config"
+		printf 'config network\n' >"$work/restore-seed/devices/rt1/files/etc/config/network"
+		_rt_sha=$(sha256sum "$work/restore-seed/devices/rt1/files/etc/config/network" | awk '{print $1}')
+		_rt_entries=$(restore_entry_file '/etc/config/network' 640 0 0 "$_rt_sha")
+		restore_write_manifest "$work/restore-seed/devices/rt1/manifest.json" "$_rt_entries" ''
+		restore_seed_push "$work/restore-bare.git" device/rt1
+
+		# The router as found: something else already sitting at the
+		# destination, as a link to a file the manifest says nothing about.
+		mkdir -p "$work/restore-dest/etc/config"
+		printf 'ORIGINAL\n' >"$work/restore-dest/etc/elsewhere"
+		ln -s "$work/restore-dest/etc/elsewhere" "$work/restore-dest/etc/config/network"
+
+		gb_restore rt1 '' --yes >/dev/null 2>&1
+		eq 'the restore itself succeeds' '0' "$?"
+		eq 'the link target is untouched' 'ORIGINAL' "$(cat "$work/restore-dest/etc/elsewhere")"
+		if [ -L "$work/restore-dest/etc/config/network" ]; then
+			no 'the destination is a real file now, not still a link' 'it is still a symlink'
+		else
+			ok 'the destination is a real file now, not still a link'
+		fi
+		eq 'and it holds what the backup held' 'config network' "$(cat "$work/restore-dest/etc/config/network")"
+
+		restore_teardown
+	)
+}
+
 t_restore_sha_mismatch_stops_before_write() {
 	(
 		. "$share/lib.sh"; . "$share/gitio.sh"; . "$share/restore.sh"
@@ -3899,6 +4035,57 @@ paths_fixture() {
 	GB_ROOT="$work/paths-root"; export GB_ROOT
 	GB_SYSUPGRADE_CONF="$work/paths-sysupgrade.conf"; export GB_SYSUPGRADE_CONF
 	rm -f "$GB_SYSUPGRADE_CONF"
+}
+
+# t_paths_validate_non_canonical -- the blacklist above is `case` glob
+# matching, so it only ever held for one spelling. Every entry below names
+# the reserved /etc/gitbackup directory to find(1) -- which is exactly what
+# a sysupgrade.conf line becomes -- while matching none of the patterns
+# that reserve it, and each one was accepted before gb_path_canon existed.
+# Refused as a plain bad argument (exit 2), not a safety refusal (exit 4):
+# the objection is to the spelling, and the message says which spelling to
+# use instead, so the Paths view can show an operator what to type.
+t_paths_validate_non_canonical() {
+	(
+		. "$share/lib.sh"; . "$share/paths.sh"
+		paths_fixture
+		mkdir -p "$work/paths-root/etc/gitbackup"
+		: >"$work/paths-root/etc/gitbackup/token"
+
+		gb_paths_validate '//etc/gitbackup' 2>/dev/null
+		eq 'a doubled leading slash is refused (exit 2)' '2' "$?"
+		gb_paths_validate '/etc/./gitbackup' 2>/dev/null
+		eq 'a "." component is refused (exit 2)' '2' "$?"
+		gb_paths_validate '/etc/../etc/gitbackup/token' 2>/dev/null
+		eq 'a ".." component is refused (exit 2)' '2' "$?"
+		gb_paths_validate '/etc/config/' 2>/dev/null
+		eq 'a trailing slash is refused (exit 2)' '2' "$?"
+
+		contains 'and the reason names the canonical spelling to use instead' 			'/etc/gitbackup' "$(gb_paths_validate '//etc/gitbackup' 2>&1)"
+	)
+}
+
+# t_path_canon -- gb_path_canon is the one answer two textual gates
+# (gb_paths_validate's blacklist, collect.sh's hard-exclude) agree on. The
+# expectations below are the four spellings POSIX pathname resolution
+# treats as one path, worked out by hand from the rules themselves
+# (repeated slashes are one slash, "." is the directory itself, ".." is its
+# parent, a trailing slash names the same directory) -- never by running
+# the function and writing down what it said.
+t_path_canon() {
+	(
+		. "$share/lib.sh"
+
+		eq 'an already-canonical path is returned unchanged' '/etc/gitbackup' "$(gb_path_canon '/etc/gitbackup')"
+		eq 'a doubled leading slash collapses' '/etc/gitbackup' "$(gb_path_canon '//etc/gitbackup')"
+		eq 'a doubled inner slash collapses' '/etc/gitbackup' "$(gb_path_canon '/etc//gitbackup')"
+		eq 'a "." component is dropped' '/etc/gitbackup' "$(gb_path_canon '/etc/./gitbackup')"
+		eq 'a ".." component is resolved lexically' '/etc/gitbackup' "$(gb_path_canon '/etc/../etc/gitbackup')"
+		eq 'a trailing slash is dropped' '/etc/gitbackup' "$(gb_path_canon '/etc/gitbackup/')"
+		eq 'the root itself survives as "/"' '/' "$(gb_path_canon '/')"
+		eq '".." cannot climb above the root' '/' "$(gb_path_canon '/../..')"
+		eq 'a relative path is handed back untouched' 'etc/gitbackup' "$(gb_path_canon 'etc/gitbackup')"
+	)
 }
 
 t_paths_validate_blacklist() {
@@ -4657,6 +4844,67 @@ t_cli_run_space_check_fails() {
 	wait "$_gl_pid" 2>/dev/null
 }
 
+# t_run_scrub_pushes_no_archive -- the one configuration where the archive
+# and the scrub cannot both be honoured. sysupgrade -b reads the LIVE
+# filesystem, and its output lands inside the same $WORK tree gb_build_tree
+# stages whole -- so before step 11a learned about GB_SCRUB, a scrubbed run
+# still pushed a tarball containing every value it had just removed.
+# visibility=public forces scrub on precisely because the repository is
+# world-readable, which is exactly where that tarball did the most damage.
+#
+# Asserted on both sides of the seam: sysupgrade -b is never called at all
+# (the stub logs each call), and the pushed commit has no backup.tar.gz in
+# it. Same real-bare-repo machinery as the integration test above, one run.
+t_run_scrub_pushes_no_archive() {
+	gb_listener
+	_gl_pid="$GB_LISTENER_PID"
+	if [ -z "$_gl_pid" ]; then
+		skip 'run: a scrubbing run pushes no backup.tar.gz' \
+			'python3 not found on PATH -- gb_listener needs it for a real listening socket'
+		return 0
+	fi
+
+	collect_fixture
+	GB_DEVICE=rt1
+	mkdir -p "$work/froot/etc/config"
+	printf "config wifi-iface\n	option key 'hunter2'\n" >"$work/froot/etc/config/wireless"
+	sysupgrade_list '/etc/config/wireless'
+	printf "DISTRIB_RELEASE='25.12.4'\n" >"$work/froot/etc/openwrt_release"
+
+	GB_TEST_GIT_REAL=1; export GB_TEST_GIT_REAL
+	_gs_bare="$work/run-scrub-bare.git"
+	rm -rf "$_gs_bare"
+	git init --bare -q "$_gs_bare"
+
+	GB_TEST_GIT_REMOTE_URL="https://127.0.0.1:$GB_LISTENER_PORT/o/r.git"; export GB_TEST_GIT_REMOTE_URL
+	GB_TEST_GIT_REMOTE_PATH="$_gs_bare"; export GB_TEST_GIT_REMOTE_PATH
+	GB_TEST_SYSUPGRADE_B_LOG="$work/sysupgrade-b-scrub.log"; export GB_TEST_SYSUPGRADE_B_LOG
+	: >"$GB_TEST_SYSUPGRADE_B_LOG"
+
+	fixture 'gitbackup.main.device_id=custom' 'gitbackup.main.device=rt1' \
+		"gitbackup.origin.url=$GB_TEST_GIT_REMOTE_URL" \
+		'gitbackup.origin.acknowledged=1' 'gitbackup.main.archive=1' \
+		'gitbackup.security.scrub=1'
+
+	out=$(cli run 2>&1)
+	eq 'the run itself still succeeds' '0' "$?"
+	contains 'and says why no archive was pushed' 'no backup.tar.gz is pushed' "$out"
+
+	_gs_calls=$(grep -c . "$GB_TEST_SYSUPGRADE_B_LOG")
+	eq 'sysupgrade -b was never called' '0' "$_gs_calls"
+
+	_gs_blob=$(git --git-dir="$_gs_bare" cat-file -p device/rt1:devices/rt1/backup.tar.gz 2>/dev/null)
+	if [ -n "$_gs_blob" ]; then
+		no 'and no backup.tar.gz reached the commit' 'it is there anyway'
+	else
+		ok 'and no backup.tar.gz reached the commit'
+	fi
+
+	kill "$_gl_pid" 2>/dev/null
+	wait "$_gl_pid" 2>/dev/null
+	unset GB_TEST_GIT_REAL GB_TEST_GIT_REMOTE_URL GB_TEST_GIT_REMOTE_PATH GB_TEST_SYSUPGRADE_B_LOG
+}
+
 # t_run_integration_bare_repo -- the ticket's own headline acceptance
 # criterion: a full `gitbackup run`, through the real CLI (flock, the
 # network precheck, the visibility gate, all of it), pushing to a REAL
@@ -5348,6 +5596,45 @@ t_card_no_secret() {
 	)
 }
 
+# t_card_path0_matches_what_run_actually_pushes -- the recovery card is
+# read once, by someone whose router is already down, so a step on it that
+# cannot work is worse than an absent step. `run` writes backup.tar.gz only
+# when main.archive is on AND the run does not scrub (usr/sbin/gitbackup
+# step 11a), and the card has to describe that same router, not the general
+# case. GB_SCRUB is read, not gitbackup.security.scrub: visibility=public
+# forces scrub on over whatever that option says.
+t_card_path0_matches_what_run_actually_pushes() {
+	(
+		. "$share/lib.sh"; . "$share/remoteurl.sh"; . "$share/card.sh"
+		GB_DEVICE=rt1
+		GB_URL='https://github.com/acme/routers'
+
+		fixture 'gitbackup.main.archive=1'
+		GB_SCRUB=0; export GB_SCRUB
+		gb_card "$work/card-archive-on.md"
+		contains 'with an archive being pushed, Path 0 points at it' \
+			'backup.tar.gz' "$(cat "$work/card-archive-on.md")"
+
+		GB_SCRUB=1; export GB_SCRUB
+		gb_card "$work/card-scrubbed.md"
+		_ct_body=$(cat "$work/card-scrubbed.md")
+		case "$_ct_body" in
+			*'download'*'backup.tar.gz'*)
+				no 'a scrubbing router never sends the reader after an archive it does not push' "$_ct_body" ;;
+			*) ok 'a scrubbing router never sends the reader after an archive it does not push' ;;
+		esac
+		contains 'and says why that path is unavailable' 'scrubbing is on' "$_ct_body"
+
+		GB_SCRUB=0; export GB_SCRUB
+		fixture 'gitbackup.main.archive=0'
+		gb_card "$work/card-archive-off.md"
+		contains 'archive=0 gets its own reason, not the scrub one' \
+			'archive` is off' "$(cat "$work/card-archive-off.md")"
+
+		unset GB_SCRUB
+	)
+}
+
 # t_card_never_dies -- gb_card is called from the middle of a real backup
 # run (usr/sbin/gitbackup: `gb_card ... 2>/dev/null`), in the SAME process
 # as the run it rides along with. gb_die calls exit, so if gb_card ever hit
@@ -5406,6 +5693,51 @@ assert_json() {
 	else
 		no "$1" "not valid JSON: [$2]"
 	fi
+}
+
+# t_rpcd_acl_read_tier_returns_no_file_content -- the read tier is split
+# from the write tier on "may see the router's secrets", not on "changes
+# something". `diff` changes nothing at all, and still belongs in write:
+# what it returns is `git diff` between two commits of the backup branch,
+# i.e. the CONTENT of the backed-up files, and at the shipped default
+# (visibility=private, security.scrub='0') that content is unscrubbed --
+# /etc/shadow's root hash, the dropbear host keys, the WPA PSKs. Every
+# method left in read answers "is the backup healthy" without handing over
+# a file's bytes: status/log/history are metadata, and config_diff compares
+# manifests (paths, modes, hashes), never content.
+#
+# Parsed per tier here, unlike t_rpcd_acl_matches_plugin above, which
+# deliberately unions both tiers to compare the ACL against the dispatcher.
+t_rpcd_acl_read_tier_returns_no_file_content() {
+	acl="$root/applications/luci-app-gitbackup/root/usr/share/rpcd/acl.d/luci-app-gitbackup.json"
+	[ -r "$acl" ] || { no 'acl.d file exists' "missing: $acl"; return; }
+
+	# Everything between "read": and "write": -- the read tier's own block.
+	read_tier=$(awk '/"read":/ { grab=1 } /"write":/ { grab=0 } grab' "$acl" |
+		sed -n 's/^[[:space:]]*"\([a-z_][a-z_]*\)".*/\1/p' | sort -u)
+	write_tier=$(awk '/"write":/ { grab=1 } grab' "$acl" |
+		sed -n 's/^[[:space:]]*"\([a-z_][a-z_]*\)".*/\1/p' | sort -u)
+
+	[ -n "$read_tier" ] || { no 'the read tier parser found at least one method' 'found none -- the parser itself is broken'; return; }
+	[ -n "$write_tier" ] || { no 'the write tier parser found at least one method' 'found none -- the parser itself is broken'; return; }
+
+	read_hay=" $(printf '%s' "$read_tier" | tr '\n' ' ') "
+	write_hay=" $(printf '%s' "$write_tier" | tr '\n' ' ') "
+
+	case "$read_hay" in
+		*' diff '*) no 'diff is not in the read tier -- it returns raw backed-up file content' "read tier: $read_hay" ;;
+		*) ok 'diff is not in the read tier -- it returns raw backed-up file content' ;;
+	esac
+	case "$write_hay" in
+		*' diff '*) ok 'diff is in the write tier instead' ;;
+		*) no 'diff is in the write tier instead' "write tier: $write_hay" ;;
+	esac
+	for m in status log history config_diff; do
+		case "$read_hay" in
+			*" $m "*) ok "the metadata-only method $m stays readable" ;;
+			*) no "the metadata-only method $m stays readable" "read tier: $read_hay" ;;
+		esac
+	done
 }
 
 # t_rpcd_acl_matches_plugin -- the ticket's own explicit acceptance
@@ -6561,6 +6893,7 @@ run_test 'collect.sh: manifest fields for a file' t_collect_file_manifest_fields
 run_test 'collect.sh: empty directories become dir entries' t_collect_empty_dir
 run_test 'collect.sh: a trailing slash in a keep.d source is stripped' t_collect_empty_dir_trailing_slash_source
 run_test 'collect.sh: /etc/gitbackup/** is always hard-excluded' t_collect_hard_exclude
+run_test 'collect.sh: the hard-exclude holds for every spelling of the same path' t_collect_hard_exclude_non_canonical
 run_test 'collect.sh: gb_manifest_equal' t_collect_manifest_equal
 run_test 'collect.sh: JSON escaping of odd paths' t_collect_json_special_chars
 run_test 'scrub.sh: sourcing alone has no side effect' t_scrub_no_side_effect_on_source
@@ -6606,6 +6939,9 @@ run_test 'restore.sh: permissions/symlinks/empty dirs match the manifest' t_rest
 run_test 'restore.sh: chown is actually invoked per manifest entry, not just coincidentally matching' t_restore_chown_is_actually_called
 run_test 'restore.sh: overwrites an existing destination against a busybox-shaped cp (owlab finding)' t_restore_overwrites_existing_destination
 run_test 'restore.sh: a sha256 mismatch stops before any write' t_restore_sha_mismatch_stops_before_write
+run_test 'restore.sh: a non-canonical manifest entry path is refused outright' t_restore_refuses_a_hostile_manifest_entry
+run_test 'restore.sh: an option-shaped mode never reaches chmod' t_restore_refuses_an_option_shaped_mode
+run_test 'restore.sh: a file entry never writes through an existing symlink' t_restore_never_writes_through_a_symlink
 run_test 'restore.sh: board mismatch is refused, --force overrides it' t_restore_board_mismatch
 run_test 'restore.sh: a major OpenWrt version gap warns, does not refuse' t_restore_os_release_major_mismatch_warns
 run_test 'restore.sh: a non-empty manifest.scrubbed is printed to the operator' t_restore_scrubbed_list_printed
@@ -6619,7 +6955,9 @@ run_test 'schedule.sh: gb_cron_valid against tests/fixtures/cron.tsv' t_schedule
 run_test 'schedule.sh: gb_cron_next' t_schedule_cron_next
 run_test 'schedule.sh: gb_cron_apply is idempotent and off removes the line' t_schedule_cron_apply_idempotent
 run_test 'schedule.sh: gb_cron_apply on an unrunnable cron_expr' t_schedule_cron_apply_bad_cron_expr
+run_test 'lib.sh: gb_path_canon' t_path_canon
 run_test 'paths.sh: gb_paths_validate against the fixed blacklist' t_paths_validate_blacklist
+run_test 'paths.sh: gb_paths_validate refuses a non-canonical spelling of a blacklisted path' t_paths_validate_non_canonical
 run_test 'paths.sh: gb_paths_validate on a space and a nonexistent path' t_paths_validate_space_and_missing
 run_test 'paths.sh: gb_paths_add/gb_paths_del are idempotent' t_paths_add_del_idempotent
 run_test 'paths.sh: gb_paths_list and gb_paths_size_kb' t_paths_list_and_size
@@ -6652,6 +6990,7 @@ run_test 'cli: a successful test forgets a kept .old key' t_cli_test_forgets_old
 run_test 'cli: run -- a busy lock is skipped, not an error' t_cli_run_flock_busy
 run_test 'cli: run -- not enough space in /tmp' t_cli_run_space_check_fails
 run_test 'run: integration on a real local bare repository (3 runs)' t_run_integration_bare_repo
+run_test 'run: a scrubbing run pushes no backup.tar.gz' t_run_scrub_pushes_no_archive
 run_test 'cli: log shows run timings (A01)' t_cli_log
 run_test 'cli: collect --out DIR' t_cli_collect
 run_test 'cli: card --out FILE' t_cli_card
@@ -6668,7 +7007,9 @@ run_test 'card.sh: https remote recommends --token, not --ssh-key' t_card_https_
 run_test 'card.sh: ssh remote recommends --ssh-key, web link coerced to https' t_card_ssh_key_flag
 run_test 'card.sh: never leaks the token or deploy key onto the card' t_card_no_secret
 run_test 'card.sh: never dies on a malformed or missing GB_URL/GB_DEVICE' t_card_never_dies
+run_test 'card.sh: Path 0 matches what run actually pushes' t_card_path0_matches_what_run_actually_pushes
 run_test 'rpcd: ACL matches the plugin dispatcher, both directions' t_rpcd_acl_matches_plugin
+run_test 'rpcd: the read tier hands over no file content' t_rpcd_acl_read_tier_returns_no_file_content
 run_test 'rpcd: history/diff/list_paths/audit_paths call only $GB_BIN, never git/sysupgrade directly' t_rpcd_only_calls_gitbackup
 run_test 'rpcd: status never leaks the secret, only token_set' t_rpcd_status_hides_secret
 run_test 'rpcd: log wraps the CLI'\''s own text' t_rpcd_log_wraps_cli_text

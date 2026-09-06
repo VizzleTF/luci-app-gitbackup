@@ -251,6 +251,21 @@ gbrpc_history() {
 # валидации" this whole ticket asks for. A malformed value is refused by
 # the CLI (exit 2) and relayed here as the same { "reason": ... } shape,
 # never reaching a `git` argv at all.
+#
+# In the ACL's WRITE tier, not read, unlike every other method here that
+# only reads. Not because it writes anything -- it does not -- but because
+# of what it returns: `git diff` between two commits of the backup branch
+# is the CONTENT of the backed-up files, and at the shipped default
+# (visibility=private, security.scrub='0') that content is unscrubbed --
+# /etc/shadow's root hash, the dropbear host keys, the WPA PSKs. A read
+# grant is meant to answer "is the backup healthy", which status/log/
+# history/config_diff all do without handing over a single file's bytes
+# (config_diff compares manifests: paths, modes, hashes, never content).
+# Splitting the tiers on "may see the router's secrets" rather than on
+# "changes something" is what makes the read tier actually safe to hand
+# out. The LuCI History view's own "View diff" button therefore needs the
+# write grant, which is the same grant its neighbouring "Restore" button
+# has always needed.
 gbrpc_diff() {
 	_gb_rpc_from=$(_gb_rpc_param "$1" '@.from')
 	_gb_rpc_to=$(_gb_rpc_param "$1" '@.to')

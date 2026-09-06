@@ -161,6 +161,19 @@ gb_restore() {
 		return 1
 	fi
 
+	# Before anything reads a field out of it: the manifest is remote
+	# input. Everything else in this function already treats the CONTENT
+	# of files/ as untrusted-until-hashed; this pass extends the same
+	# suspicion to the entry metadata that decides WHERE that content
+	# goes and what it ends up owned by. Refusing the whole manifest
+	# rather than skipping the offending entry is deliberate -- a
+	# manifest this package did not write is not a backup that was
+	# partially applied, it is a backup that should not be applied.
+	_gb_restore_check_entries "$_gb_manifest" || {
+		gb_log err "gb_restore: $_gb_prefix/manifest.json at $_gb_target has unusable entries, nothing was written:$_gb_entries_bad"
+		return 4
+	}
+
 	_gb_restore_check_board "$_gb_srcroot/meta/board.json" "$_gb_force"
 	_gb_board_rc=$?
 	[ "$_gb_board_rc" -eq 0 ] || return "$_gb_board_rc"
@@ -409,6 +422,102 @@ _gb_restore_verify_sha_one() {
 # perfectly overwritable by root). Those still only surface at actual
 # write time, exactly as before this ticket; this preflight only removes
 # the ONE failure mode the spec explicitly asks to catch ahead of time.
+# _gb_restore_check_entries <manifest.json> -- read-only validation of
+# every entry's METADATA, before any of it is used. Sets _gb_entries_bad
+# (a multi-line "  <path>: <reason>" report, empty when everything is
+# usable) and returns 0 iff it stayed empty.
+#
+# What this does NOT do is restrict WHICH paths may be restored. Writing
+# back whatever the backup set contained, wherever it lived, is the whole
+# point of this module -- there is no allowlist here and there should not
+# be one. What it checks is that each entry says what it means, exactly
+# once, in the one spelling every later pass will agree on:
+#
+#   - path is absolute and canonical (gb_path_canon, lib.sh). Two passes
+#     read this field independently -- _gb_restore_check_writable_one
+#     builds _gb_precheck_bad from it and _gb_restore_write_one looks
+#     itself up in that list by string match -- so "/etc/./hosts" and
+#     "/etc/hosts" naming the same file in two entries would make the
+#     preflight and the write disagree about which one it decided on.
+#   - type is one this module actually handles, so an unknown one is a
+#     loud refusal instead of an entry silently skipped by all three
+#     `case` statements below.
+#   - mode is 3 or 4 octal digits, uid/gid are digits. These go straight
+#     into `chmod`/`chown` argv (_gb_restore_perm_one), where a value
+#     like "--reference=/etc/shadow" or a leading "-" would be read as an
+#     option rather than as the mode it claims to be.
+#
+# A manifest that fails any of this was not written by this package's own
+# collect.sh -- every field above is machine-generated there from stat(1)
+# output -- so the honest response is to refuse the restore outright
+# (gb_restore does, with exit 4), not to sanitize a hostile manifest into
+# a plausible-looking one and apply it.
+_gb_restore_check_entries() {
+	_gb_manifest="$1"
+	_gb_entries_bad=''
+	gb_manifest_each "$_gb_manifest" entries _gb_restore_check_entries_one
+	[ -z "$_gb_entries_bad" ]
+}
+
+# _gb_restore_entry_reject <shown-path> <reason> -- one line onto the report.
+_gb_restore_entry_reject() {
+	_gb_entries_bad="$_gb_entries_bad
+  $1: $2"
+}
+
+_gb_restore_check_entries_one() {
+	_gb_obj="$1"
+	_gb_ce_path=$(gb_manifest_field "$_gb_obj" path)
+	_gb_ce_type=$(gb_manifest_field "$_gb_obj" type)
+	_gb_ce_mode=$(gb_manifest_field "$_gb_obj" mode)
+	_gb_ce_uid=$(gb_manifest_field "$_gb_obj" uid)
+	_gb_ce_gid=$(gb_manifest_field "$_gb_obj" gid)
+
+	_gb_ce_shown="$_gb_ce_path"
+	[ -n "$_gb_ce_shown" ] || _gb_ce_shown='(entry with no path)'
+
+	case "$_gb_ce_path" in
+		/*) ;;
+		*)
+			_gb_restore_entry_reject "$_gb_ce_shown" 'not an absolute path'
+			return 0
+			;;
+	esac
+
+	if [ "$(gb_path_canon "$_gb_ce_path")" != "$_gb_ce_path" ]; then
+		_gb_restore_entry_reject "$_gb_ce_shown" 'not a canonical path'
+		return 0
+	fi
+
+	case "$_gb_ce_type" in
+		file | dir | symlink) ;;
+		*)
+			_gb_restore_entry_reject "$_gb_ce_shown" "unknown entry type '$_gb_ce_type'"
+			return 0
+			;;
+	esac
+
+	if [ -n "$_gb_ce_mode" ]; then
+		case "$_gb_ce_mode" in
+			[0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+			*)
+				_gb_restore_entry_reject "$_gb_ce_shown" "mode '$_gb_ce_mode' is not 3 or 4 octal digits"
+				return 0
+				;;
+		esac
+	fi
+
+	for _gb_ce_id in "$_gb_ce_uid" "$_gb_ce_gid"; do
+		[ -n "$_gb_ce_id" ] || continue
+		case "$_gb_ce_id" in
+			*[!0-9]*)
+				_gb_restore_entry_reject "$_gb_ce_shown" "owner id '$_gb_ce_id' is not numeric"
+				return 0
+				;;
+		esac
+	done
+}
+
 _gb_restore_check_writable() {
 	_gb_manifest="$1"
 	_gb_precheck_bad=''
@@ -513,6 +622,19 @@ _gb_restore_write_one() {
   $_gb_path: $_gb_mkdir_err"
 		return 0
 	}
+	# A symlink sitting where a "file" entry wants to land is removed
+	# first, never written through. Two reasons, and the second is the
+	# one that matters: a "file" entry must end up an actual file, which
+	# is what the symlink branch of _gb_restore_perm_one already assumes
+	# in the other direction (it rm -f's whatever is there before its own
+	# ln -s); and `cp -f` disagrees with itself about this across the two
+	# implementations this package runs on -- GNU cp opens the
+	# destination O_TRUNC, which FOLLOWS the link and rewrites whatever
+	# it points at, somewhere the manifest never named, while busybox cp
+	# unlinks first (the -f comment below). Deciding it here makes both
+	# behave the same, and makes the set of files a restore can touch
+	# exactly the set of paths its manifest lists.
+	[ -L "$_gb_dest" ] && rm -f "$_gb_dest" 2>/dev/null
 	# -f: busybox cp (unlike GNU/BSD cp) refuses an existing destination
 	# outright ("File exists") without it -- found live on the owlab
 	# stand restoring over /etc/hosts, not caught by any host-side test
@@ -565,7 +687,12 @@ _gb_restore_perm_one() {
 			_gb_symtarget=$(gb_manifest_field "$_gb_obj" target)
 			mkdir -p "$(dirname "$_gb_dest")" 2>/dev/null
 			rm -f "$_gb_dest" 2>/dev/null
-			ln -s "$_gb_symtarget" "$_gb_dest" 2>/dev/null
+			# `--`: the target string is the one manifest field with no
+			# shape of its own to validate (any string is a legal symlink
+			# target), so it is the one that can still arrive looking like
+			# an option -- "-s", "--force". End-of-options settles it
+			# without constraining what a symlink is allowed to point at.
+			ln -s -- "$_gb_symtarget" "$_gb_dest" 2>/dev/null
 			# -h: change the symlink's own ownership, not the (possibly
 			# dangling, e.g. /etc/resolv.conf) target's -- busybox chown
 			# documents -h for exactly this. Mode is never set on a

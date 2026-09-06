@@ -83,8 +83,22 @@ gb_collect() {
 # rules. Re-reads the file on every call rather than caching it in a
 # variable: the list is a handful of lines, and this keeps the match logic
 # free of the quoting/IFS games a cached multi-line variable would need.
+#
+# Matched on the canonical spelling of <path>, never the raw one: `case`
+# globbing is textual, so "//etc/gitbackup/token" and
+# "/etc/./gitbackup/token" match no pattern that names /etc/gitbackup even
+# though find(1), cp(1) and the kernel all agree they are that file. This
+# is the second half of the same fix gb_paths_validate carries -- that one
+# stops such an entry being accepted into sysupgrade.conf at all, this one
+# holds even for a path that never went through it, since `sysupgrade -l`
+# unions in /lib/upgrade/keep.d/* and changed conffiles that this package
+# does not own. exclude.list's own R76 ("must never end up inside its own
+# backup, no matter how the router is configured") is only true with both.
 _gb_collect_is_excluded() {
-	_gb_path="$1"
+	# Own variable name, deliberately not the _gb_path every caller loop
+	# here already uses: POSIX sh has no locals, and canonicalizing into
+	# that name would silently rewrite the caller's loop variable too.
+	_gb_ie_path=$(gb_path_canon "$1")
 	[ -r "$GB_EXCLUDE_LIST" ] || return 1
 	while IFS= read -r _gb_pat || [ -n "$_gb_pat" ]; do
 		case "$_gb_pat" in
@@ -93,13 +107,13 @@ _gb_collect_is_excluded() {
 		case "$_gb_pat" in
 			*/'**')
 				_gb_prefix=${_gb_pat%/\*\*}
-				case "$_gb_path" in
+				case "$_gb_ie_path" in
 					"$_gb_prefix"|"$_gb_prefix"/*) return 0 ;;
 				esac
 				;;
 			*)
 				# shellcheck disable=SC2254  # unquoted on purpose: this is a case glob, not a literal
-				case "$_gb_path" in
+				case "$_gb_ie_path" in
 					$_gb_pat) return 0 ;;
 				esac
 				;;
@@ -121,6 +135,13 @@ _gb_collect_files() {
 	_gb_entries="$2"
 	sysupgrade -l 2>/dev/null | while IFS= read -r _gb_path || [ -n "$_gb_path" ]; do
 		[ -n "$_gb_path" ] || continue
+		# One spelling per file from here down, so the staged tree, the
+		# manifest entry and the exclude decision cannot disagree about
+		# what "this path" is: "/etc/./config/network" and
+		# "/etc/config/network" are one file to the kernel but two
+		# distinct manifest entries (and two distinct restore targets)
+		# if the raw string is carried through.
+		_gb_path=$(gb_path_canon "$_gb_path")
 		_gb_collect_is_excluded "$_gb_path" && continue
 
 		_gb_src="$GB_ROOT$_gb_path"

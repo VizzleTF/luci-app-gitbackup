@@ -690,9 +690,37 @@ _gb_run_backup() {
 	# push (spec: sysupgrade -b's own gzip is not deterministic byte for
 	# byte, so building it before the compare above would commit a diff
 	# every single run even when nothing on the router changed).
+	#
+	# Never when this run scrubs. sysupgrade -b reads the LIVE
+	# filesystem, not the tree step 7 just scrubbed, and it lands inside
+	# $_gb_outdir, which gb_build_tree stages whole (gitio.sh: a bare
+	# `find . \( -type f -o -type l \)`, no exclude logic of its own) --
+	# so the archive carried every byte the scrub had just removed,
+	# straight into the same commit. That made scrubbing decorative in
+	# exactly the configuration it exists for: visibility=public forces
+	# scrub on (_gb_effective_scrub, R99) precisely because anyone can
+	# read the repository, and this shipped /etc/shadow, the dropbear
+	# host keys and the WPA PSKs to them anyway, in a tarball, with the
+	# run reporting success and manifest.scrubbed[] claiming the values
+	# had been handled.
+	#
+	# Skipped rather than scrubbed-then-rebuilt: sysupgrade -b's output
+	# has to stay something `sysupgrade -r` accepts byte for byte (the
+	# recovery card's Path 0 is exactly that), and a tarball this package
+	# reassembles from the scrubbed tree would be a second, hand-rolled
+	# implementation of a format it does not own. Turning scrub on is the
+	# operator saying these values must not reach the repository; the
+	# archive is the one thing here that cannot honour that, so it is the
+	# thing that gives way. Said out loud, at notice level, because a
+	# file quietly missing from a backup is exactly the kind of surprise
+	# a recovery card must not contain.
 	if [ "$(gb_json_bool "$(gb_uci_get gitbackup.main.archive 1)")" = true ]; then
-		sysupgrade -b "$_gb_outdir/backup.tar.gz" >/dev/null 2>&1 ||
-			gb_log warning 'gitbackup run: sysupgrade -b failed, continuing without backup.tar.gz'
+		if [ "$(gb_json_bool "$GB_SCRUB")" = true ]; then
+			gb_log notice 'gitbackup run: scrubbing is on, so no backup.tar.gz is pushed -- sysupgrade -b reads the live filesystem and would carry exactly the values just scrubbed out of the tree'
+		else
+			sysupgrade -b "$_gb_outdir/backup.tar.gz" >/dev/null 2>&1 ||
+				gb_log warning 'gitbackup run: sysupgrade -b failed, continuing without backup.tar.gz'
+		fi
 	fi
 
 	# 11b: the recovery card -- only once card.sh (ticket 09) exists; see
